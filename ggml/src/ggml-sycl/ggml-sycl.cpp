@@ -6917,6 +6917,214 @@ static ggml_tensor * find_ssm_conv_for_writeback(const ggml_cgraph * cgraph, int
 //
 // Anchored at the CONCAT, whose gather `0127` has already folded, so `gather` is in hand.
 // Fills out_conv/out_cpy and returns true when the whole chain can collapse.
+// Prefill twin of find_conv_collapse. At prefill widths the concat spends its whole
+// dispatch materialising ggml_transpose(qkv_mixed); the fold reads the untransposed
+// buffer through its strides instead and absorbs the snapshot CPYs in the same
+// registers, so CONCAT + K CPYs + SSM_CONV + SILU become one dispatch. The finder
+// must account for EVERY consumer of the concat: one conv, plus view->CPY chains
+// whose (s_idx, dst) sequence matches the snapshot-slot arithmetic build_conv_state
+// emits. Anything else rejects -- the concat buffer is never written, so an
+// unaccounted reader would read garbage silently.
+struct conv_prefill_fold {
+    ggml_tensor * conv = nullptr;
+    ggml_tensor * silu = nullptr;
+    float *       wb_base   = nullptr;
+    int64_t       wb_stride = 0;   // floats between consecutive slots
+    int64_t       wb_s2     = 0;   // floats between sequences within one slot
+    int           wb_count  = 0;
+    ggml_tensor * skip[8]   = {};  // cpy + view nodes this fold absorbs
+    int           n_skip    = 0;
+};
+
+static bool find_conv_prefill_fold(const ggml_cgraph * cgraph, int cat_idx, conv_prefill_fold * out) {
+    if (!ggml_sycl_conv_prefill_fold_enabled()) {
+        return false;
+    }
+    ggml_tensor * cat = cgraph->nodes[cat_idx];
+    ggml_tensor * st  = cat->src[0];
+    ggml_tensor * x   = cat->src[1];
+    if (st == nullptr || x == nullptr) {
+        return false;
+    }
+    if (((const int32_t *) cat->op_params)[0] != 0 || cat->ne[3] != 1) {
+        return false;
+    }
+    if (cat->type != GGML_TYPE_F32 || st->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // state is the gathered [DC-1, C, S] block; the kernel is instantiated at DC=4
+    if (st->ne[0] != 3 || !ggml_is_contiguous(st)) {
+        return false;
+    }
+    const int64_t n_t = cat->ne[0] - st->ne[0];
+    const int64_t C   = cat->ne[1];
+    const int64_t S   = cat->ne[2];
+    // decode widths belong to find_conv_collapse; this fold is the prefill form
+    if (n_t < 8 || x->ne[0] != n_t || x->ne[1] != C || x->ne[2] != S || st->ne[1] != C || st->ne[2] != S) {
+        return false;
+    }
+    if (x->nb[0] % sizeof(float) != 0 || x->nb[1] % sizeof(float) != 0 || x->nb[2] % sizeof(float) != 0) {
+        return false;
+    }
+
+    // Account for EVERY reader of the concat across the WHOLE graph: one SSM_CONV,
+    // plus snapshot views whose only consumer is a CPY of the shape build_conv_state
+    // emits. The concat buffer is never written under this fold, so one unaccounted
+    // reader means silent garbage -- reject on anything unrecognised.
+    ggml_tensor * conv = nullptr;
+    int conv_idx = -1;
+    struct cpy_rec { int64_t s_idx; ggml_tensor * cpy; };
+    cpy_rec       cpys[4];
+    int           n_cpy = 0;
+    ggml_tensor * views[4];
+    int           view_consumers[4] = { 0, 0, 0, 0 };
+    int           n_view = 0;
+
+    int view_idx[4] = { -1, -1, -1, -1 };
+
+    // Bounded window: the builder emits views, CPYs, conv and silu adjacent to the
+    // concat. Readers OUTSIDE the window cannot escape accounting -- the use-count
+    // reconciliation below fails and the fold rejects.
+    const int scan_end = std::min(cgraph->n_nodes, cat_idx + 32);
+    for (int j = cat_idx + 1; j < scan_end; j++) {
+        ggml_tensor * n = cgraph->nodes[j];
+
+        // a view OF the concat: record it; its consumers are checked below
+        if (n->view_src == cat) {
+            if (n->op != GGML_OP_VIEW || n_view >= 4) {
+                return false;
+            }
+            if (n->ne[0] != st->ne[0] || n->ne[1] != C || n->ne[2] != S ||
+                n->view_offs % sizeof(float) != 0) {
+                return false;
+            }
+            view_idx[n_view] = j;
+            views[n_view++]  = n;
+            continue;
+        }
+
+        // does n read the concat directly or through a recorded view?
+        int  via_view    = -1;
+        bool reads_cat   = false;
+        for (int a = 0; a < GGML_MAX_SRC; a++) {
+            const ggml_tensor * src = n->src[a];
+            if (src == nullptr) {
+                continue;
+            }
+            if (src == cat) {
+                reads_cat = true;
+            }
+            for (int v = 0; v < n_view; v++) {
+                if (src == views[v]) {
+                    via_view = v;
+                }
+            }
+        }
+        if (!reads_cat && via_view < 0) {
+            continue;
+        }
+
+        if (n->op == GGML_OP_SSM_CONV && n->src[0] == cat && via_view < 0) {
+            if (conv != nullptr) {
+                return false;
+            }
+            conv     = n;
+            conv_idx = j;
+            continue;
+        }
+        if (n->op == GGML_OP_CPY && via_view >= 0 && !reads_cat && n->src[0] == views[via_view]) {
+            if (n_cpy >= 4 || n->type != GGML_TYPE_F32 || n->nb[0] != sizeof(float)) {
+                return false;
+            }
+            view_consumers[via_view]++;
+            const int64_t s_idx = (int64_t) (views[via_view]->view_offs / sizeof(float));
+            // absorbed bytes must come from the x region: the owning work-item reads x
+            if (s_idx < st->ne[0] || s_idx > cat->ne[0] - st->ne[0]) {
+                return false;
+            }
+            cpys[n_cpy].s_idx = s_idx;
+            cpys[n_cpy].cpy   = n;
+            n_cpy++;
+            continue;
+        }
+        return false;   // unrecognised reader
+    }
+    if (conv == nullptr || conv_idx + 1 >= cgraph->n_nodes || n_cpy == 0) {
+        return false;
+    }
+    for (int v = 0; v < n_view; v++) {
+        if (view_consumers[v] != 1) {
+            return false;   // a snapshot view inside the window with zero or several consumers
+        }
+    }
+    // Use-count reconciliation: the graph's own reference counts must match exactly
+    // the readers this window found -- cat is read by the conv and by each view (a
+    // view srcs its base), every view by exactly its one CPY. A reader beyond the
+    // window shows up as a count this set cannot explain, and the fold rejects.
+    if (ggml_node_get_use_count(cgraph, cat_idx) != 1 + n_view) {
+        return false;
+    }
+    for (int v = 0; v < n_view; v++) {
+        if (ggml_node_get_use_count(cgraph, view_idx[v]) != 1) {
+            return false;
+        }
+    }
+    if (conv->type != GGML_TYPE_F32 || conv->src[1] == nullptr || conv->src[1]->ne[0] != 4 ||
+        conv->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(conv->src[1])) {
+        return false;
+    }
+    if (conv->ne[0] != C || conv->ne[1] != n_t || conv->ne[2] != S) {
+        return false;
+    }
+    ggml_tensor * silu = cgraph->nodes[conv_idx + 1];
+    if (silu->op != GGML_OP_UNARY || ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || silu->src[0] != conv) {
+        return false;
+    }
+    if (ggml_node_get_use_count(cgraph, conv_idx) != 1 || !ggml_is_contiguous(silu)) {
+        return false;
+    }
+
+    // snapshot arithmetic: s_idx consecutive descending from the final state, dst
+    // pointers uniform-stride -- exactly what build_conv_state emits
+    for (int a = 0; a < n_cpy; a++) {
+        for (int b = a + 1; b < n_cpy; b++) {
+            if (cpys[b].s_idx > cpys[a].s_idx) {
+                cpy_rec t = cpys[a]; cpys[a] = cpys[b]; cpys[b] = t;
+            }
+        }
+    }
+    if (cpys[0].s_idx != cat->ne[0] - st->ne[0]) {
+        return false;
+    }
+    int64_t wb_stride = 0;
+    for (int k = 0; k < n_cpy; k++) {
+        if (cpys[k].s_idx != cpys[0].s_idx - k) {
+            return false;
+        }
+        if (cpys[k].cpy->nb[1] != cpys[0].cpy->nb[1]) {
+            return false;
+        }
+        if (k == 1) {
+            wb_stride = (int64_t) ((float *) cpys[1].cpy->data - (float *) cpys[0].cpy->data);
+        }
+        if (k >= 1 && (int64_t) ((float *) cpys[k].cpy->data - (float *) cpys[0].cpy->data) != k * wb_stride) {
+            return false;
+        }
+    }
+
+    out->conv      = conv;
+    out->silu      = silu;
+    out->wb_base   = (float *) cpys[0].cpy->data;
+    out->wb_stride = wb_stride;
+    out->wb_s2     = (int64_t) (cpys[0].cpy->nb[1] / sizeof(float));
+    out->wb_count  = n_cpy;
+    out->n_skip    = 0;
+    for (int k = 0; k < n_cpy; k++) {
+        out->skip[out->n_skip++] = cpys[k].cpy;
+    }
+    return true;
+}
+
 static bool find_conv_collapse(const ggml_cgraph * cgraph, int concat_idx, const ggml_tensor * gather,
                                ggml_tensor ** out_conv, ggml_tensor ** out_cpy, ggml_tensor ** out_silu) {
     if (!ggml_sycl_conv_collapse_enabled()) {
@@ -7559,6 +7767,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     ggml_tensor * collapse_conv = nullptr;
     ggml_tensor * collapse_cpy  = nullptr;
     ggml_tensor * collapse_silu = nullptr;
+    conv_prefill_fold prefill_fold;
+    bool              prefill_fold_live = false;
     // graph indices already covered by a folded mat-vec pair above: the decay chain
     // [lo, hi], plus the single paired node when the anchor was the chain itself
     int           pair_skip_lo   = -1;
@@ -7583,6 +7793,19 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (node == collapse_conv) {
             collapse_conv = nullptr;
             continue;
+        }
+        if (prefill_fold_live) {
+            bool absorbed = false;
+            for (int k = 0; k < prefill_fold.n_skip; k++) {
+                if (node == prefill_fold.skip[k]) {
+                    prefill_fold.skip[k] = nullptr;
+                    absorbed = true;
+                    break;
+                }
+            }
+            if (absorbed) {
+                continue;
+            }
         }
         if (node == collapse_silu) {
             collapse_silu = nullptr;
@@ -7684,6 +7907,25 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             ggml_sycl_op_concat(*sycl_ctx, node, gth);
             prof.mark(node);
             continue;
+        }
+        if (node->op == GGML_OP_CONCAT && g_ggml_sycl_enable_fusion) {
+            conv_prefill_fold f;
+            if (find_conv_prefill_fold(cgraph, i, &f)) {
+                ggml_sycl_ssm_conv_prefill_fold(*sycl_ctx, node, f.conv, f.silu,
+                                                f.wb_base, f.wb_stride, f.wb_s2, f.wb_count);
+                if (prefill_fold_live) {
+                    for (int k = 0; k < prefill_fold.n_skip; k++) {
+                        GGML_ASSERT(prefill_fold.skip[k] == nullptr &&
+                                    "prefill conv fold: previous fold's CPY was never absorbed");
+                    }
+                }
+                collapse_conv     = f.conv;
+                collapse_silu     = f.silu;
+                prefill_fold      = f;
+                prefill_fold_live = true;
+                prof.mark(node);
+                continue;
+            }
         }
         if (node->op == GGML_OP_GATED_DELTA_NET && g_ggml_sycl_enable_fusion) {
             // A skipped SIGMOID means src[4] is never written, and a skipped GET_ROWS means

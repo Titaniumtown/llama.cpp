@@ -14,6 +14,10 @@ bool ggml_sycl_conv_collapse_diag();
 // Collapses GET_ROWS + CONCAT + SSM_CONV + CPY into one dispatch at a decode width of one
 // token. gather supplies the cache and its row indices, concat the projection (src[1]),
 // wb the destination state view.
+bool ggml_sycl_conv_prefill_fold_enabled();
+void ggml_sycl_ssm_conv_prefill_fold(ggml_backend_sycl_context & ctx, const ggml_tensor * cat,
+                                     const ggml_tensor * conv, ggml_tensor * silu,
+                                     float * wb_base, int64_t wb_stride, int64_t wb_s2, int wb_count);
 bool ggml_sycl_ssm_conv_collapsed(ggml_backend_sycl_context & ctx, ggml_tensor * dst, ggml_tensor * silu_dst,
                                   const ggml_tensor * gather, const ggml_tensor * concat, const ggml_tensor * wb);
 bool ggml_sycl_ssm_conv_prefers_tiled(int d_conv, int d_inner, int n_t);

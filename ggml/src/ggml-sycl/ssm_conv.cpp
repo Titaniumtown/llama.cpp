@@ -264,6 +264,160 @@ static void kernel_ssm_conv_collapsed_t1(
     });
 }
 
+// Prefill fold: one dispatch for CONCAT + K state CPYs + SSM_CONV + SiLU.
+//
+// The concat this replaces spends its whole 545 us/call materialising
+// ggml_transpose(qkv_mixed): the source has channels of one token contiguous, the
+// concat wants tokens of one channel contiguous. This kernel never builds that
+// layout. It maps consecutive lanes to consecutive CHANNELS of one token, so the
+// x reads (x is addressed through its own strides, i.e. the *untransposed* buffer)
+// and the dst store are both contiguous -- the coalescing the tiled kernel buys
+// with an SLM transpose falls out of reading the source in its native layout.
+// Window positions p < DC-1 come from the gathered state instead; only the first
+// DC-1 output tokens ever touch it.
+//
+// The state writeback rides the same registers as the single-slot absorb above:
+// the CPY for snapshot slot k copies concat columns [ne0-(DC-1)-k, ..), which are
+// exactly window[1..DC-1] of the work-item computing token n_t-1-k. wb_stride is
+// the (finder-validated) uniform byte distance between consecutive slots' rows.
+// Accumulation order and the SiLU expression are verbatim kernel_ssm_conv_impl,
+// so the fold is bit-identical to the unfused chain.
+template <int DC>
+static void kernel_ssm_conv_prefill_fold(
+    queue &q,
+    const float *state, int st_s2,                 // state (p, c, s): p + c*(DC-1) + s*st_s2
+    const float *x, int64_t x_s0, int64_t x_s1, int64_t x_s2,   // x (t, c, s), float strides
+    const float *weights,
+    float *dst_data, int64_t dst_s1, int64_t dst_s2,            // dst (c, t, s), float strides
+    float *wb_base, int64_t wb_stride,             // slot 0 row; float stride between slots
+    int64_t wb_s2,                                 // float stride between sequences of one slot
+    int wb_count,
+    int d_inner, int n_t, int n_s, bool apply_silu
+) {
+    // One work-item per (channel, token-chunk, seq), walking its chunk serially with
+    // the DC-1 window tail in registers: every x element is loaded exactly once, and
+    // both the loads and the stores are contiguous across lanes (consecutive channels
+    // of one token). The first form of this kernel mapped one WI per output and paid
+    // the window overlap as 4x strided re-reads 40 KB apart -- 84 MB x 4 passes
+    // through an 18 MB L2 is DRAM, and it measured 917 us/call against the unfused
+    // chain's 955 (CONCAT 541 + conv 414): the concat's token-fastest layout hands
+    // the conv all four window taps in one cache line, so beating the pair needs the
+    // 1x-read walk, not just transpose avoidance.
+    // Chunking exists only for occupancy: C*S alone is ~10k lanes on a 2.5k-lane
+    // device; chunks multiply that without changing any read count beyond the DC-1
+    // halo per chunk seam.
+    int chunks = n_t / 256;
+    if (chunks < 1) { chunks = 1; }
+    if (chunks > 16) { chunks = 16; }
+    const int chunk_len = (n_t + chunks - 1) / chunks;
+
+    const size_t total_work = (size_t) d_inner * (size_t) chunks * (size_t) n_s;
+    const size_t work_group_size = 256;
+    const size_t num_work_groups = (total_work + work_group_size - 1) / work_group_size;
+
+    q.submit([&](handler &h) {
+        h.parallel_for(
+            nd_range<1>(range<1>(num_work_groups * work_group_size), range<1>(work_group_size)),
+            [=](nd_item<1> item) {
+                const size_t idx = item.get_global_id(0);
+                if (idx >= total_work) {
+                    return;
+                }
+                const int channel = (int) (idx % (size_t) d_inner);
+                const int chunk   = (int) ((idx / (size_t) d_inner) % (size_t) chunks);
+                const int seq     = (int) (idx / ((size_t) d_inner * (size_t) chunks));
+
+                const int t0 = chunk * chunk_len;
+                int       t1 = t0 + chunk_len;
+                if (t1 > n_t) { t1 = n_t; }
+                if (t0 >= t1) { return; }
+
+                const float *c = weights + (size_t) channel * DC;
+                float w0 = c[0], w1 = c[1], w2 = c[2], w3 = c[3];
+                static_assert(DC == 4, "sliding window is written for DC == 4");
+
+                // in(p) for concat position p, without the concat
+                const float *xb = x + (int64_t) channel * x_s1 + (int64_t) seq * x_s2;
+                const float *sb = state + (size_t) channel * (DC - 1) + (size_t) seq * st_s2;
+                auto in_at = [&](int p) -> float {
+                    return p < DC - 1 ? sb[p] : xb[(int64_t) (p - (DC - 1)) * x_s0];
+                };
+
+                // prime the window for output t0: positions t0, t0+1, t0+2
+                float a0 = in_at(t0);
+                float a1 = in_at(t0 + 1);
+                float a2 = in_at(t0 + 2);
+
+                float *db = dst_data + (size_t) channel + (int64_t) seq * dst_s2;
+
+                for (int t = t0; t < t1; ++t) {
+                    const float a3 = xb[(int64_t) t * x_s0];   // position t+3 is always x
+                    // accumulation order matches kernel_ssm_conv_impl: j ascending
+                    float sumf = a0 * w0;
+                    sumf += a1 * w1;
+                    sumf += a2 * w2;
+                    sumf += a3 * w3;
+                    db[(int64_t) t * dst_s1] = apply_silu ? sumf / (1.0f + sycl::exp(-sumf)) : sumf;
+
+                    // absorbed snapshot CPYs: token n_t-1-k owns slot k's bytes,
+                    // which are window positions t+1..t+3 = [a1, a2, a3]
+                    const int k = (n_t - 1) - t;
+                    if (wb_base != nullptr && k < wb_count) {
+                        float *so = wb_base + (int64_t) k * wb_stride
+                            + (int64_t) seq * wb_s2
+                            + (size_t) channel * (DC - 1);
+                        so[0] = a1;
+                        so[1] = a2;
+                        so[2] = a3;
+                    }
+
+                    a0 = a1;
+                    a1 = a2;
+                    a2 = a3;
+                }
+            }
+        );
+    });
+}
+
+// GGML_SYCL_CONV_PREFILL_FOLD=0 disables the prefill conv fold (same-binary control).
+bool ggml_sycl_conv_prefill_fold_enabled() {
+    static const int v = [] {
+        const char * e = std::getenv("GGML_SYCL_CONV_PREFILL_FOLD");
+        return e == nullptr ? 1 : std::atoi(e);
+    }();
+    return v != 0;
+}
+
+// One dispatch for what was CONCAT + K snapshot CPYs + SSM_CONV + SiLU at prefill
+// widths. Runs at the CONCAT's position; find_conv_prefill_fold proves every
+// consumer of the concat is inside this kernel before it is allowed to run.
+void ggml_sycl_ssm_conv_prefill_fold(ggml_backend_sycl_context & ctx, const ggml_tensor * cat,
+                                     const ggml_tensor * conv, ggml_tensor * silu,
+                                     float * wb_base, int64_t wb_stride, int64_t wb_s2, int wb_count) {
+    const ggml_tensor * st = cat->src[0];
+    const ggml_tensor * x  = cat->src[1];
+    const ggml_tensor * w  = conv->src[1];
+
+    const int d_conv  = (int) w->ne[0];
+    const int d_inner = (int) conv->ne[0];
+    const int n_t     = (int) conv->ne[1];
+    const int n_s     = (int) conv->ne[2];
+    GGML_ASSERT(d_conv == 4);
+
+    dpct::queue_ptr stream = ctx.stream();
+    kernel_ssm_conv_prefill_fold<4>(
+        *stream,
+        (const float *) st->data, (int) (st->nb[2] / sizeof(float)),
+        (const float *) x->data,
+        (int64_t) (x->nb[0] / sizeof(float)), (int64_t) (x->nb[1] / sizeof(float)), (int64_t) (x->nb[2] / sizeof(float)),
+        (const float *) w->data,
+        (float *) silu->data,
+        (int64_t) (silu->nb[1] / sizeof(float)), (int64_t) (silu->nb[2] / sizeof(float)),
+        wb_base, wb_stride, wb_s2, wb_count,
+        d_inner, n_t, n_s, /*apply_silu=*/true);
+}
+
 // GGML_SYCL_SSM_CONV_UNROLL=0 keeps the runtime-trip-count loop, for A/B.
 static bool kernel_ssm_conv(
     queue &q,

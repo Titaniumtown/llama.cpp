@@ -5766,6 +5766,17 @@ struct ggml_sycl_op_prof {
 
     static std::string node_key(const ggml_tensor * node) {
         std::string key = ggml_op_name(node->op);
+        // A concat's cost depends entirely on which axis it joins -- a dim-0 join with a short
+        // first dimension is a different kernel and a different access pattern from a dim-1
+        // join of the same tensor -- so an aggregated CONCAT row cannot say which one to look
+        // at. Carry the axis and the destination shape.
+        if (node->op == GGML_OP_CONCAT) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "/dim%d/%ldx%ldx%ld", node->op_params[0],
+                     (long) node->ne[0], (long) node->ne[1], (long) node->ne[2]);
+            key += buf;
+            return key;
+        }
         // matmul cost is dominated by the weight, so keep type and shape apart
         if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0]) {
             char buf[64];

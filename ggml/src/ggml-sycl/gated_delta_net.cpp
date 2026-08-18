@@ -148,21 +148,14 @@ void gated_delta_net_sycl(
             // overload interleaves two reductions in a single pass), and kq needs one more
             // reduction per token rather than per column, since it does not depend on col.
             // Same terms in a different summation order, so results differ in rounding only.
-            float kv_col[C];
-            float qs_col[C];
-#pragma unroll
-            for (int c = 0; c < C; c++) {
-                sycl::float2 acc(0.0f, 0.0f);
-#pragma unroll
-                for (int r = 0; r < rows_per_lane; r++) {
-                    acc.x() += s_shard[c][r] * k_reg[r];
-                    acc.y() += s_shard[c][r] * q_reg[r];
-                }
-                acc       = warp_reduce_sum<warp_size>(acc);
-                kv_col[c] = acc.x();
-                qs_col[c] = acc.y();
-            }
-
+            // kq is a function of this token's q and k alone -- it never reads the state --
+            // so it can be computed before the column loop rather than between the two.
+            // That is what lets those two loops fuse below, and the fusion is the point:
+            // kv_col[C] and qs_col[C] existed only to carry C reductions across this
+            // reduction, and at C=4 that is 8 floats/lane held live for no other reason.
+            // This kernel spills ~12 registers at SIMD16/128 GRFs, and raising the GRF
+            // count instead is measured at +38% (see the README); cutting live values is
+            // the direction that does not cost residency.
             float kq_shard = 0.0f;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
@@ -172,8 +165,16 @@ void gated_delta_net_sycl(
 
 #pragma unroll
             for (int c = 0; c < C; c++) {
+                sycl::float2 acc(0.0f, 0.0f);
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    acc.x() += s_shard[c][r] * k_reg[r];
+                    acc.y() += s_shard[c][r] * q_reg[r];
+                }
+                acc = warp_reduce_sum<warp_size>(acc);
+
                 // delta[col] = (v[col] - g * kv[col]) * beta
-                const float delta_col = (v_reg[c] - g_val * kv_col[c]) * beta_val;
+                const float delta_col = (v_reg[c] - g_val * acc.x()) * beta_val;
 
                 // S[i][col] = g * S[i][col] + k[i] * delta[col]
 #pragma unroll
@@ -184,7 +185,7 @@ void gated_delta_net_sycl(
                 // Park this column's result in the lane that will store it. Every input
                 // here is warp-uniform (all three reductions broadcast; v/g/beta are
                 // uniform loads), so lane c already holds column c's value -- no shuffle.
-                out_lane = (lane == c) ? (g_val * qs_col[c] + delta_col * kq) * scale : out_lane;
+                out_lane = (lane == c) ? (g_val * acc.y() + delta_col * kq) * scale : out_lane;
             }
         } else {
             // g is per-row on this path, so it is hoisted with q/k. exp() is pure, so

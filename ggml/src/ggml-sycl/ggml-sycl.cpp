@@ -3829,10 +3829,34 @@ enum class mul_mat_algo {
     MUL_MAT_SYCL = 2,
 };
 
+// Upstream hard-disables MMQ with a bare "TODO: accuracy issues". mmq.cpp is a complete
+// implementation covering exactly this model's types, and the path it bypasses -- dequantise
+// the weight to f16, then GEMM -- is 9% of a prefill profile (DEQUANT + CONVERT/src1). Make
+// it measurable so the question can be closed with data instead of a TODO.
+//
+// GGML_SYCL_MMQ=1 enables it for the types mmq.cpp dispatches; correctness is then whatever
+// test-backend-ops -o MUL_MAT says, which is the check the TODO is really about.
 inline bool ggml_sycl_supports_mmq(enum ggml_type type) {
-    // TODO: accuracy issues in MMQ
-    GGML_UNUSED(type);
-    return false;
+    static const int enable = ggml_sycl_get_env("GGML_SYCL_MMQ", 0);
+    if (enable == 0) {
+        GGML_UNUSED(type);
+        return false;
+    }
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
 }
 
 inline bool ggml_sycl_supports_reorder_mul_mat_sycl(enum ggml_type type) {
@@ -4644,7 +4668,12 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     // Workaround in https://github.com/ggml-org/llama.cpp/commit/95f84d5ce8b449a9b16009434aca800df504a02e
     use_mul_mat_q = use_mul_mat_q && (src0->type != GGML_TYPE_IQ2_XXS);
 #ifdef SYCL_USE_XMX
-    use_mul_mat_q = use_mul_mat_q && (src1->ne[1] <= MMQ_MAX_BATCH_SIZE);
+    // The 32-column cap keeps MMQ away from prefill entirely, so it has to move with the
+    // enable knob or the experiment measures nothing.
+    {
+        static const int mmq_max_batch = ggml_sycl_get_env("GGML_SYCL_MMQ_MAX_BATCH", MMQ_MAX_BATCH_SIZE);
+        use_mul_mat_q = use_mul_mat_q && (src1->ne[1] <= mmq_max_batch);
+    }
 #endif // SYCL_USE_XMX
 
     // When reorder is enabled, both ESIMD, MMVQ and DMMV kernels may be used. For

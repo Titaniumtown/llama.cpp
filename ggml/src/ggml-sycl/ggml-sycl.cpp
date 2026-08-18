@@ -5838,7 +5838,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
 #endif
         // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
-        if (node->op == GGML_OP_GATED_DELTA_NET) {
+        if (node->op == GGML_OP_GATED_DELTA_NET && g_ggml_sycl_enable_fusion) {
             ggml_sycl_gated_delta_net_fused_cache fused_state_cpy;
             const int gdn_nodes_to_skip = ggml_sycl_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
             if (gdn_nodes_to_skip > 0) {

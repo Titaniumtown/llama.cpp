@@ -1091,6 +1091,13 @@ void launch_fattn(
             }
         }
 
+        // Single-token decode is latency-bound on the long KV walk; the wave-fill heuristic
+        // under-provisions KV-split. Split into two nthreads-chunks per block (half the useful max).
+        if (ncols == 1) {
+            const int chunk = 2*nwarps*warp_size;
+            parallel_blocks = std::min(ntiles_KQ, (int) ((K->ne[1] + chunk - 1) / chunk));
+        }
+
         blocks_num.x = ntiles_x;
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];

@@ -10253,6 +10253,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 16416, 1, 128, {8,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 16416, {8,  1}, {4, 1}, {0, 1, 2, 3}, 2*16416));
 
+    // q4_K quantised mat-vec, K x M sweep at both MTP widths (n=2 and n=4). This exists
+    // instrument, not as coverage: on Arc the reorder mat-vec reaches ~470 GB/s at most
+    // shapes but collapses to ~212 GB/s at K=6144 and ~321 at M=6144, and six attempts to
+    // explain that from the source failed (see patches/llamacpp/0055 for the list). All
+    // of them reasoned from five aggregated profile rows. A dense map over both dimensions
+    // separates "K=6144 is slow" from "M=6144 is slow" from "some periodic function of
+    // either" without another guess at the dispatch.
+    for (int n : { 2, 4 }) {
+        for (int k : { 4096, 5120, 6144, 7168, 8192, 10240, 12288, 17408 }) {
+            for (int m : { 4096, 5120, 6144, 7168, 8192, 10240, 12288, 17408 }) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 64, 1, 64));

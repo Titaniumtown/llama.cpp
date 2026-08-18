@@ -12,6 +12,6 @@
 //
 // Lives in its own translation unit because it grows a branch per supported op sequence.
 bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops,
-                        std::initializer_list<enum ggml_unary_op> unary_ops);
+                        std::initializer_list<enum ggml_unary_op> unary_ops = {});
 
 #endif  // GGML_SYCL_FUSION_HPP

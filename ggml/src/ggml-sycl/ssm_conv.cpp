@@ -18,7 +18,8 @@ static void kernel_ssm_conv(
     int src_stride_inner,
     int src_stride_seq,
     int dst_stride_token,
-    int dst_stride_seq
+    int dst_stride_seq,
+    bool apply_silu
 ) {
     const size_t total_work = static_cast<size_t>(d_inner) * static_cast<size_t>(n_t) * static_cast<size_t>(n_s);
     const size_t work_group_size = 256;
@@ -61,13 +62,14 @@ static void kernel_ssm_conv(
                     static_cast<size_t>(token) * static_cast<size_t>(dst_stride_token) +
                     static_cast<size_t>(channel);
 
-                dst_data[dst_idx] = sumf;
+                // fused SiLU epilogue (matches element_wise op_silu: x / (1 + exp(-x)))
+                dst_data[dst_idx] = apply_silu ? sumf / (1.0f + sycl::exp(-sumf)) : sumf;
             }
         );
     });
 }
 
-inline void ggml_sycl_op_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+inline void ggml_sycl_op_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor * dst, ggml_tensor * silu_dst = nullptr) {
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src1 = dst->src[1];
 
@@ -104,7 +106,8 @@ inline void ggml_sycl_op_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor *
 
         const float *src_data = static_cast<const float *>(src0->data);
         const float *weights  = static_cast<const float *>(src1->data);
-        float *dst_data       = static_cast<float *>(dst->data);
+        const bool   apply_silu = silu_dst != nullptr;
+        float *dst_data       = static_cast<float *>((silu_dst ? silu_dst : dst)->data);
 
         GGML_ASSERT(src_data && weights && dst_data);
 
@@ -121,7 +124,8 @@ inline void ggml_sycl_op_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor *
             src_stride_inner,
             src_stride_seq,
             dst_stride_token,
-            dst_stride_seq
+            dst_stride_seq,
+            apply_silu
         );
 
     } catch (const std::exception &e) {
@@ -133,4 +137,12 @@ inline void ggml_sycl_op_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor *
 void ggml_sycl_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
     ggml_sycl_op_ssm_conv(ctx, dst);
+}
+
+// Fused ssm_conv + SiLU: write silu(conv) straight into silu_dst, eliding the
+// standalone SiLU launch and its HBM round-trip of the conv output.
+void ggml_sycl_ssm_conv_fused(ggml_backend_sycl_context & ctx, ggml_tensor * dst, ggml_tensor * silu_dst) {
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
+    GGML_ASSERT(silu_dst && ggml_are_same_shape(dst, silu_dst) && silu_dst->type == GGML_TYPE_F32);
+    ggml_sycl_op_ssm_conv(ctx, dst, silu_dst);
 }

@@ -6335,7 +6335,8 @@ static ggml_tensor * find_gdn_beta_sigmoid(const ggml_cgraph * cgraph, int i) {
 // Deferring a cache read from a GET_ROWS to its consumer is sound only if nothing WRITES
 // the cache in between. Reads in between are irrelevant: the cache is not being modified,
 // only read later than it used to be. Shared by both state folds so the two cannot drift.
-static bool cache_written_between(const ggml_cgraph * cgraph, int from, int to, const ggml_tensor * cache) {
+static bool region_touched_between(const ggml_cgraph * cgraph, int from, int to, const ggml_tensor * cache,
+                                   bool include_reads) {
     const char * cache_beg = (const char *) cache->data;
     const size_t cache_len = ggml_nbytes(cache);
     auto hits_cache = [&](const ggml_tensor * t) {
@@ -6360,8 +6361,21 @@ static bool cache_written_between(const ggml_cgraph * cgraph, int from, int to, 
         if ((n->op == GGML_OP_CPY || n->op == GGML_OP_SET_ROWS) && hits_cache(n->src[1])) {
             return true;
         }
+        // Deferring a *write* also has to clear readers, which deferring a read does not:
+        // a reader in between would see the previous step's state.
+        if (include_reads) {
+            for (int k = 0; k < GGML_MAX_SRC; k++) {
+                if (hits_cache(n->src[k])) {
+                    return true;
+                }
+            }
+        }
     }
     return false;
+}
+
+static bool cache_written_between(const ggml_cgraph * cgraph, int from, int to, const ggml_tensor * cache) {
+    return region_touched_between(cgraph, from, to, cache, /*include_reads=*/false);
 }
 
 // A gated-delta-net's recurrent state reaches it as GET_ROWS(state_cache, row_index):
@@ -6582,6 +6596,108 @@ static ggml_tensor * find_conv_state_gather(const ggml_cgraph * cgraph, int i) {
         g_conv_fold_tally.n["accept"]++;
     }
     return cat;
+}
+
+// The other half of the causal-conv pair. `0127` folded away the GET_ROWS that reads the
+// state; this folds away the CPY that writes it back:
+//
+//   CONCAT(cache_row, x) -> conv_input -> CPY(conv_input[:, n_t:], cache_row)
+//                                      -> SSM_CONV -> out
+//
+// The CPY's bytes are exactly the last d_conv-1 values of the LAST token's conv window,
+// and the ssm_conv work-item computing that token already holds them in registers.
+//
+// Note the direction: `build_conv_state` calls ggml_build_forward_expand on the CPY before
+// ggml_ssm_conv is ever created, so the CPY sits at a LOWER graph index than its producer's
+// consumer. This fold therefore *defers* a write rather than advancing one, and is anchored
+// at the CPY. Scanning forward from the ssm_conv finds nothing at all.
+//
+// Given the CPY at index j, returns the ssm_conv that will perform the write, or nullptr.
+static ggml_tensor * find_ssm_conv_for_writeback(const ggml_cgraph * cgraph, int j) {
+    if (!ggml_sycl_conv_wb_enabled()) {
+        return nullptr;
+    }
+    ggml_tensor * cpy = cgraph->nodes[j];
+    if (cpy->op != GGML_OP_CPY || cpy->type != GGML_TYPE_F32) {
+        return nullptr;
+    }
+    ggml_tensor * a = cpy->src[0];
+    ggml_tensor * b = cpy->src[1];
+    if (a == nullptr || b == nullptr || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) {
+        return nullptr;
+    }
+    ggml_tensor * base = a->view_src != nullptr ? a->view_src : a;
+
+    // The first ssm_conv after this CPY is this layer's; a later one belongs to another
+    // layer and reads another conv_input.
+    ggml_tensor * conv     = nullptr;
+    int           conv_idx = -1;
+    for (int i = j + 1; i < cgraph->n_nodes; i++) {
+        ggml_tensor * n = cgraph->nodes[i];
+        if (n->op != GGML_OP_SSM_CONV) {
+            continue;
+        }
+        if (n->src[0] == base && n->type == GGML_TYPE_F32) {
+            conv     = n;
+            conv_idx = i;
+        }
+        break;
+    }
+    if (conv == nullptr || conv->src[0] == nullptr || conv->src[1] == nullptr) {
+        return nullptr;
+    }
+    if (conv->src[1]->type != GGML_TYPE_F32) {
+        return nullptr;
+    }
+
+    const int64_t d_conv  = conv->src[1]->ne[0];
+    const int64_t d_inner = conv->ne[0];
+    const int64_t n_t     = conv->ne[1];
+    const int64_t n_s     = conv->ne[2];
+    if (d_conv < 2) {
+        return nullptr;
+    }
+    // the writeback lives only in the scalar form; ask the dispatcher rather than restate
+    // its condition, so the two cannot disagree
+    if (ggml_sycl_ssm_conv_prefers_tiled((int) d_conv, (int) d_inner, (int) n_t)) {
+        return nullptr;
+    }
+    // the kernel indexes src0 as a dense [d_conv-1+n_t, d_inner, n_s]
+    if (base->nb[0] != sizeof(float) || base->nb[1] != (size_t) base->ne[0] * sizeof(float)) {
+        return nullptr;
+    }
+    // the source must be exactly the trailing window, at the offset the last-token
+    // work-item happens to hold
+    if (a->ne[0] != d_conv - 1 || a->ne[1] != d_inner || a->ne[2] != n_s || a->ne[3] != 1) {
+        return nullptr;
+    }
+    if (a->nb[1] != base->nb[1] || a->nb[2] != base->nb[2]) {
+        return nullptr;
+    }
+    if ((const char *) a->data != (const char *) base->data + (size_t) n_t * sizeof(float)) {
+        return nullptr;
+    }
+    // and the destination one contiguous cache row per sequence, so that ggml_cpy's flat
+    // element order puts channel c at c*(d_conv-1) -- which is what the kernel writes
+    if (b->nb[0] != sizeof(float)) {
+        return nullptr;
+    }
+    if (b->ne[0] != (d_conv - 1) * d_inner || b->ne[1] != n_s || b->ne[2] != 1 || b->ne[3] != 1) {
+        return nullptr;
+    }
+
+    // Reading conv_input at the ssm_conv rather than here needs nothing to rewrite it in
+    // between.
+    if (region_touched_between(cgraph, j + 1, conv_idx, base, /*include_reads=*/false)) {
+        return nullptr;
+    }
+    // And deferring the write needs nothing to read OR write the destination in between --
+    // a reader would otherwise see the previous step's state. That scan also covers any
+    // consumer of the CPY node itself, whose bytes are the destination's.
+    if (region_touched_between(cgraph, j + 1, conv_idx + 1, b, /*include_reads=*/true)) {
+        return nullptr;
+    }
+    return conv;
 }
 
 // Device-side per-op profiler, enabled with GGML_SYCL_PROF=1.
@@ -6967,6 +7083,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // same, for the causal-conv state's gather and the CONCAT that consumes it
     ggml_tensor * concat_fold_gather = nullptr;
     ggml_tensor * concat_gather_node = nullptr;
+    // set when a CPY was skipped because the ssm_conv below it writes the state itself;
+    // ssm_wb_conv is that ssm_conv, ssm_wb_cpy the copy it absorbs
+    ggml_tensor * ssm_wb_conv = nullptr;
+    ggml_tensor * ssm_wb_cpy  = nullptr;
     ggml_sycl_op_prof prof;
     prof.begin(sycl_ctx->stream());
 
@@ -7118,12 +7238,33 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
-        if (node->op == GGML_OP_SSM_CONV &&
-            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
-            ggml_sycl_ssm_conv_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
-            prof.mark(node, cgraph, i, 2);
-            i++;
-            continue;
+
+        if (node->op == GGML_OP_CPY && g_ggml_sycl_enable_fusion && ssm_wb_conv == nullptr) {
+            if (ggml_tensor * conv = find_ssm_conv_for_writeback(cgraph, i)) {
+                // No dispatch: the ssm_conv below stores these bytes straight from the
+                // registers it already loaded to convolve them.
+                ssm_wb_conv = conv;
+                ssm_wb_cpy  = node;
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_SSM_CONV && g_ggml_sycl_enable_fusion) {
+            ggml_tensor * wb   = node == ssm_wb_conv ? ssm_wb_cpy : nullptr;
+            const bool    silu =
+                ggml_sycl_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU });
+            if (wb != nullptr || silu) {
+                ssm_wb_conv = nullptr;
+                ssm_wb_cpy  = nullptr;
+                if (silu) {
+                    ggml_sycl_ssm_conv_fused(*sycl_ctx, node, cgraph->nodes[i + 1], wb);
+                    prof.mark(node, cgraph, i, 2);
+                    i++;
+                } else {
+                    ggml_sycl_ssm_conv(*sycl_ctx, node, wb);
+                    prof.mark(node);
+                }
+                continue;
+            }
         }
         if (node->op == GGML_OP_UNARY &&
             (ggml_sycl_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
@@ -7322,6 +7463,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         GGML_ASSERT(ok);
         prof.mark(node);
     }
+    // A skipped CPY whose ssm_conv never ran would leave the conv state unwritten, which
+    // is silent wrong output on the next token rather than a crash. It cannot happen --
+    // the detector found that ssm_conv at a higher index in this same graph -- so make the
+    // impossible case loud instead of trusting it.
+    GGML_ASSERT(ssm_wb_conv == nullptr && "conv-state writeback skipped but never performed");
     prof.flush();
 }
 

@@ -1,4 +1,6 @@
 #include "ssm_conv.hpp"
+#include <vector>
+#include <cstdlib>
 #include "common.hpp"
 
 #include <cstdio>
@@ -24,7 +26,9 @@ static void kernel_ssm_conv_impl(
     int src_stride_seq,
     int dst_stride_token,
     int dst_stride_seq,
-    bool apply_silu
+    bool apply_silu,
+    float *state_out,
+    int state_stride_seq
 ) {
     const size_t total_work = static_cast<size_t>(d_inner) * static_cast<size_t>(n_t) * static_cast<size_t>(n_s);
     const size_t work_group_size = 256;
@@ -88,6 +92,26 @@ static void kernel_ssm_conv_impl(
 
                 // fused SiLU epilogue (matches element_wise op_silu: x / (1 + exp(-x)))
                 dst_data[dst_idx] = apply_silu ? sumf / (1.0f + sycl::exp(-sumf)) : sumf;
+
+                // Fused state writeback. The next step's conv window is this row's last
+                // d_conv-1 values, which is exactly s[1..d_conv-1] of the LAST token's
+                // window -- already in registers, so this costs d_conv-1 stores and no
+                // extra loads. It replaces a whole CPY dispatch of the same bytes.
+                if (state_out != nullptr && token == n_t - 1) {
+                    float *so = state_out
+                        + static_cast<size_t>(seq) * static_cast<size_t>(state_stride_seq)
+                        + static_cast<size_t>(channel) * static_cast<size_t>(d_conv - 1);
+                    if constexpr (DC > 0) {
+#pragma unroll
+                        for (int j = 0; j < DC - 1; ++j) {
+                            so[j] = s[j + 1];
+                        }
+                    } else {
+                        for (int j = 0; j < d_conv - 1; ++j) {
+                            so[j] = s[j + 1];
+                        }
+                    }
+                }
             }
         );
     });
@@ -155,8 +179,17 @@ static void kernel_ssm_conv_tiled(
     });
 }
 
+// Whether the tiled (prefill) form would be chosen. The writeback is implemented only in
+// the scalar form, so the detector asks this rather than restating the condition -- a
+// detector that disagreed with the dispatch would either lose the tiled prefill kernel or
+// skip a CPY nobody then performs.
+bool ggml_sycl_ssm_conv_prefers_tiled(int d_conv, int d_inner, int n_t) {
+    static const int map_mode = ggml_sycl_get_env("GGML_SYCL_SSM_CONV_MAP", 2);
+    return map_mode == 2 && d_conv == 4 && n_t >= 32 && (d_inner % 32) == 0;
+}
+
 // GGML_SYCL_SSM_CONV_UNROLL=0 keeps the runtime-trip-count loop, for A/B.
-static void kernel_ssm_conv(
+static bool kernel_ssm_conv(
     queue &q,
     const float *src_data,
     const float *weights,
@@ -170,34 +203,91 @@ static void kernel_ssm_conv(
     int src_stride_seq,
     int dst_stride_token,
     int dst_stride_seq,
-    bool apply_silu
+    bool apply_silu,
+    float *state_out,
+    int state_stride_seq
 ) {
     static const bool unroll = ggml_sycl_get_env("GGML_SYCL_SSM_CONV_UNROLL", 1) != 0;
     // GGML_SYCL_SSM_CONV_MAP=0 restores the token-fastest mapping, for A/B.
     static const int  map_mode     = ggml_sycl_get_env("GGML_SYCL_SSM_CONV_MAP", 2);
     static const bool chan_fastest = map_mode == 1;
 
-    if (map_mode == 2 && d_conv == 4 && n_t >= 32 && (d_inner % 32) == 0) {
+    // The tiled form is prefill-only (n_t >= 32) and does not implement the writeback;
+    // there the CPY is once per layer per ubatch rather than per token, so it is not worth
+    // a second code path. Reporting false leaves the caller to run the CPY normally.
+    if (map_mode == 2 && d_conv == 4 && n_t >= 32 && (d_inner % 32) == 0 && state_out == nullptr) {
         kernel_ssm_conv_tiled<4>(q, src_data, weights, dst_data, d_inner, n_t, n_s,
                                  src_stride_inner, src_stride_seq, dst_stride_token,
                                  dst_stride_seq, apply_silu);
-        return;
+        return false;
     }
 
 #define GGML_SYCL_SSM_CONV_CALL(DC_, MAP_)                                                        \
     kernel_ssm_conv_impl<DC_, MAP_>(q, src_data, weights, dst_data, d_conv, d_inner, n_t, n_s,    \
                                     ncs, src_stride_inner, src_stride_seq, dst_stride_token,      \
-                                    dst_stride_seq, apply_silu)
+                                    dst_stride_seq, apply_silu, state_out, state_stride_seq)
 
     if (unroll && d_conv == 4) {
         if (chan_fastest) { GGML_SYCL_SSM_CONV_CALL(4, true); } else { GGML_SYCL_SSM_CONV_CALL(4, false); }
-        return;
+        return state_out != nullptr;
     }
     if (chan_fastest) { GGML_SYCL_SSM_CONV_CALL(0, true); } else { GGML_SYCL_SSM_CONV_CALL(0, false); }
 #undef GGML_SYCL_SSM_CONV_CALL
+    return state_out != nullptr;
 }
 
-inline void ggml_sycl_op_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor * dst, ggml_tensor * silu_dst = nullptr) {
+// GGML_SYCL_CONV_WB=0 disables the fused conv-state writeback (same-binary control).
+bool ggml_sycl_conv_wb_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("GGML_SYCL_CONV_WB");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
+    return on;
+}
+
+// GGML_SYCL_CONV_WB_DIAG=1 byte-compares what the fused writeback stored against the
+// bytes the CPY it replaces would have copied. Generation output cannot gate a state
+// write on this box -- see the nondeterminism control recorded for the gather fold --
+// and test-backend-ops cannot see a graph-level fusion at all.
+bool ggml_sycl_conv_wb_diag() {
+    static const bool on = [] {
+        const char * e = std::getenv("GGML_SYCL_CONV_WB_DIAG");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return on;
+}
+
+// src0 is [d_conv-1+n_t, d_inner, n_s] contiguous; the state the CPY would write is its
+// last d_conv-1 columns, laid out flat as channel*(d_conv-1) + k per sequence row.
+static void ssm_conv_wb_verify(ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
+                               const ggml_tensor * dstv, int d_conv, int d_inner, int n_t, int n_s) {
+    queue_ptr q = ctx.stream();
+
+    const size_t       ncs = (size_t) (d_conv - 1 + n_t);
+    std::vector<float> in(ncs * d_inner * n_s);
+    SYCL_CHECK(CHECK_TRY_ERROR(q->memcpy(in.data(), src0->data, in.size() * sizeof(float)).wait()));
+
+    const size_t       row = (size_t) (d_conv - 1) * d_inner;
+    const size_t       rs  = dstv->nb[1] / sizeof(float);
+    std::vector<float> out(rs * n_s);
+    SYCL_CHECK(CHECK_TRY_ERROR(q->memcpy(out.data(), dstv->data, out.size() * sizeof(float)).wait()));
+
+    long bad = 0;
+    for (int sq = 0; sq < n_s; ++sq) {
+        for (int c = 0; c < d_inner; ++c) {
+            for (int k = 0; k < d_conv - 1; ++k) {
+                const float want = in[(size_t) sq * ncs * d_inner + (size_t) c * ncs + n_t + k];
+                const float got  = out[(size_t) sq * rs + (size_t) c * (d_conv - 1) + k];
+                bad += (want != got);
+            }
+        }
+    }
+    fprintf(stderr, "[CONVWB] n_s=%d n_t=%d d_conv=%d elems=%zu mismatches=%ld\n", n_s, n_t, d_conv,
+            row * n_s, bad);
+}
+
+static bool ggml_sycl_op_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
+                                  ggml_tensor * silu_dst = nullptr, const ggml_tensor * wb = nullptr) {
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src1 = dst->src[1];
 
@@ -239,7 +329,20 @@ inline void ggml_sycl_op_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor *
 
         GGML_ASSERT(src_data && weights && dst_data);
 
-        kernel_ssm_conv(
+        // wb is the CPY that copies src0's last d_conv-1 columns into the conv-state
+        // cache. Its destination view is contiguous per sequence with nb[1] the cache's
+        // row stride, and ggml_cpy's flat element order puts channel c at c*(d_conv-1).
+        float * state_out        = nullptr;
+        int     state_stride_seq = 0;
+        if (wb != nullptr) {
+            const ggml_tensor * dv = wb->src[1];
+            GGML_ASSERT(dv->type == GGML_TYPE_F32 && dv->nb[0] == sizeof(float));
+            GGML_ASSERT(dv->ne[0] == (int64_t) (d_conv - 1) * d_inner && dv->ne[1] == n_s);
+            state_out        = (float *) dv->data;
+            state_stride_seq = (int) (dv->nb[1] / sizeof(float));
+        }
+
+        const bool wrote = kernel_ssm_conv(
             *q,
             src_data,
             weights,
@@ -253,8 +356,19 @@ inline void ggml_sycl_op_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor *
             src_stride_seq,
             dst_stride_token,
             dst_stride_seq,
-            apply_silu
+            apply_silu,
+            state_out,
+            state_stride_seq
         );
+
+        // the detector rejects any shape the tiled form would claim, so a requested
+        // writeback must always be taken -- the CPY has already been skipped by then
+        GGML_ASSERT(wrote == (wb != nullptr));
+
+        if (wrote && ggml_sycl_conv_wb_diag()) {
+            ssm_conv_wb_verify(ctx, src0, wb->src[1], d_conv, d_inner, n_t, n_s);
+        }
+        return wrote;
 
     } catch (const std::exception &e) {
         std::fprintf(stderr, "[SYCL-SSM_CONV] ERROR: %s\n", e.what());
@@ -262,15 +376,16 @@ inline void ggml_sycl_op_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor *
     }
 }
 
-void ggml_sycl_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+bool ggml_sycl_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor * dst, const ggml_tensor * wb) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
-    ggml_sycl_op_ssm_conv(ctx, dst);
+    return ggml_sycl_op_ssm_conv(ctx, dst, nullptr, wb);
 }
 
 // Fused ssm_conv + SiLU: write silu(conv) straight into silu_dst, eliding the
 // standalone SiLU launch and its HBM round-trip of the conv output.
-void ggml_sycl_ssm_conv_fused(ggml_backend_sycl_context & ctx, ggml_tensor * dst, ggml_tensor * silu_dst) {
+bool ggml_sycl_ssm_conv_fused(ggml_backend_sycl_context & ctx, ggml_tensor * dst, ggml_tensor * silu_dst,
+                              const ggml_tensor * wb) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
     GGML_ASSERT(silu_dst && ggml_are_same_shape(dst, silu_dst) && silu_dst->type == GGML_TYPE_F32);
-    ggml_sycl_op_ssm_conv(ctx, dst, silu_dst);
+    return ggml_sycl_op_ssm_conv(ctx, dst, silu_dst, wb);
 }

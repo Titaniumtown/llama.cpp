@@ -775,6 +775,9 @@ bool gpu_has_xmx(sycl::device &dev);
 
 int ggml_sycl_get_env(const char *env_name, int default_val);
 
+char * ggml_sycl_src1_q8_store_ext(ggml_backend_sycl_context & ctx, const void * key, const void * strm,
+                                   size_t bytes, size_t src_ne, int variant, const ggml_tensor * out);
+
 // Attribute a device-side pass that is NOT a graph node to its own profiler row
 // (GGML_SYCL_PROF=1). No-op when profiling is off. Without this, work submitted inside an
 // op -- notably launch_fattn's K/V dequant -- is invisible: it shows up in no row at all.

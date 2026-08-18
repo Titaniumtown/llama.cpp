@@ -2914,6 +2914,28 @@ static char * src1_q8_store(ggml_backend_sycl_context & ctx, const void * key, c
     return c.buf->get();
 }
 
+// Producer-side entry to the q8_1 cache. An op that produces a mat-vec activation can emit the
+// q8_1 copy itself and register it here; the consumer's src1_q8_lookup is keyed on the float
+// data pointer, so no consumer detection is needed -- the cache IS the rendezvous. A wrong
+// `variant` guess is safe: the lookup compares it and simply misses.
+char * ggml_sycl_src1_q8_store_ext(ggml_backend_sycl_context & ctx, const void * key, const void * strm,
+                                   size_t bytes, size_t src_ne, int variant, const ggml_tensor * out) {
+    char * p = src1_q8_store(ctx, key, strm, bytes, src_ne, variant);
+    // src1_q8_store stamps c.node = ctx.cur_node, which for a CONSUMER is the node that reads
+    // the activation -- correct there. A producer is the other way round: a fused op dispatches
+    // at the index of its FIRST node, so its own output lands at cur_node+1 or +2 and the
+    // lookup's overwrite walk (which starts at c.node+1) sees the output as a later write over
+    // the source range and rejects every entry. Measured, not reasoned: with key, stream,
+    // bytes, src_ne and variant all byte-identical at the very next mat-vec, the hit count did
+    // not move off its baseline at all. Stamp the node that actually produces `out` instead.
+    if (out != nullptr && ctx.cur_graph != nullptr) {
+        for (int j = ctx.cur_node; j < ctx.cur_node + 4 && j < ctx.cur_graph->n_nodes; ++j) {
+            if (ctx.cur_graph->nodes[j] == out) { ctx.src1_q8.node = j; break; }
+        }
+    }
+    return p;
+}
+
 inline void ggml_sycl_op_mul_mat_sycl(
     ggml_backend_sycl_context & ctx,
     const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
@@ -3543,7 +3565,13 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
             char * qhit = cacheable ? src1_q8_lookup(ctx, dev[i].src1_ddf, (const void *) stream,
                                                      ddq_bytes, (size_t) ggml_nelements(src1), qvariant)
                                     : nullptr;
-            if (qhit != nullptr) {
+            static const int nq8_trace = ggml_sycl_get_env("GGML_SYCL_NORM_EMIT_Q8_TRACE", 0);
+        if (nq8_trace) {
+            fprintf(stderr, "[NQ8] consumer cacheable=%d bytes=%zu src_ne=%zu variant=%d key=%p hit=%d\n",
+                    (int) cacheable, ddq_bytes, (size_t) ggml_nelements(src1), qvariant,
+                    (const void *) dev[i].src1_ddf, (int) (qhit != nullptr));
+        }
+        if (qhit != nullptr) {
                 dev[i].src1_ddq = qhit;
                 // A hit submits nothing, so without a barrier here the next mark is the
                 // GEMV's and this MUL_MAT row bills every microsecond since the PREVIOUS

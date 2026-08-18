@@ -1,6 +1,8 @@
 #include <type_traits>
 
 #include "norm.hpp"
+#include "quantize.hpp"
+#include "presets.hpp"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/presets.hpp"
 
@@ -161,7 +163,8 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols,
     const float eps, const sycl::nd_item<3>& item_ct1, float* s_sum, int block_size,
     const float* mul = nullptr, const int64_t mul_stride_row = 0, const int64_t mul_stride_channel = 0,
     const int64_t mul_stride_sample = 0, const int mul_nrows = 0, const int mul_nchannels = 0, const int mul_nsamples = 0,
-    const float* add_b = nullptr, float* add_out = nullptr, sycl::half * mir = nullptr) {
+    const float* add_b = nullptr, float* add_out = nullptr, sycl::half * mir = nullptr,
+    char * q8_out = nullptr, int q8_kx = 0) {
 
     const int nrows = item_ct1.get_group_range(2);
     const int nchannels = item_ct1.get_group_range(1);
@@ -250,6 +253,63 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols,
         dst[col * dst_stride_col] = v;
         if constexpr (do_mirror) {
             mir[col * dst_stride_col] = static_cast<sycl::half>(v);
+        }
+    }
+
+    // Emit the q8_1 copy that the consuming mat-vec would otherwise launch a separate kernel
+    // for. QUANTIZE/src1 is 259 launches/token at decode, 5.03 us each and 8.5 GB/s against a
+    // 598 GB/s wall -- essentially pure launch latency. 0122's work-group sweep proved the
+    // kernel itself is not the problem (1.7% on the kernel, exactly zero end-to-end, md5
+    // identical at BPG=1/8/32), so the only way to remove the cost is to not launch it.
+    //
+    // One q8_1 block per SUB-GROUP, ElementsPerWI columns per lane -- the identical mapping and
+    // arithmetic to quantize_and_reorder_q8_1_soa, which is what makes the bytes bit-identical
+    // and the generation md5 immovable.
+    //
+    // The obvious formulation -- fold this into the store loop above, one column per lane -- is
+    // WRONG here and silently so. GGML_SYCL_WARP_SIZE is 16 on Intel (ggml-sycl/CMakeLists.txt),
+    // so a sub-group spans 16 columns while a q8_1 block spans 32: reduce_over_group then
+    // computes d and sum over HALF a block. Nothing faults, every quant stays in range, and
+    // generation drifts by a stable amount (5f9f7ae3a2a2e43c -> f9eacfcbf9979260, 3/3 reps).
+    //
+    // Iterating over blocks rather than columns also keeps the reduction legal: a sub-group
+    // enters or skips an iteration as a unit, so every reduce_over_group is full-width, which a
+    // column-strided loop cannot guarantee (ncols=5120 is not a multiple of 2*block_size).
+    if (q8_out != nullptr) {
+        constexpr int EPW = QK8_1 / WARP_SIZE;
+        // dst is read across sub-group boundaries here -- block b was written by the threads
+        // holding columns [32b,32b+32), which are not this sub-group's.
+        item_ct1.barrier(sycl::access::fence_space::global_and_local);
+
+        const auto sg   = item_ct1.get_sub_group();
+        const int  lane = tid % WARP_SIZE;
+        const int  nsg  = block_size / WARP_SIZE;
+        const int  nblk = ncols / QK8_1;
+
+        for (int b = tid / WARP_SIZE; b < nblk; b += nsg) {
+            const int c0 = b * QK8_1 + lane * EPW;
+
+            float vv[EPW];
+            float sum  = 0.0f;
+            float amax = 0.0f;
+#pragma unroll
+            for (int i = 0; i < EPW; i++) {
+                vv[i] = dst[(c0 + i) * dst_stride_col];
+                sum  += vv[i];
+                amax  = sycl::fmax(amax, sycl::fabs(vv[i]));
+            }
+            sum  = sycl::reduce_over_group(sg, sum, sycl::plus<float>());
+            amax = sycl::reduce_over_group(sg, amax, sycl::maximum<float>());
+
+            const float d = amax == 0.0f ? 1.0f : amax / 127.0f;
+#pragma unroll
+            for (int i = 0; i < EPW; i++) {
+                ((int8_t *) q8_out)[c0 + i] = static_cast<int8_t>(sycl::round(vv[i] / d));
+            }
+            if (lane == 0) {
+                *(sycl::half2 *) (q8_out + q8_kx + b * (int) sizeof(sycl::half2)) =
+                    sycl::half2(sycl::half(amax == 0.0f ? 0.0f : d), sycl::half(sum));
+            }
         }
     }
 }
@@ -432,7 +492,8 @@ static void rms_norm_mul_f32_sycl(const float* x, const float* mul, float* dst, 
         const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
         const int mul_nrows, const int mul_nchannels, const int mul_nsamples,
         const float eps, queue_ptr stream, int device,
-        const float * add_b = nullptr, float * add_out = nullptr, sycl::half * mir = nullptr) {
+        const float * add_b = nullptr, float * add_out = nullptr, sycl::half * mir = nullptr,
+        char * q8_out = nullptr, int q8_kx = 0) {
     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
     const auto body = [&](auto mirror_tag) {
     constexpr bool MIR = decltype(mirror_tag)::value;
@@ -448,7 +509,7 @@ static void rms_norm_mul_f32_sycl(const float* x, const float* mul, float* dst, 
                         dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
                         eps, item_ct1, nullptr, WARP_SIZE,
                         mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples,
-                        add_b, add_out, mir);
+                        add_b, add_out, mir, q8_out, q8_kx);
                 });
             });
     }
@@ -467,7 +528,7 @@ static void rms_norm_mul_f32_sycl(const float* x, const float* mul, float* dst, 
                         dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
                         eps, item_ct1, get_pointer(s_sum_acc_ct1), work_group_size,
                         mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples,
-                        add_b, add_out, mir);
+                        add_b, add_out, mir, q8_out, q8_kx);
                 });
             });
     }
@@ -678,6 +739,47 @@ void ggml_sycl_op_rms_norm(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
         ss0, ss1, ss2, ss3, ds0, ds1, ds2, ds3, eps, main_stream, ctx.device);
 }
 
+// Gate + register for the producer-side q8_1 emission. Returns the buffer to write into, or
+// nullptr with a reason on stderr under GGML_SYCL_NORM_EMIT_Q8_TRACE=1 -- an attempt that
+// yields exactly zero has to be able to say which condition rejected it.
+static char * norm_q8_emit_target(ggml_backend_sycl_context & ctx, const ggml_tensor * out,
+                                  int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+                                  int64_t d00, const void * strm, const char * site, int * q8_kx) {
+    static const int emit_q8 = ggml_sycl_get_env("GGML_SYCL_NORM_EMIT_Q8", 1);
+    static const int trace   = ggml_sycl_get_env("GGML_SYCL_NORM_EMIT_Q8_TRACE", 0);
+    *q8_kx = 0;
+    if (emit_q8 != 1) { return nullptr; }
+
+    const char * why = nullptr;
+    int bs = 0;
+    if (ne01 != 1 || ne02 != 1 || ne03 != 1)  { why = "multi-row"; }
+    else if (ne00 % QK8_1 != 0)               { why = "ne00%QK8_1"; }
+    else if (!ggml_is_contiguous(out))        { why = "noncontig"; }
+    else if (d00 != 1)                        { why = "d00!=1"; }
+    else {
+        bs = ne00 < 1024 ? WARP_SIZE : ggml_sycl_info().max_work_group_sizes[ctx.device];
+        if (ne00 % bs != 0) { why = "ne00%bs"; }
+    }
+    if (why != nullptr) {
+        if (trace) {
+            fprintf(stderr, "[NQ8] %s decline=%s ne=[%ld,%ld,%ld,%ld] bs=%d\n", site, why,
+                    (long) ne00, (long) ne01, (long) ne02, (long) ne03, bs);
+        }
+        return nullptr;
+    }
+
+    const int64_t padded = GGML_PAD(ne00, MATRIX_ROW_PADDING);
+    const size_t  bytes  = (size_t) padded * sizeof(block_q8_1) / QK8_1;
+    const size_t  src_ne = (size_t) ggml_nelements(out);
+    char * p = ggml_sycl_src1_q8_store_ext(ctx, (const void *) out->data, strm, bytes, src_ne, /*SoA=*/1, out);
+    if (trace) {
+        fprintf(stderr, "[NQ8] %s EMIT ne00=%ld bytes=%zu src_ne=%zu key=%p\n", site,
+                (long) ne00, bytes, src_ne, (const void *) out->data);
+    }
+    *q8_kx = (int) ne00;
+    return p;
+}
+
 void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
     const ggml_tensor * rms_norm_src = dst->src[0];
     float eps = 0.0f;
@@ -733,9 +835,14 @@ void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor * 
     const int mul_nchannels = mul_src->ne[2];
     const int mul_nsamples  = mul_src->ne[3];
 
+    int    q8_kx  = 0;
+    char * q8_out = norm_q8_emit_target(ctx, mul_tensor, ne00, ne01, ne02, ne03, d00,
+                                        (const void *) main_stream, "fused", &q8_kx);
+
     rms_norm_mul_f32_sycl(src0_dd, mul_dd, dst_dd, ne00, ne01, ne02, ne03,
         s00, s01, s02, s03, d00, d01, d02, d03,
-        mul_s01, mul_s02, mul_s03, mul_nrows, mul_nchannels, mul_nsamples, eps, main_stream, ctx.device);
+        mul_s01, mul_s02, mul_s03, mul_nrows, mul_nchannels, mul_nsamples, eps, main_stream, ctx.device,
+        nullptr, nullptr, nullptr, q8_out, q8_kx);
 }
 
 void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context & ctx, ggml_tensor * rms_norm,
@@ -816,10 +923,14 @@ void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context & ctx, ggml_tenso
                                                    (size_t) ggml_nelements(mul_tensor));
     }
 
+    int    q8_kx  = 0;
+    char * q8_out = norm_q8_emit_target(ctx, mul_tensor, ne00, ne01, ne02, ne03, d00,
+                                        (const void *) main_stream, "fused_add", &q8_kx);
+
     rms_norm_mul_f32_sycl<true>(src0_dd, mul_dd, dst_dd, ne00, ne01, ne02, ne03,
         s00, s01, s02, s03, d00, d01, d02, d03,
         mul_s01, mul_s02, mul_s03, mul_nrows, mul_nchannels, mul_nsamples, eps, main_stream, ctx.device,
-        add_b_dd, add_dd, mir);
+        add_b_dd, add_dd, mir, q8_out, q8_kx);
 }
 
 void ggml_sycl_op_rms_norm_back(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {

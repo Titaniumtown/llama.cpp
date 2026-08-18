@@ -4597,6 +4597,14 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         }
     } else if (use_mul_mat_q) {
         ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_q);
+    } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+               dst->type == GGML_TYPE_F32 &&
+               src1->ne[1] >= 1 && src1->ne[1] <= 8 && src0->ne[0] % 4 == 0 &&
+               ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+        // f32 mat-vec. The generic path below runs these through a GEMM library, which
+        // for a tall-thin f32 src0 costs far more in setup than the weight read itself.
+        // Capped at 8 columns: past that a real blocked GEMM wins again.
+        ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_f32);
     } else {
         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl);
     }

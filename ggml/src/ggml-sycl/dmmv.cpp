@@ -2022,6 +2022,112 @@ static void dequantize_mul_mat_vec_q6_K_sycl_reorder(const void *vx, const float
         });
 }
 
+// Plain f32 mat-vec, one subgroup per output row.
+//
+// An f32 src0 matches none of the dmmv/mmvq/mmq predicates, so it falls through to
+// ggml_sycl_op_mul_mat_sycl, i.e. a oneDNN/MKL sgemm. For n=1 that dispatches a GEMV
+// through a GEMM library and the library overhead dwarfs the work: the GDN
+// ssm_alpha/ssm_beta projections ([5120,48] f32, 983 KB) measure 17.32 us each where
+// the weight read alone is ~2 us at DRAM speed, 96 calls per decode step.
+//
+// Accumulation stays in f32 -- deliberately not routed through the dfloat/half
+// machinery the F16 dmmv kernels use, since GGML_SYCL_F16 makes dfloat==half and that
+// would quietly drop the activations to half precision for a gating projection.
+static constexpr int MMV_F32_WG = 1024;
+
+template <int ncols_dst>
+static void mul_mat_vec_f32_f32(const float * __restrict__ vx, const float * __restrict__ y,
+                                float * __restrict__ dst, const int ncols,
+                                const int stride_col_y, const int stride_col_dst,
+                                const sycl::nd_item<1> & item_ct1) {
+    // One work-group per output row, reduced across the whole group.
+    //
+    // A subgroup-per-row layout does not work for these shapes: ssm_alpha/ssm_beta are
+    // [5120, 48], so 48 rows would give 48 subgroups (1536 work-items) and nowhere near
+    // enough memory-level parallelism to stream 983 KB -- measured 30.8 us/call, worse
+    // than the oneDNN sgemm it replaces. Spreading each row over a full work-group gives
+    // 48 x 1024 = 49k work-items instead.
+    //
+    // The weight row is the entire bandwidth cost, so it is loaded once and reused across
+    // all ncols_dst activation columns: extra columns cost arithmetic, not traffic.
+    const int row = item_ct1.get_group(0);
+    const int tid = item_ct1.get_local_linear_id();
+
+    const float * xrow = vx + (int64_t) row * ncols;
+
+    float sums[ncols_dst];
+#pragma unroll
+    for (int c = 0; c < ncols_dst; ++c) {
+        sums[c] = 0.0f;
+    }
+
+    // ncols % 4 == 0 is guaranteed by the dispatch guard, so i and ncols are both
+    // multiples of 4 and a float4 at i never runs past the row.
+    for (int i = tid * 4; i < ncols; i += MMV_F32_WG * 4) {
+        const sycl::float4 xv = *(const sycl::float4 *) (xrow + i);
+#pragma unroll
+        for (int c = 0; c < ncols_dst; ++c) {
+            const sycl::float4 yv = *(const sycl::float4 *) (y + (int64_t) c * stride_col_y + i);
+            sums[c] += xv.x() * yv.x() + xv.y() * yv.y() + xv.z() * yv.z() + xv.w() * yv.w();
+        }
+    }
+
+#pragma unroll
+    for (int c = 0; c < ncols_dst; ++c) {
+        const float s = sycl::reduce_over_group(item_ct1.get_group(), sums[c], std::plus<>());
+        if (tid == 0) {
+            dst[(int64_t) c * stride_col_dst + row] = s;
+        }
+    }
+}
+
+void ggml_sycl_op_mul_mat_vec_f32(
+    ggml_backend_sycl_context & ctx,
+    const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
+    const char *src0_dd_i, const float *src1_ddf_i, const char *src1_ddq_i,
+    float *dst_dd_i, const int64_t row_low, const int64_t row_high,
+    const int64_t src1_ncols, const int64_t src1_padded_row_size,
+    const dpct::queue_ptr &stream) {
+
+    const int64_t ne00     = src0->ne[0];
+    const int64_t row_diff = row_high - row_low;
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(ne00 % 4 == 0);
+
+    const float * vx = (const float *) src0_dd_i;
+    const int stride_col_y   = ne00;        // src1 columns are contiguous, stride ne10 == ne00
+    const int stride_col_dst = dst->ne[0];
+
+    const sycl::nd_range<1> nd(sycl::range<1>((size_t) row_diff * MMV_F32_WG),
+                               sycl::range<1>(MMV_F32_WG));
+
+#define LAUNCH_MMV_F32(N)                                                                   \
+    stream->parallel_for(nd, [=](sycl::nd_item<1> it) {                                     \
+        mul_mat_vec_f32_f32<N>(vx, src1_ddf_i, dst_dd_i, ne00, stride_col_y,                \
+                               stride_col_dst, it);                                         \
+    })
+
+    switch (src1_ncols) {
+        case 1: LAUNCH_MMV_F32(1); break;
+        case 2: LAUNCH_MMV_F32(2); break;
+        case 3: LAUNCH_MMV_F32(3); break;
+        case 4: LAUNCH_MMV_F32(4); break;
+        case 5: LAUNCH_MMV_F32(5); break;
+        case 6: LAUNCH_MMV_F32(6); break;
+        case 7: LAUNCH_MMV_F32(7); break;
+        case 8: LAUNCH_MMV_F32(8); break;
+        default: GGML_ABORT("unsupported src1_ncols=%d for f32 MMV", (int) src1_ncols);
+    }
+#undef LAUNCH_MMV_F32
+
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src1_ddq_i);
+    GGML_UNUSED(src1_padded_row_size);
+}
+
 void ggml_sycl_op_dequantize_mul_mat_vec(
     ggml_backend_sycl_context & ctx,
     const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,

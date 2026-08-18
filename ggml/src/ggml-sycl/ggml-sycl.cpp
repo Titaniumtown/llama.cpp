@@ -2805,6 +2805,9 @@ catch (sycl::exception const &exc) {
 // A no-op unless GGML_SYCL_PROF=1; defined next to the profiler further down.
 // non-static: fattn-common.hpp marks the FA K/V dequant, which is not a graph node.
 void ggml_sycl_prof_mark_sub(const std::string & name, uint64_t bytes);
+// The profiler class itself is declared far below this point; this is enough for a caller
+// here to skip work that only a profiled run would consume.
+bool ggml_sycl_prof_active();
 // `weight` only names the row; passing nullptr keeps the single aggregate row.
 void ggml_sycl_prof_mark_gap(const ggml_tensor * weight = nullptr);
 
@@ -3017,9 +3020,23 @@ inline void ggml_sycl_op_mul_mat_sycl(
                     out = src1_as_f16.get();
                 }
                 to_fp16_sycl(src1_ddf_i, out, ne, stream);
-                char ckey[64];
-                snprintf(ckey, sizeof(ckey), "CONVERT/src1/f32->f16/%ldx%ld", (long) ne10,
-                         (long) src1_ncols);
+                char ckey[96];
+                int  cn = snprintf(ckey, sizeof(ckey), "CONVERT/src1/f32->f16/%ldx%ld",
+                                   (long) ne10, (long) src1_ncols);
+                // Name the tensor that produced this activation. Shape alone already split
+                // the row usefully, but two different producers can share a shape, and which
+                // producer to fold the conversion into is the only actionable question this
+                // row can answer -- so the row should say. ggml names activations per layer
+                // ("ffn_swiglu-62"); the layer suffix is dropped so the row groups by
+                // producer instead of splitting 48 ways. Costs nothing unless profiling.
+                if (cn > 0 && (size_t) cn < sizeof(ckey) && ggml_sycl_prof_active()) {
+                    size_t L = strlen(src1->name);
+                    while (L > 0 && src1->name[L - 1] >= '0' && src1->name[L - 1] <= '9') { L--; }
+                    if (L > 0 && src1->name[L - 1] == '-') { L--; }
+                    if (L > 0) {
+                        snprintf(ckey + cn, sizeof(ckey) - (size_t) cn, "<-%.*s", (int) L, src1->name);
+                    }
+                }
                 ggml_sycl_prof_mark_sub(ckey, ne * (sizeof(float) + sizeof(sycl::half)));
                 src1_ptr = out;
             }
@@ -6616,6 +6633,10 @@ struct ggml_sycl_op_prof {
         fflush(stderr);
     }
 };
+
+bool ggml_sycl_prof_active() {
+    return ggml_sycl_op_prof::active() != nullptr;
+}
 
 void ggml_sycl_prof_mark_sub(const std::string & name, uint64_t bytes) {
     if (ggml_sycl_op_prof * a = ggml_sycl_op_prof::active()) {

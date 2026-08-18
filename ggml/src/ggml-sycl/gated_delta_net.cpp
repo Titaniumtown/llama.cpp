@@ -4,10 +4,17 @@
 #include "ggml.h"
 #include "gated_delta_net.hpp"
 #include <cmath>
+#include <cstdlib>
 
 
-template <int S_v, bool KDA, bool keep_rs_t>
-void gated_delta_net_sycl(const float *     q,
+// C is how many columns of the recurrent state one warp owns. It is pure register
+// blocking: every column's arithmetic and its two warp reductions are untouched, so
+// the total FMA and shuffle counts across the launch do not change. What changes is
+// that this token's q and k shards are loaded once per warp instead of once per
+// column, cutting the redundant load traffic by C. Selected by GGML_SYCL_GDN_COLS.
+template <int S_v, int C, bool KDA, bool keep_rs_t>
+void gated_delta_net_sycl(
+                          const float *     q,
                           const float *     k,
                           const float *     v,
                           const float *     g,
@@ -34,31 +41,36 @@ void gated_delta_net_sycl(const float *     q,
     auto           item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const uint32_t h_idx    = item_ct1.get_group(2);
     const uint32_t sequence = item_ct1.get_group(1);
-    // each warp owns one column, using warp-level primitives to reduce across rows
+    // each warp owns C columns, using warp-level primitives to reduce across rows
     const int      lane     = item_ct1.get_local_id(2);
-    const int      col      = item_ct1.get_group(0) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
+    const int      col0     = ((int) (item_ct1.get_group(0) * item_ct1.get_local_range(1) +
+                                      item_ct1.get_local_id(1))) * C;
 
     const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
     const uint32_t iq3 = fastdiv(sequence, rq3_magic);
 
     float *       attn_data        = dst;
 
-    // input state holds s0 only [S_v, S_v, H, n_seqs] — seq stride is D = H * S_v * S_v.
-    // output state layout (per-slot D * n_seqs) — same per-(seq,head) offset as before.
+    // input state holds s0 only [S_v, S_v, H, n_seqs] -- seq stride is D = H * S_v * S_v.
+    // output state layout (per-slot D * n_seqs) -- same per-(seq,head) offset as before.
     const int64_t state_in_offset      = sequence * H * S_v * S_v + h_idx * S_v * S_v;
     const int64_t state_out_offset     = (sequence * H + h_idx) * S_v * S_v;
     state += state_out_offset;
-    curr_state += state_in_offset + col * S_v;
+    curr_state += state_in_offset;
     attn_data += (sequence * n_tokens * H + h_idx) * S_v;
 
     constexpr int warp_size = ggml_sycl_get_physical_warp_size() < S_v ? ggml_sycl_get_physical_warp_size() : S_v;
     static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
+    static_assert(S_v % C == 0, "S_v must be a multiple of the column block C");
     constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
-    float         s_shard[rows_per_lane];
+    float         s_shard[C][rows_per_lane];
 #pragma unroll
-    for (int r = 0; r < rows_per_lane; r++) {
-        const int i = r * warp_size + lane;
-        s_shard[r]  = curr_state[i];
+    for (int c = 0; c < C; c++) {
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            const int i   = r * warp_size + lane;
+            s_shard[c][r] = curr_state[(col0 + c) * S_v + i];
+        }
     }
 
     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
@@ -75,64 +87,92 @@ void gated_delta_net_sycl(const float *     q,
 
         const float beta_val = *beta_t;
 
+        // this token's q/k shard, read once and reused by all C columns -- the point of C
+        float q_reg[rows_per_lane];
+        float k_reg[rows_per_lane];
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            const int i = r * warp_size + lane;
+            q_reg[r]    = q_t[i];
+            k_reg[r]    = k_t[i];
+        }
+
         if constexpr (!KDA) {
             const float g_val = sycl::native::exp(*g_t);
 
             // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
-            float kv_shard = 0.0f;
+            float kv_col[C];
 #pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) {
-                const int i = r * warp_size + lane;
-                kv_shard += s_shard[r] * k_t[i];
-            }
-            float kv_col = warp_reduce_sum<warp_size>(kv_shard);
-
-            // delta[col] = (v[col] - g * kv[col]) * beta
-            float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
-
-            // fused: S[i][col] = g * S[i][col] + k[i] * delta[col]
-            // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
-            float attn_partial = 0.0f;
+            for (int c = 0; c < C; c++) {
+                float kv_shard = 0.0f;
 #pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) {
-                const int i = r * warp_size + lane;
-                s_shard[r]  = g_val * s_shard[r] + k_t[i] * delta_col;
-                attn_partial += s_shard[r] * q_t[i];
+                for (int r = 0; r < rows_per_lane; r++) {
+                    kv_shard += s_shard[c][r] * k_reg[r];
+                }
+                kv_col[c] = warp_reduce_sum<warp_size>(kv_shard);
             }
 
-            float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+#pragma unroll
+            for (int c = 0; c < C; c++) {
+                // delta[col] = (v[col] - g * kv[col]) * beta
+                const float delta_col = (v_t[col0 + c] - g_val * kv_col[c]) * beta_val;
 
-            if (lane == 0) {
-                attn_data[col] = attn_col * scale;
+                // fused: S[i][col] = g * S[i][col] + k[i] * delta[col]
+                // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
+                float attn_partial = 0.0f;
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    s_shard[c][r] = g_val * s_shard[c][r] + k_reg[r] * delta_col;
+                    attn_partial += s_shard[c][r] * q_reg[r];
+                }
+
+                const float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+
+                if (lane == 0) {
+                    attn_data[col0 + c] = attn_col * scale;
+                }
             }
         } else {
+            // g is per-row on this path, so it is hoisted with q/k. exp() is pure, so
+            // computing it once instead of once per use is bit-identical.
+            float g_reg[rows_per_lane];
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                const int i = r * warp_size + lane;
+                g_reg[r]    = sycl::native::exp(g_t[i]);
+            }
+
             // kv[col] = sum_i g[i] * S[i][col] * k[i]
-            float kv_shard = 0.0f;
+            float kv_col[C];
 #pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) {
-                const int i = r * warp_size + lane;
-                kv_shard += sycl::native::exp(g_t[i]) * s_shard[r] * k_t[i];
+            for (int c = 0; c < C; c++) {
+                float kv_shard = 0.0f;
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    kv_shard += g_reg[r] * s_shard[c][r] * k_reg[r];
+                }
+                kv_col[c] = warp_reduce_sum<warp_size>(kv_shard);
             }
 
-            float kv_col = warp_reduce_sum<warp_size>(kv_shard);
-
-            // delta[col] = (v[col] - kv[col]) * beta
-            float delta_col = (v_t[col] - kv_col) * beta_val;
-
-            // fused: S[i][col] = g[i] * S[i][col] + k[i] * delta[col]
-            // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
-            float attn_partial = 0.0f;
 #pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) {
-                const int i = r * warp_size + lane;
-                s_shard[r]  = sycl::native::exp(g_t[i]) * s_shard[r] + k_t[i] * delta_col;
-                attn_partial += s_shard[r] * q_t[i];
-            }
+            for (int c = 0; c < C; c++) {
+                // delta[col] = (v[col] - kv[col]) * beta
+                const float delta_col = (v_t[col0 + c] - kv_col[c]) * beta_val;
 
-            float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+                // fused: S[i][col] = g[i] * S[i][col] + k[i] * delta[col]
+                // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
+                float attn_partial = 0.0f;
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    s_shard[c][r] = g_reg[r] * s_shard[c][r] + k_reg[r] * delta_col;
+                    attn_partial += s_shard[c][r] * q_reg[r];
+                }
 
-            if (lane == 0) {
-                attn_data[col] = attn_col * scale;
+                const float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+
+                if (lane == 0) {
+                    attn_data[col0 + c] = attn_col * scale;
+                }
             }
         }
 
@@ -145,9 +185,12 @@ void gated_delta_net_sycl(const float *     q,
             if (target_slot >= 0 && target_slot < K) {
                 float * curr_state = state + target_slot * state_slot_stride;
 #pragma unroll
-                for (int r = 0; r < rows_per_lane; r++) {
-                    const int i = r * warp_size + lane;
-                    curr_state[col * S_v + i] = s_shard[r];
+                for (int c = 0; c < C; c++) {
+#pragma unroll
+                    for (int r = 0; r < rows_per_lane; r++) {
+                        const int i = r * warp_size + lane;
+                        curr_state[(col0 + c) * S_v + i] = s_shard[c][r];
+                    }
                 }
             }
         }
@@ -155,15 +198,112 @@ void gated_delta_net_sycl(const float *     q,
 
     if constexpr (!keep_rs_t) {
 #pragma unroll
-        for (int r = 0; r < rows_per_lane; r++) {
-            const int i          = r * warp_size + lane;
-            state[col * S_v + i] = s_shard[r];
+        for (int c = 0; c < C; c++) {
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                const int i = r * warp_size + lane;
+                state[(col0 + c) * S_v + i] = s_shard[c][r];
+            }
         }
     }
 }
 
+// warps per work-group; the column block is clamped so that S_v / C never drops
+// below this, which keeps every warp's columns inside the state.
+static constexpr int gdn_num_warps = 4;
+
+template <int C, bool KDA, bool keep_rs_t>
+static void launch_gated_delta_net_cols(
+                                        const float *   q_d,
+                                        const float *   k_d,
+                                        const float *   v_d,
+                                        const float *   g_d,
+                                        const float *   b_d,
+                                        const float *   s_d,
+                                        float *         dst_d,
+                                        float *         state_d,
+                                        int64_t         state_slot_stride,
+                                        int64_t         S_v,
+                                        int64_t         H,
+                                        int64_t         n_tokens,
+                                        int64_t         n_seqs,
+                                        int64_t         sq1,
+                                        int64_t         sq2,
+                                        int64_t         sq3,
+                                        int64_t         sv1,
+                                        int64_t         sv2,
+                                        int64_t         sv3,
+                                        int64_t         sb1,
+                                        int64_t         sb2,
+                                        int64_t         sb3,
+                                        int64_t         neqk1,
+                                        int64_t         rq3,
+                                        float           scale,
+                                        int             K,
+                                        dpct::queue_ptr stream) {
+    const int warp_size = ggml_sycl_info().devices[ggml_sycl_get_device()].warp_size;
+
+    // one warp now covers C columns, so C times fewer warps are needed
+    dpct::dim3 grid_dims(H, n_seqs, (S_v / C + gdn_num_warps - 1) / gdn_num_warps);
+    dpct::dim3 block_dims(warp_size <= S_v ? warp_size : S_v, gdn_num_warps, 1);
+
+    const sycl::uint3 neqk1_magic = init_fastdiv_values(neqk1);
+    const sycl::uint3 rq3_magic   = init_fastdiv_values(rq3);
+
+    switch (S_v) {
+        case 16:
+            {
+                constexpr int sv = 16;
+                stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
+                                     [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                         gated_delta_net_sycl<sv, C, KDA, keep_rs_t>(
+                                                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, sq1, sq2, sq3, sv1, sv2, sv3,
+                                                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
+                                     });
+            }
+            break;
+        case 32:
+            {
+                constexpr int sv = 32;
+                stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
+                                     [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                         gated_delta_net_sycl<sv, C, KDA, keep_rs_t>(
+                                                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, sq1, sq2, sq3, sv1, sv2, sv3,
+                                                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
+                                     });
+            }
+            break;
+        case 64:
+            {
+                constexpr int sv = 64;
+                stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
+                                     [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                         gated_delta_net_sycl<sv, C, KDA, keep_rs_t>(
+                                                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, sq1, sq2, sq3, sv1, sv2, sv3,
+                                                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
+                                     });
+            }
+            break;
+        case 128:
+            {
+                constexpr int sv = 128;
+                stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
+                                     [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                         gated_delta_net_sycl<sv, C, KDA, keep_rs_t>(
+                                                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, sq1, sq2, sq3, sv1, sv2, sv3,
+                                                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
+                                     });
+            }
+            break;
+        default:
+            GGML_ABORT("fatal error");
+            break;
+    }
+}
+
 template <bool KDA, bool keep_rs_t>
-static void launch_gated_delta_net(const float *   q_d,
+static void launch_gated_delta_net(
+                                   const float *   q_d,
                                    const float *   k_d,
                                    const float *   v_d,
                                    const float *   g_d,
@@ -191,64 +331,41 @@ static void launch_gated_delta_net(const float *   q_d,
                                    int             K,
                                    dpct::queue_ptr stream) {
     //TODO: Add chunked kernel for even faster pre-fill
-    const int warp_size = ggml_sycl_info().devices[ggml_sycl_get_device()].warp_size;
-
-    const int num_warps = 4;
-    dpct::dim3 grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
-    dpct::dim3 block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
-
-    const sycl::uint3 neqk1_magic = init_fastdiv_values(neqk1);
-    const sycl::uint3 rq3_magic   = init_fastdiv_values(rq3);
-
-    switch (S_v) {
-        case 16:
-            {
-                constexpr int sv = 16;
-                stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
-                                     [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                         gated_delta_net_sycl<sv, KDA, keep_rs_t>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
-                                                                       sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2,
-                                                                       sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
-                                     });
-            }
-            break;
-        case 32:
-            {
-                constexpr int sv = 32;
-                stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
-                                     [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                         gated_delta_net_sycl<sv, KDA, keep_rs_t>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
-                                                                       sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2,
-                                                                       sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
-                                     });
-            }
-            break;
-        case 64: {
-            {
-                constexpr int sv = 64;
-                stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
-                                        [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                            gated_delta_net_sycl<sv, KDA, keep_rs_t>(
-                                                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, sq1, sq2,
-                                                sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
-                                        });
-            }
-            break;
+    // Columns per warp. 1 reproduces the original launch exactly; 4 is the measured
+    // default (+4.00% pp8192). Higher values cut the redundant per-column q/k loads
+    // without changing any column's arithmetic.
+    static const int cols_req = [] {
+        const char * e = std::getenv("GGML_SYCL_GDN_COLS");
+        if (!e) {
+            return 4;
         }
-        case 128: {
-            {
-                constexpr int sv = 128;
-                stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
-                                        [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                            gated_delta_net_sycl<sv, KDA, keep_rs_t>(
-                                                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, sq1, sq2,
-                                                sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
-                                        });
-            }
+        const int v = std::atoi(e);
+        return (v == 1 || v == 2 || v == 4) ? v : 4;
+    }();
+
+    // Clamp so S_v / C >= gdn_num_warps: otherwise the tail warps of a group would
+    // address columns past the end of the state. S_v is a power of two >= 16 and C is a
+    // power of two <= 8, so halving always lands on a legal value.
+    int cols = cols_req;
+    while (cols > 1 && S_v / cols < gdn_num_warps) {
+        cols /= 2;
+    }
+
+    switch (cols) {
+        case 1:
+            launch_gated_delta_net_cols<1, KDA, keep_rs_t>(
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, state_slot_stride,
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
             break;
-        }
+        case 2:
+            launch_gated_delta_net_cols<2, KDA, keep_rs_t>(
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, state_slot_stride,
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
+            break;
         default:
-            GGML_ABORT("fatal error");
+            launch_gated_delta_net_cols<4, KDA, keep_rs_t>(
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, state_slot_stride,
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
             break;
     }
 }

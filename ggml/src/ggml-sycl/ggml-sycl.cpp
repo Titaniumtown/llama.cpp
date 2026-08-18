@@ -5684,6 +5684,7 @@ struct ggml_sycl_op_prof {
 
     struct entry {
         std::string name;
+        uint64_t    bytes;
         sycl::event ev;
     };
 
@@ -5696,26 +5697,67 @@ struct ggml_sycl_op_prof {
         }
         q = queue;
         marks.clear();
-        marks.push_back({ std::string(), q->ext_oneapi_submit_barrier() });
+        marks.push_back({ std::string(), 0, q->ext_oneapi_submit_barrier() });
     }
 
-    void mark(const ggml_tensor * node) {
+    // Bytes this node is expected to move. For a matmul in decode the weight dwarfs
+    // everything else, so attributing src0 alone gives a directly comparable
+    // "achieved streaming bandwidth" across quant types.
+    static uint64_t node_bytes(const ggml_tensor * node) {
+        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0]) {
+            return ggml_nbytes(node->src[0]);
+        }
+        uint64_t b = ggml_nbytes(node);
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (node->src[j]) {
+                b += ggml_nbytes(node->src[j]);
+            }
+        }
+        return b;
+    }
+
+    static std::string node_key(const ggml_tensor * node) {
+        std::string key = ggml_op_name(node->op);
+        // matmul cost is dominated by the weight, so keep type and shape apart
+        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0]) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "/%s/%ldx%ld", ggml_type_name(node->src[0]->type),
+                     (long) node->src[0]->ne[0], (long) node->src[0]->ne[1]);
+            key += buf;
+        }
+        return key;
+    }
+
+    // One submission may cover a fused span; charge it every byte the span moves.
+    void mark(const ggml_tensor * node, const ggml_cgraph * cgraph = nullptr, int i = 0, int span = 0) {
         if (!enabled() || q == nullptr) {
             return;
         }
-        std::string key = ggml_op_name(node->op);
-        // matmul cost is dominated by the weight type, so keep them apart
-        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0]) {
-            key += "/";
-            key += ggml_type_name(node->src[0]->type);
+        uint64_t bytes = 0;
+        if (cgraph && span > 0) {
+            for (int j = i; j < i + span && j < cgraph->n_nodes; j++) {
+                bytes += node_bytes(cgraph->nodes[j]);
+            }
+        } else {
+            bytes = node_bytes(node);
         }
-        marks.push_back({ std::move(key), q->ext_oneapi_submit_barrier() });
+        marks.push_back({ node_key(node), bytes, q->ext_oneapi_submit_barrier() });
     }
 
     // Totals are accumulated across every graph and dumped once at exit.
-    static std::map<std::string, std::pair<uint64_t, uint64_t>> & totals() {
-        static std::map<std::string, std::pair<uint64_t, uint64_t>> t;
-        return t;
+    struct acc {
+        uint64_t ns    = 0;
+        uint64_t calls = 0;
+        uint64_t bytes = 0;
+    };
+
+    // Deliberately leaked. atexit(dump) is registered from enabled(), which runs before
+    // this map is first constructed, so a function-local static would be destroyed
+    // BEFORE the handler that reads it -- dump() would walk a dead map. Leaking keeps it
+    // alive for the whole process; it is bounded by the number of distinct op keys.
+    static std::map<std::string, acc> & totals() {
+        static std::map<std::string, acc> * t = new std::map<std::string, acc>();
+        return *t;
     }
 
     void flush() {
@@ -5730,8 +5772,9 @@ struct ggml_sycl_op_prof {
             const uint64_t cur =
                 marks[i].ev.get_profiling_info<sycl::info::event_profiling::command_end>();
             auto & slot = t[marks[i].name];
-            slot.first  += cur > prev ? cur - prev : 0;
-            slot.second += 1;
+            slot.ns    += cur > prev ? cur - prev : 0;
+            slot.calls += 1;
+            slot.bytes += marks[i].bytes;
         }
         marks.clear();
     }
@@ -5741,22 +5784,26 @@ struct ggml_sycl_op_prof {
         if (t.empty()) {
             return;
         }
-        uint64_t grand = 0;
+        uint64_t grand = 0, grand_bytes = 0;
         for (const auto & kv : t) {
-            grand += kv.second.first;
+            grand       += kv.second.ns;
+            grand_bytes += kv.second.bytes;
         }
-        std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> v(t.begin(), t.end());
+        std::vector<std::pair<std::string, acc>> v(t.begin(), t.end());
         std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) {
-            return a.second.first > b.second.first;
+            return a.second.ns > b.second.ns;
         });
-        fprintf(stderr, "\n=== SYCL device-time profile (total %.2f ms over all graphs) ===\n",
-                grand / 1e6);
-        fprintf(stderr, "%-28s %12s %10s %12s %8s\n", "op", "gpu_ms", "calls", "us/call", "share");
+        fprintf(stderr, "\n=== SYCL device-time profile (total %.2f ms, %.2f GB over all graphs) ===\n",
+                grand / 1e6, grand_bytes / 1e9);
+        fprintf(stderr, "%-30s %11s %9s %10s %8s %10s\n", "op", "gpu_ms", "calls", "us/call",
+                "share", "GB/s");
         for (const auto & kv : v) {
-            fprintf(stderr, "%-28s %12.3f %10llu %12.2f %7.2f%%\n", kv.first.c_str(),
-                    kv.second.first / 1e6, (unsigned long long) kv.second.second,
-                    kv.second.first / 1e3 / (double) kv.second.second,
-                    grand ? 100.0 * kv.second.first / grand : 0.0);
+            const double ms = kv.second.ns / 1e6;
+            fprintf(stderr, "%-30s %11.3f %9llu %10.2f %7.2f%% %10.1f\n", kv.first.c_str(), ms,
+                    (unsigned long long) kv.second.calls,
+                    kv.second.ns / 1e3 / (double) kv.second.calls,
+                    grand ? 100.0 * kv.second.ns / grand : 0.0,
+                    kv.second.ns ? kv.second.bytes / (double) kv.second.ns : 0.0);
         }
         fflush(stderr);
     }
@@ -5778,7 +5825,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
         if (nodes_to_skip != 0) {
-            prof.mark(node);
+            prof.mark(node, cgraph, i, nodes_to_skip + 1);
             i += nodes_to_skip;
             continue;
         }
@@ -5796,6 +5843,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             const int gdn_nodes_to_skip = ggml_sycl_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
             if (gdn_nodes_to_skip > 0) {
                 ggml_sycl_op_gated_delta_net_fused_cache(*sycl_ctx, node, fused_state_cpy);
+                prof.mark(node);
                 i += gdn_nodes_to_skip;
                 continue;
             }
@@ -5804,6 +5852,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (node->op == GGML_OP_ROPE &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS })) {
             ggml_sycl_rope_fused(*sycl_ctx, node, cgraph->nodes[i + 2]);
+            prof.mark(node, cgraph, i, 3);
             i += 2;
             continue;
         }
@@ -5811,6 +5860,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (node->op == GGML_OP_RMS_NORM &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
             ggml_sycl_op_rms_norm_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
+            prof.mark(node, cgraph, i, 2);
             i++;
             continue;
         }
@@ -5818,6 +5868,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (node->op == GGML_OP_SSM_CONV &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
             ggml_sycl_ssm_conv_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
+            prof.mark(node, cgraph, i, 2);
             i++;
             continue;
         }
@@ -5826,6 +5877,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
              ggml_sycl_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
              ggml_sycl_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS }))) {
             ggml_sycl_fused_unary_mul(*sycl_ctx, node, cgraph->nodes[i + 1]);
+            prof.mark(node, cgraph, i, 2);
             i++;
             continue;
         }
@@ -5834,6 +5886,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
              ggml_sycl_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
              ggml_sycl_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS }))) {
             ggml_sycl_fused_add_unary_mul(*sycl_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+            prof.mark(node, cgraph, i, 3);
             i += 2;
             continue;
         }
@@ -5871,13 +5924,14 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
             if (count >= 2) {
                 ggml_sycl_l2_norm_batch(*sycl_ctx, batch, count);
-                prof.mark(node);
+                prof.mark(node, cgraph, i, count);
                 i += count - 1;
                 continue;
             }
         }
 
         if (node->op == GGML_OP_MUL_MAT && ggml_sycl_mul_mat_glu_mmvq_fused(*sycl_ctx, cgraph, i)) {
+            prof.mark(node, cgraph, i, 3);
             i += 2;
             continue;
         }

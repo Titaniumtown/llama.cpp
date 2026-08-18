@@ -1067,18 +1067,19 @@ static inline void get_scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8
 }
 #endif
 
-template <typename dst_t>
+// `scales` may point at either global or local memory: get_scale_min_k4 only reads bytes.
+// `n` is the qs bytes one thread handles, which fixes the work-group shape at the call site.
+template <typename dst_t, int n>
 inline void dequantize_q4_K_common(dst_t * __restrict__ y, const uint8_t * __restrict__ qs_ptr, const float dall,
-                                   const float dmin, uint8_t * __restrict__ scales_local, int il, int ir) {
+                                   const float dmin, const uint8_t * __restrict__ scales, int il, int ir) {
     const int is = 2 * il;
-    constexpr int n  = 4;
 
     uint8_t sc, m;
-    get_scale_min_k4(is + 0, scales_local, sc, m);
+    get_scale_min_k4(is + 0, scales, sc, m);
     const float d1 = dall * sc;
     const float m1 = dmin * m;
 
-    get_scale_min_k4(is + 1, scales_local, sc, m);
+    get_scale_min_k4(is + 1, scales, sc, m);
     const float d2 = dall * sc;
     const float m2 = dmin * m;
 
@@ -1089,7 +1090,7 @@ inline void dequantize_q4_K_common(dst_t * __restrict__ y, const uint8_t * __res
     }
 }
 
-template<typename dst_t>
+template<typename dst_t, int n, bool stage_scales>
 static void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restrict__ yy,
                                   uint8_t* scales_local, const sycl::nd_item<3> &item_ct1) {
     const block_q4_K * x = (const block_q4_K *) vx;
@@ -1097,22 +1098,29 @@ static void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restri
     const int64_t i = item_ct1.get_group(2);
 
 #if QK_K == 256
+    // A 256-weight block is 4 sub-blocks of 32 qs bytes, each with its own scale pair, so
+    // `n` bytes per thread means 32/n threads per sub-block and 4*(32/n) per work-group.
+    constexpr int per_sub = 32 / n;
     const int64_t tid = item_ct1.get_local_id(2);
-    const int64_t il  = tid / 8;
-    const int64_t ir  = tid % 8;
+    const int64_t il  = tid / per_sub;
+    const int64_t ir  = tid % per_sub;
 
-    dst_t * y = yy + i * QK_K + 64 * il + 4 * ir;
+    dst_t * y = yy + i * QK_K + 64 * il + n * ir;
 
     const sycl::half2 dm = x[i].dm;
     const float dall = dm[0];
     const float dmin = dm[1];
 
-    if (tid < 12) {
-        scales_local[tid] = x[i].scales[tid];
-    }
+    if constexpr (stage_scales) {
+        if (tid < 12) {
+            scales_local[tid] = x[i].scales[tid];
+        }
 
-    item_ct1.barrier(sycl::access::fence_space::local_space);
-    dequantize_q4_K_common(y, x[i].qs, dall, dmin, scales_local, il, ir);
+        item_ct1.barrier(sycl::access::fence_space::local_space);
+        dequantize_q4_K_common<dst_t, n>(y, x[i].qs, dall, dmin, scales_local, il, ir);
+    } else {
+        dequantize_q4_K_common<dst_t, n>(y, x[i].qs, dall, dmin, x[i].scales, il, ir);
+    }
 #else
     const int64_t tid = item_ct1.get_local_id(2);
     const uint8_t * q = x[i].qs;
@@ -1124,15 +1132,16 @@ static void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restri
 #endif
 }
 
-template <typename dst_t>
+template <typename dst_t, int n, bool stage_scales>
 static void dequantize_block_q4_K_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy, uint8_t * scales_local,
                                           const sycl::nd_item<1> & item_ct1, int64_t nb) {
+    constexpr int per_sub = 32 / n;
     const int64_t i   = item_ct1.get_group(0);     // block index
     const int64_t tid = item_ct1.get_local_id(0);  // thread index within block
-    const int64_t il  = tid / 8;
-    const int64_t ir  = tid % 8;
+    const int64_t il  = tid / per_sub;
+    const int64_t ir  = tid % per_sub;
 
-    dst_t * y = yy + i * QK_K + 64 * il + 4 * ir;
+    dst_t * y = yy + i * QK_K + 64 * il + n * ir;
 
     const uint8_t * base          = static_cast<const uint8_t *>(vx);
     const size_t    qs_offset     = i * (QK_K / 2);
@@ -1146,12 +1155,20 @@ static void dequantize_block_q4_K_reorder(const void * __restrict__ vx, dst_t * 
     const float dall = dm_values.x();
     const float dmin = dm_values.y();
 
-    if (tid < 12) {
-        scales_local[tid] = scales_ptr[tid];
-    }
+    if constexpr (stage_scales) {
+        if (tid < 12) {
+            scales_local[tid] = scales_ptr[tid];
+        }
 
-    item_ct1.barrier(sycl::access::fence_space::local_space);
-    dequantize_q4_K_common(y, qs_ptr, dall, dmin, scales_local, il, ir);
+        item_ct1.barrier(sycl::access::fence_space::local_space);
+        dequantize_q4_K_common<dst_t, n>(y, qs_ptr, dall, dmin, scales_local, il, ir);
+    } else {
+        // Read the 12 scale bytes straight from global. Every thread in the group wants the
+        // same bytes, so after the first touch they come from cache -- the staged version
+        // moved the same bytes, and paid a barrier that sat between this load and the qs
+        // load below, serialising two loads that have no dependency on each other.
+        dequantize_q4_K_common<dst_t, n>(y, qs_ptr, dall, dmin, scales_ptr, il, ir);
+    }
 }
 
 template<typename dst_t>

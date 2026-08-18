@@ -4945,13 +4945,39 @@ static inline bool ggml_sycl_f16_mirror_enabled() {
     return e != 0;
 }
 
+// GGML_SYCL_MIRROR_TRACE=1 prints one line per call: whether a mirror was taken and, if
+// not, which test refused it. Four patches have tried to reach the last conversions in the
+// CONVERT/src1 row by wiring a producer read off the profile, and all four collected exactly
+// nothing. A null result cannot separate "the helper declined" from "the helper was never
+// called on this path", which are opposite bugs with opposite fixes -- so the ABSENCE of a
+// line for a producer is as informative as any reason it can print.
+static inline bool mirror_trace_on() {
+    static const int e = ggml_sycl_get_env("GGML_SYCL_MIRROR_TRACE", 0);
+    return e != 0;
+}
+
+static inline void mirror_trace(const char * why, const ggml_tensor * t) {
+    if (UNLIKELY(mirror_trace_on())) {
+        fprintf(stderr, "[MIRROR] %-11s %s\n", why, (t != nullptr && t->name[0]) ? t->name : "?");
+    }
+}
+
 sycl::half * ggml_sycl_f16_mirror_for_next_matmul(ggml_backend_sycl_context & ctx,
                                                   const ggml_tensor * dst, size_t ne) {
-    if (!ggml_sycl_f16_mirror_enabled() || !ggml_sycl_src1_cache_enabled()) { return nullptr; }
-    if (dst == nullptr || dst->type != GGML_TYPE_F32 || dst->data == nullptr)  { return nullptr; }
+    if (!ggml_sycl_f16_mirror_enabled() || !ggml_sycl_src1_cache_enabled()) {
+        mirror_trace("off", dst);
+        return nullptr;
+    }
+    if (dst == nullptr || dst->type != GGML_TYPE_F32 || dst->data == nullptr) {
+        mirror_trace("type", dst);
+        return nullptr;
+    }
 
     const ggml_cgraph * g = ctx.cur_graph;
-    if (g == nullptr) { return nullptr; }
+    if (g == nullptr) {
+        mirror_trace("no-graph", dst);
+        return nullptr;
+    }
 
     // A fused span executes at the index of its HEAD, but the tensor it produces belongs to
     // its LAST node. That matters because the cache's write scan starts just after the
@@ -4963,19 +4989,46 @@ sycl::half * ggml_sycl_f16_mirror_for_next_matmul(ggml_backend_sycl_context & ct
     for (int j = ctx.cur_node; j < g->n_nodes && j - ctx.cur_node <= 8; ++j) {
         if (g->nodes[j] == dst) { prod = j; break; }
     }
-    if (prod < 0 || prod + 1 >= g->n_nodes) { return nullptr; }
+    if (prod < 0 || prod + 1 >= g->n_nodes) {
+        mirror_trace("no-prod", dst);
+        return nullptr;
+    }
     ggml_tensor * nxt = g->nodes[prod + 1];
-    if (nxt->op != GGML_OP_MUL_MAT || nxt->src[1] != dst) { return nullptr; }
+    if (nxt->op != GGML_OP_MUL_MAT || nxt->src[1] != dst) {
+        // A bare "no-consumer" is not actionable: it conflates the wrong op sitting at
+        // prod+1 with the right op holding a different tensor over the same buffer (a view).
+        // Those need opposite fixes -- a wider window versus an alias comparison -- and a
+        // window widened on the wrong guess measured -0.28% for nothing. So say which.
+        if (UNLIKELY(mirror_trace_on())) {
+            char buf[80];
+            const ggml_tensor * c = nxt->src[1];
+            snprintf(buf, sizeof(buf), "nc:%s/%s%s", ggml_op_name(nxt->op),
+                     (c != nullptr && c->name[0]) ? c->name : "-",
+                     (c != nullptr && c->data == dst->data) ? "=alias" : "");
+            mirror_trace(buf, dst);
+        }
+        return nullptr;
+    }
 
     // Only the f16 GEMM path converts src1. The mat-vec paths quantize to q8_1 or read f32
     // directly, so a mirror written for them is pure extra traffic -- which is exactly the
     // decode case, where ne[1] is 1..a few and this must stay silent.
-    if (nxt->src[1]->ne[1] <= 1) { return nullptr; }
-    if (can_use_dequantize_mul_mat_vec(nxt->src[0], nxt->src[1], nxt)) { return nullptr; }
-    if (can_use_mul_mat_vec_q(nxt->src[0], nxt->src[1], nxt))          { return nullptr; }
+    if (nxt->src[1]->ne[1] <= 1) {
+        mirror_trace("ne1", dst);
+        return nullptr;
+    }
+    if (can_use_dequantize_mul_mat_vec(nxt->src[0], nxt->src[1], nxt)) {
+        mirror_trace("dmmv", dst);
+        return nullptr;
+    }
+    if (can_use_mul_mat_vec_q(nxt->src[0], nxt->src[1], nxt)) {
+        mirror_trace("mmvq", dst);
+        return nullptr;
+    }
 
     // The lookup re-validates: same graph, bounded node distance, and no node between here
     // and the consumer writing over the f32 source. Storing cannot make a stale hit possible.
+    mirror_trace("TAKEN", dst);
     return src1_f16_store(ctx, dst->data, (const void *) ctx.stream(), ne, prod);
 }
 

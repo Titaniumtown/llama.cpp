@@ -2523,6 +2523,12 @@ static void mul_mat_vec_q5_K_q8_1_sycl_switch_ncols(
     }
 }
 
+template <int ncols_dst>
+static void mul_mat_vec_q5_K_reorder_wide_ncols(const void * __restrict__ vx, const void * __restrict__ vy,
+                                                float * __restrict__ dst, const int ncols, const int nrows,
+                                                const int stride_col_y_bytes, const int stride_col_dst,
+                                                const sycl::nd_item<3> & nd_item);
+
 static void reorder_mul_mat_vec_q5_k_q8_1_sycl(const void * vx, const void * vy, float * dst, const int ncols,
                                                const int nrows, dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
@@ -2532,11 +2538,18 @@ static void reorder_mul_mat_vec_q5_k_q8_1_sycl(const void * vx, const void * vy,
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
+    // Decode (n=1) ran the scalar generic kernel; the q6_K launcher below measured
+    // this same rerouting for q5_K as WORSE (+0.89%) and kept the generic path --
+    // but that was against the old scalar-load wide body. 0134 rebuilt the wide
+    // kernel on int4 lanes (2 vector weight loads instead of 8 scalar, activation
+    // int4s instead of 8 scalar ints), which invalidates that measurement's
+    // premise: at one column there is no column loop left to lose on, so it is
+    // simply the better loader, exactly the q6_K argument. Both strides are dead
+    // at ncols_dst == 1 (col == 0), so passing 0/0 is safe.
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                             [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q5_K>>(vx, vy, dst, ncols,
-                                                                                            nrows, nd_item);
+                                mul_mat_vec_q5_K_reorder_wide_ncols<1>(vx, vy, dst, ncols, nrows, 0, 0, nd_item);
                             });
     });
 }
@@ -2839,8 +2852,11 @@ static void reorder_mul_mat_vec_q6_k_q8_1_sycl(const void * vx, const void * vy,
     // paired against the previous build, 3 rounds: tg64 d0 26.52 -> 26.69 t/s (+0.65%),
     // d65536 15.95 -> 15.99 (+0.27%), 6/6 round-deltas positive. Correctness: 11/11
     // q6_K MUL_MAT cases against the CPU reference.
-    // q4_K (+0.39%) and q5_K (+0.89%) were measured the same way and got WORSE, so they
-    // keep the generic kernel -- this is q6_K-only on purpose.
+    // q4_K (+0.39%) and q5_K (+0.89%) were measured the same way and got WORSE, so
+    // both kept the generic kernel at the time. q5_K has since moved to its wide
+    // kernel (see the launcher above): the +0.89% was measured against the
+    // scalar-load wide body, and 0134's int4-lane rebuild flipped it. q4_K's
+    // result stands -- its wide kernel already had int4 loads when it lost.
     // ncols_dst == 1 makes both strides dead (col == 0), so passing 0/0 is safe.
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),

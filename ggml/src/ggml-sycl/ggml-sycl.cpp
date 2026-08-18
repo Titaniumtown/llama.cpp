@@ -6365,6 +6365,23 @@ struct ggml_sycl_op_prof {
                 key += role_of(w->name);
             }
         }
+        // Every other op aggregates over SHAPE, and its us/call is then a mean over a
+        // mixture that matches none of its members. RMS_NORM+MUL is the case that caught
+        // this: it reports 9.32 us/call with a max of 12010.9 us, and the same kernel at the
+        // decode shape [5120,4] benches at 2.77 us standalone -- a 3.4x gap that four
+        // separate experiments (work-group geometry, the reduction itself, interleaving with
+        // eight distinct kernels, and the profiler's own submit_barrier) all failed to
+        // explain, because there was nothing to explain: the row is a mixture and the bench
+        // is one member of it. Carry the destination shape so a row means one thing.
+        //
+        // Under the same names flag as the MUL_MAT role suffix, so a profile taken without
+        // it is byte-identical to every one recorded before this patch.
+        else if (name_keys()) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "/%ldx%ldx%ld", (long) node->ne[0], (long) node->ne[1],
+                     (long) node->ne[2]);
+            key += buf;
+        }
         return key;
     }
 

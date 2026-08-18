@@ -5936,9 +5936,44 @@ struct ggml_sycl_op_prof {
                          (long) w->ne[0], (long) w->ne[1]);
             }
             key += buf;
+            // One shape key can cover several distinct weights -- 6144x5120 is both
+            // attn_output and ssm_out -- and their per-call costs differ, so the averaged
+            // row hides which one is slow. Opt-in, because it multiplies the row count.
+            if (name_keys()) {
+                key += "/";
+                key += role_of(w->name);
+            }
         }
         return key;
     }
+
+    // "blk.37.ssm_out.weight" -> "ssm_out": the block index is noise here, every block runs
+    // the same tensor, and 43 near-identical rows per weight would bury the table.
+    static std::string role_of(const char * name) {
+        std::string s = name ? name : "?";
+        if (s.compare(0, 4, "blk.") == 0) {
+            size_t dot = s.find('.', 4);
+            if (dot != std::string::npos) {
+                s.erase(0, dot + 1);
+            }
+        }
+        const std::string suffix = ".weight";
+        if (s.size() > suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            s.erase(s.size() - suffix.size());
+        }
+        return s;
+    }
+
+    static bool name_keys() {
+        static const bool v = ggml_sycl_get_env("GGML_SYCL_PROF_NAMES", 0) != 0;
+        return v;
+    }
+
+    // One submission may cover a fused span; charge it every byte the span moves.
+    void mark(const ggml_tensor * node, const ggml_cgraph * cgraph = nullptr, int i = 0, int span = 0) {
+        if (!enabled() || q == nullptr) {
+            return;
+        }
 
     // One submission may cover a fused span; charge it every byte the span moves.
     void mark(const ggml_tensor * node, const ggml_cgraph * cgraph = nullptr, int i = 0, int span = 0) {

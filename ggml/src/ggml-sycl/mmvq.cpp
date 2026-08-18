@@ -1600,15 +1600,29 @@ static void mul_mat_vec_q4_K_q8_1_sycl_switch_ncols(
 static inline float q4k_wide_dot(const sycl::int4 & vq, const uint8_t * sc, const uint8_t * m,
                                  const sycl::float2 & dm4f, int half, const sycl::int4 & u0, const sycl::int4 & u1,
                                  float d8_0, float d8_1, float s8_0, float s8_1) {
-    float sumf_d = 0.0f;
+    // Accumulate the two dot products in int32 and apply the scales once, instead of
+    // scaling every term.
+    //
+    // `d8_0`/`d8_1` (activation block scales) and `sc[0]`/`sc[1]` (weight group scales)
+    // are all invariant across p, yet the previous form paid, for each of the 8 terms,
+    // an int multiply by sc, an int->float convert, a float multiply by d8 and a float
+    // add -- while passing 0 as dp4a's accumulator and discarding it. dp4a carries the
+    // accumulator for free, so the whole p-loop collapses to 8 dp4a, and the scaling
+    // becomes 2 converts + 4 multiplies + 1 add for the entire call.
+    //
+    // Exact, and strictly better rounded than what it replaces: the nibbles are 0..15
+    // and the activations int8, so |dot| <= 4 lanes * 4 iters * 15 * 127 = 30480, and
+    // after the 6-bit scale still under 2e6 -- three orders inside int32. Integer
+    // accumulation cannot round at all, where the old float chain rounded 8 times.
+    int dot0 = 0;
+    int dot1 = 0;
 #pragma unroll
     for (int p = 0; p < 4; ++p) {
-        const int vp  = vq[p];
-        const int vi0 = (vp >> 0) & 0x0F0F0F0F;
-        const int vi1 = (vp >> 4) & 0x0F0F0F0F;
-        sumf_d += d8_0 * (dpct::dp4a(vi0, u0[p], 0) * sc[0]);
-        sumf_d += d8_1 * (dpct::dp4a(vi1, u1[p], 0) * sc[1]);
+        const int vp = vq[p];
+        dot0 = dpct::dp4a((vp >> 0) & 0x0F0F0F0F, u0[p], dot0);
+        dot1 = dpct::dp4a((vp >> 4) & 0x0F0F0F0F, u1[p], dot1);
     }
+    const float sumf_d = d8_0 * (float) (dot0 * sc[0]) + d8_1 * (float) (dot1 * sc[1]);
     const float sumf_m = (half == 0) ? (s8_0 * m[0] + s8_1 * m[1]) : 0.0f;
     return dm4f.x() * sumf_d - dm4f.y() * sumf_m;
 }

@@ -280,7 +280,32 @@ void gated_delta_net_sycl(
 
 // warps per work-group; the column block is clamped so that S_v / C never drops
 // below this, which keeps every warp's columns inside the state.
-static constexpr int gdn_num_warps = 4;
+//
+// A group covers C * warps columns, so each (head, token)'s q_t/k_t row is re-read by
+// S_v / (C * warps) groups. Raising this is therefore the direct test of whether the
+// GDN row is bound by redundant q/k load traffic: it cuts exactly that redundancy and
+// reaches nothing else (the kernel takes its warp index from the nd_item at runtime,
+// so no registers and no s_shard change). Selected by GGML_SYCL_GDN_WARPS.
+// The cols clamp below keeps its shipped meaning (C small enough for a 4-warp group);
+// the warp count is clamped separately, against the columns a group actually has.
+static constexpr int gdn_cols_clamp_warps = 4;
+
+static int ggml_sycl_gdn_num_warps() {
+    static const int v = [] {
+        int n = 32;
+        if (const char * e = std::getenv("GGML_SYCL_GDN_WARPS")) {
+            const int p = std::atoi(e);
+            // block is warp_size * n work-items; 32 keeps that inside every device's
+            // limit and, at S_v=128/C=4, is exactly one group per head.
+            if (p >= 1 && p <= 32) {
+                n = p;
+            }
+        }
+        GGML_LOG_DEBUG("%s: GDN warps per work-group = %d\n", __func__, n);
+        return n;
+    }();
+    return v;
+}
 
 template <int C, bool KDA, bool keep_rs_t>
 static void launch_gated_delta_net_cols(
@@ -317,8 +342,15 @@ static void launch_gated_delta_net_cols(
     const int warp_size = ggml_sycl_info().devices[ggml_sycl_get_device()].warp_size;
 
     // one warp now covers C columns, so C times fewer warps are needed
-    dpct::dim3 grid_dims(H, n_seqs, (S_v / C + gdn_num_warps - 1) / gdn_num_warps);
-    dpct::dim3 block_dims(warp_size <= S_v ? warp_size : S_v, gdn_num_warps, 1);
+    // A group's warps split S_v / C column-blocks between them, so a warp count above
+    // that leaves the tail warps addressing past the end of the state. Halving always
+    // lands on a legal value: S_v and C are both powers of two.
+    int gdn_warps = ggml_sycl_gdn_num_warps();
+    while (gdn_warps > 1 && gdn_warps > S_v / C) {
+        gdn_warps /= 2;
+    }
+    dpct::dim3 grid_dims(H, n_seqs, (S_v / C + gdn_warps - 1) / gdn_warps);
+    dpct::dim3 block_dims(warp_size <= S_v ? warp_size : S_v, gdn_warps, 1);
 
     const sycl::uint3 neqk1_magic = init_fastdiv_values(neqk1);
     const sycl::uint3 rq3_magic   = init_fastdiv_values(rq3);
@@ -423,7 +455,7 @@ static void launch_gated_delta_net(
     // address columns past the end of the state. S_v is a power of two >= 16 and C is a
     // power of two <= 8, so halving always lands on a legal value.
     int cols = cols_req;
-    while (cols > 1 && S_v / cols < gdn_num_warps) {
+    while (cols > 1 && S_v / cols < gdn_cols_clamp_warps) {
         cols /= 2;
     }
 

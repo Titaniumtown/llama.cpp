@@ -60,6 +60,7 @@
 #include "ggml-sycl/backend.hpp"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/element_wise.hpp"
+#include "ggml-sycl/fwht.hpp"
 #include "ggml-sycl/gemm.hpp"
 #include "ggml-sycl/getrows.hpp"
 #include "ggml-sycl/norm.hpp"
@@ -4901,6 +4902,18 @@ static bool ggml_sycl_fold_ne2_columns(const ggml_tensor * src0, ggml_tensor & s
 }
 
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1_in, ggml_tensor * dst_in) {
+    // A Hadamard src0 is not data, it is a transform ggml has already named. Every other
+    // backend (CPU, CUDA, Vulkan, Metal, BLAS) reads this hint and runs an FWHT; SYCL was
+    // the only one that did not, so these nodes reached the oneDNN GEMM and paid a dense
+    // O(n^2) product plus a full read of a matrix whose contents are implied by its name.
+    // The op check is not redundant: unlike CUDA, this backend routes MUL_MAT_ID through
+    // this same function with a stack copy of the dst, which carries MUL_MAT_ID's own
+    // op_params. ggml_mul_mat_set_hint() asserts GGML_OP_MUL_MAT for the same reason.
+    if (dst_in->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(dst_in, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+        ggml_sycl_op_fwht(ctx, src1_in, dst_in)) {
+        return;
+    }
+
     static const int fold_env = ggml_sycl_get_env("GGML_SYCL_FOLD_NE2_COLS", 1);
     ggml_tensor src1_folded = *src1_in;
     ggml_tensor dst_folded  = *dst_in;

@@ -902,6 +902,14 @@ static constexpr int ggml_sycl_get_max_cpy_bytes() {
 sycl::half * ggml_sycl_f16_mirror_for_next_matmul(ggml_backend_sycl_context & ctx,
                                                   const ggml_tensor * dst, size_t ne);
 
+// Decode-side dual of the f16 mirror: if the node after `dst` is a mat-vec that will quantize
+// `dst` to q8_1 as its src1, hand back the SoA q8_1 buffer for the producing kernel to fill and
+// register it in the src1 q8_1 cache (the rendezvous -- no consumer detection, 0123's recipe).
+// Returns nullptr when the consumer would not quantize, so the caller can template the
+// emission away. *kx receives ne00. Defined in ggml-sycl.cpp beside the cache.
+char * ggml_sycl_q8_emit_for_next_matvec(ggml_backend_sycl_context & ctx,
+                                         const ggml_tensor * dst, int * kx);
+
 // Aligned memory transfers of 8/16 bytes can be faster than 2 transfers with 4 bytes.
 template <int nbytes, int alignment = 0>
 static __dpct_inline__ void ggml_sycl_memcpy_1(void * dst, const void * src) {

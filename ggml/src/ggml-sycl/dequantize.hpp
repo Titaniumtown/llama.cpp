@@ -1122,10 +1122,38 @@ inline void dequantize_q4_K_common(dst_t * __restrict__ y, const uint8_t * __res
     const float m2 = dmin * m;
 
     sycl::vec<uint8_t, n> q_vec = vec_aligned_load<uint8_t, n>(qs_ptr + 32 * il + n * ir);
+
+    // Explicit wide stores. The load here was already vectorised; the stores were a scalar
+    // loop, and the compiler does NOT merge adjacent 2-byte stores into one wide store. That
+    // is the whole cost of this kernel. Standalone bench, real 5120x17408 shape, three runs:
+    //
+    //     n=2  64 thr/blk  scalar (previous)   1682 / 677 / 792 us    136 / 337 / 288 GB/s
+    //     n=4  32 thr/blk  scalar              1066 / 712 / 722 us    214 / 321 / 316 GB/s
+    //     n=8  16 thr/blk  scalar               901 / 746 / 743 us    254 / 306 / 308 GB/s
+    //     n=2  64 thr/blk  vec2  (4B)           571 / 571 / 616 us    400 / 400 / 371 GB/s
+    //     n=4  32 thr/blk  vec4  (8B)           391 / 392 / 408 us    584 / 582 / 560 GB/s  <-
+    //     n=8  16 thr/blk  vec8  (16B)          407 / 407 / 408 us    561 / 562 / 560 GB/s
+    //     n=16  8 thr/blk  vec16 (32B)          659 / 661 / 659 us    347 / 346 / 347 GB/s
+    //
+    // Note what this does to 0050's conclusion. That patch swept the same n and read the
+    // result as "monotone in thread count", shipping the narrowest thread (n=2, 64 threads).
+    // With scalar stores it IS monotone -- but the trend was store width in disguise: fewer
+    // bytes per thread meant less of each thread's work went through 2-byte stores. Once the
+    // stores are wide the ordering inverts and the middle of the range wins. The scalar rows
+    // also swing by 2.5x run to run while every vec row is reproducible to under 4%, which is
+    // the same signature the q8_0 reorder dequant had before 0059.
+    //
+    // y is n-element aligned at every call site (y = yy + i*QK_K + 64*il + n*ir, and Q4_K is
+    // absent from the non-contiguous dispatch, which returns nullptr for it), so both stores
+    // below are naturally aligned.
+    sycl::vec<dst_t, n> lo, hi;
+#pragma unroll
     for (int l = 0; l < n; ++l) {
-        y[l + 0]  = d1 * (q_vec[l] & 0xF) - m1;
-        y[l + 32] = d2 * (q_vec[l] >> 4) - m2;
+        lo[l] = d1 * (q_vec[l] & 0xF) - m1;
+        hi[l] = d2 * (q_vec[l] >> 4)  - m2;
     }
+    *reinterpret_cast<sycl::vec<dst_t, n> *>(y +  0) = lo;
+    *reinterpret_cast<sycl::vec<dst_t, n> *>(y + 32) = hi;
 }
 
 template<typename dst_t, int n, bool stage_scales>

@@ -215,7 +215,9 @@ static void dequantize_row_q4_1_sycl(const void *vx, dst_t *y, const int64_t k,
 //                             byte loads of its own.
 static inline int q4k_deq_n() {
     static const int v = [] {
-        const int n = ggml_sycl_get_env("GGML_SYCL_Q4K_DEQ_N", 2);
+        // 0050 measured 2 as best with scalar stores; with the wide stores in
+        // dequantize_q4_K_common the ordering inverts and 4 wins. Still tunable.
+        const int n = ggml_sycl_get_env("GGML_SYCL_Q4K_DEQ_N", 4);
         return (n == 2 || n == 4 || n == 8) ? n : 2;
     }();
     return v;

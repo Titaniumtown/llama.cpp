@@ -2645,6 +2645,7 @@ catch (sycl::exception const &exc) {
 // A no-op unless GGML_SYCL_PROF=1; defined next to the profiler further down.
 // non-static: fattn-common.hpp marks the FA K/V dequant, which is not a graph node.
 void ggml_sycl_prof_mark_sub(const std::string & name, uint64_t bytes);
+void ggml_sycl_prof_mark_gap();
 
 // 0 disables the src1 f16 conversion cache, restoring a fresh conversion per matmul.
 static inline bool ggml_sycl_src1_cache_enabled() {
@@ -3263,6 +3264,9 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
             dev[i].src1_ddq = dev[i].src1_ddq_alloc.alloc(ctx.pool(i), nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs);
 
             if (src1_on_device && src1_is_contiguous) {
+                // Bracket the submit so the row below measures this kernel and not the
+                // host setup that preceded it -- see ggml_sycl_prof_mark_gap().
+                ggml_sycl_prof_mark_gap();
                 scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
                                                      /*num_src=*/2, " : converting src1 to Q8_1");
                 try {
@@ -6136,6 +6140,17 @@ struct ggml_sycl_op_prof {
 void ggml_sycl_prof_mark_sub(const std::string & name, uint64_t bytes) {
     if (ggml_sycl_op_prof * a = ggml_sycl_op_prof::active()) {
         a->mark_named(name, bytes);
+    }
+}
+
+// Close the span BEFORE a sub-marked submit. A mark's duration is
+// marks[i].end - marks[i-1].end, so on an in-order queue a sub-mark bills every
+// microsecond since the previous barrier -- including GPU idle while the host was
+// still setting the call up. For a sub-mark whose kernel is large that bias is
+// noise; for one whose real work is sub-microsecond it is the entire row.
+void ggml_sycl_prof_mark_gap() {
+    if (ggml_sycl_op_prof * a = ggml_sycl_op_prof::active()) {
+        a->mark_named("HOST/gpu-idle+setup", 0);
     }
 }
 

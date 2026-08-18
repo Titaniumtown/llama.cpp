@@ -353,6 +353,12 @@ struct ggml_backend_sycl_context {
     // This is the GDN decay chain (ssm_alpha -> +ssm_dt -> softplus -> *ssm_a). Its
     // three ggml nodes move 48 floats and cost a full dispatch each; the mat-vec that
     // produces their input already has the value in a register at the store.
+    // Set alongside mmvq_dsa_* when a SECOND, independent mat-vec over the same activation
+    // is folded into this dispatch. mmvq_pair_other is that mat-vec, whose weight is read
+    // here; mmvq_pair_anchor_is_dsa says whether the decay epilogue belongs to the anchor
+    // or to it, since ggml's order between the two is not fixed.
+    const ggml_tensor * mmvq_pair_other = nullptr;
+    bool                mmvq_pair_anchor_is_dsa = false;
     const ggml_tensor * mmvq_dsa_out   = nullptr;
     const ggml_tensor * mmvq_dsa_bias  = nullptr;
     const ggml_tensor * mmvq_dsa_scale = nullptr;

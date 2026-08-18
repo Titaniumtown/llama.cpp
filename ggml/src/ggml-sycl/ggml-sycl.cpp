@@ -6860,6 +6860,108 @@ static bool find_conv_collapse(const ggml_cgraph * cgraph, int concat_idx, const
     return true;
 }
 
+bool ggml_sycl_fuse_pair_diag();
+
+#define PAIR_REJECT(tag)                                                             \
+    do {                                                                             \
+        if (ggml_sycl_fuse_pair_diag()) {                                            \
+            static bool seen_##__LINE__ = false;                                     \
+            if (!seen_##__LINE__) {                                                  \
+                seen_##__LINE__ = true;                                              \
+                fprintf(stderr, "[MMPAIR] reject %s\n", tag);                        \
+            }                                                                        \
+        }                                                                            \
+    } while (0)
+
+// What one dispatch will cover when two independent mat-vecs share an activation.
+struct mul_mat_pair_fusion {
+    ggml_tensor * other         = nullptr;  // the paired mat-vec
+    ggml_tensor * dsa_mul       = nullptr;  // final MUL of the decay chain
+    ggml_tensor * bias          = nullptr;
+    ggml_tensor * scale         = nullptr;
+    int           chain_lo      = -1;       // graph range of the decay chain
+    int           chain_hi      = -1;
+    bool          anchor_is_dsa = false;
+};
+
+// Locates the second of a pair of independent mat-vecs sharing one activation. Anchored at
+// whichever ggml ordered first; the other sits a few nodes downstream (the delta-net's beta
+// and alpha projections are separated by a reshape and the sigmoid `0125` folds into the
+// GDN), so the scan is short and stops at the first MUL_MAT it meets.
+//
+// Exactly one of the two must be a decay-chain (DSA) mat-vec, and carrying that epilogue
+// here is a correctness requirement rather than an extra: absorbing that mat-vec means its
+// own dispatch never runs, so the fold it would have performed has to happen in this
+// kernel. Pairing the raw mat-vecs alone would leave the three epilogue nodes to dispatch
+// separately, trading the launch this saves for the one that fold already removed.
+//
+// Which side is which is NOT fixed -- ggml orders these by the consuming GDN's source list,
+// not by construction order -- so both arrangements are accepted.
+static bool find_mul_mat_pair(const ggml_cgraph * cgraph, int idx, mul_mat_pair_fusion & out) {
+    if (!g_ggml_sycl_enable_fusion) {
+        return false;
+    }
+    ggml_tensor * a  = cgraph->nodes[idx];
+    const int     hi = std::min(idx + 12, cgraph->n_nodes);
+    ggml_tensor * b  = nullptr;
+    int           bi = -1;
+    for (int j = idx + 1; j < hi; j++) {
+        if (cgraph->nodes[j]->op == GGML_OP_MUL_MAT) {
+            b  = cgraph->nodes[j];
+            bi = j;
+            break;
+        }
+    }
+    if (b == nullptr) {
+        PAIR_REJECT("no second mul_mat in window");
+        return false;
+    }
+    if (!ggml_sycl_should_fuse_mul_mat_pair(a, b)) {
+        PAIR_REJECT("geometry/activation mismatch");
+        return false;
+    }
+
+    const std::initializer_list<enum ggml_op> chain = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD,
+                                                        GGML_OP_UNARY, GGML_OP_MUL };
+    const bool a_dsa = idx + 4 < cgraph->n_nodes &&
+                       ggml_sycl_can_fuse(cgraph, idx, chain, { GGML_UNARY_OP_SOFTPLUS });
+    const bool b_dsa = bi + 4 < cgraph->n_nodes &&
+                       ggml_sycl_can_fuse(cgraph, bi, chain, { GGML_UNARY_OP_SOFTPLUS });
+    if (a_dsa == b_dsa) {
+        PAIR_REJECT(a_dsa ? "both are decay chains" : "neither is a decay chain");
+        return false;
+    }
+
+    const int     ci  = a_dsa ? idx : bi;
+    ggml_tensor * mul = cgraph->nodes[ci + 4];
+
+    // Everything this dispatch writes lands at the anchor's position, so nothing between
+    // may read or write it. The folded nodes are excluded: they never execute.
+    const int lo = a_dsa ? idx + 5 : idx + 1;
+    if (region_touched_between(cgraph, lo, bi, mul, /*include_reads=*/true)) {
+        PAIR_REJECT("decay output touched in between");
+        return false;
+    }
+    if (a_dsa && region_touched_between(cgraph, lo, bi, b, /*include_reads=*/true)) {
+        PAIR_REJECT("raw output touched in between");
+        return false;
+    }
+    // the paired activation read moves to the anchor, so nothing may rewrite it in between
+    if (region_touched_between(cgraph, lo, bi, a->src[1], /*include_reads=*/false)) {
+        PAIR_REJECT("activation rewritten in between");
+        return false;
+    }
+
+    out.other         = b;
+    out.dsa_mul       = mul;
+    out.bias          = cgraph->nodes[ci + 2]->src[1];
+    out.scale         = mul->src[1];
+    out.chain_lo      = ci;
+    out.chain_hi      = ci + 4;
+    out.anchor_is_dsa = a_dsa;
+    return true;
+}
+
 // Device-side per-op profiler, enabled with GGML_SYCL_PROF=1.
 //
 // A host-side timer around each op has to synchronise per node, which inflates the
@@ -7253,6 +7355,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     ggml_tensor * collapse_conv = nullptr;
     ggml_tensor * collapse_cpy  = nullptr;
     ggml_tensor * collapse_silu = nullptr;
+    // graph indices already covered by a folded mat-vec pair above: the decay chain
+    // [lo, hi], plus the single paired node when the anchor was the chain itself
+    int           pair_skip_lo   = -1;
+    int           pair_skip_hi   = -1;
+    ggml_tensor * pair_skip_node = nullptr;
     ggml_sycl_op_prof prof;
     prof.begin(sycl_ctx->stream());
 
@@ -7270,6 +7377,18 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         if (node == collapse_silu) {
             collapse_silu = nullptr;
+            continue;
+        }
+        if (i >= pair_skip_lo && i <= pair_skip_hi) {
+            // No dispatch: the folded pair above already produced these.
+            if (i == pair_skip_hi) {
+                pair_skip_lo = -1;
+                pair_skip_hi = -1;
+            }
+            continue;
+        }
+        if (node == pair_skip_node) {
+            pair_skip_node = nullptr;
             continue;
         }
         if (ggml_sycl_is_view_or_noop(node)) {
@@ -7396,6 +7515,46 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         // capability is checked HERE: if the mmvq switch fell through to any other
         // kernel the three skipped nodes would simply never run, which is a wrong
         // answer rather than a slow one.
+        // Two independent mat-vecs over one activation, folded into a single
+        // two-destination dispatch. At this size both are ~99% launch overhead -- the
+        // delta-net beta/alpha projections each move 138 KB in ~8.4 us, i.e. 16 GB/s
+        // against a measured 598.9 GB/s wall -- so reading the second weight costs far
+        // less than the launch it removes. Must precede the DSA hook below, which would
+        // otherwise claim the decay-chain half on its own. GGML_SYCL_FUSE_PAIR=0 disables.
+        static const int fuse_pair = ggml_sycl_get_env("GGML_SYCL_FUSE_PAIR", 1);
+        if (fuse_pair && node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr &&
+            node->src[1] != nullptr && node->src[1]->ne[1] == 1 &&
+            node->src[0]->type == GGML_TYPE_Q4_K && node->src[0]->extra != nullptr &&
+            ((ggml_tensor_extra_gpu *) node->src[0]->extra)->optimized_feature.reorder) {
+            mul_mat_pair_fusion pf;
+            if (find_mul_mat_pair(cgraph, i, pf)) {
+                sycl_ctx->mmvq_pair_other         = pf.other;
+                sycl_ctx->mmvq_pair_anchor_is_dsa = pf.anchor_is_dsa;
+                sycl_ctx->mmvq_dsa_out            = pf.dsa_mul;
+                sycl_ctx->mmvq_dsa_bias           = pf.bias;
+                sycl_ctx->mmvq_dsa_scale          = pf.scale;
+                ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(*sycl_ctx, node->src[0], node->src[1], node,
+                                                                    ggml_sycl_op_mul_mat_vec_q);
+                sycl_ctx->mmvq_pair_other         = nullptr;
+                sycl_ctx->mmvq_pair_anchor_is_dsa = false;
+                sycl_ctx->mmvq_dsa_out            = nullptr;
+                sycl_ctx->mmvq_dsa_bias           = nullptr;
+                sycl_ctx->mmvq_dsa_scale          = nullptr;
+                if (pf.anchor_is_dsa) {
+                    // the chain starts at this node; step over its four followers and skip
+                    // the paired mat-vec wherever it lands
+                    prof.mark(node, cgraph, i, 5);
+                    i              += 4;
+                    pair_skip_node  = pf.other;
+                } else {
+                    prof.mark(node);
+                    pair_skip_lo = pf.chain_lo;
+                    pair_skip_hi = pf.chain_hi;
+                }
+                continue;
+            }
+        }
+
         static const int fuse_dsa = ggml_sycl_get_env("GGML_SYCL_FUSE_DSA", 1);
         if (fuse_dsa && node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr &&
             node->src[1] != nullptr && node->src[1]->ne[1] == 1 &&
@@ -7665,6 +7824,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     GGML_ASSERT(ssm_wb_conv == nullptr && "conv-state writeback skipped but never performed");
     GGML_ASSERT(collapse_conv == nullptr && collapse_cpy == nullptr && collapse_silu == nullptr &&
                 "conv chain collapsed but a node it absorbed was never reached");
+    GGML_ASSERT(pair_skip_lo == -1 && pair_skip_node == nullptr &&
+                "mat-vec pair folded but a node it absorbed was never reached");
     prof.flush();
 }
 

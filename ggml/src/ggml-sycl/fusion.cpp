@@ -1,6 +1,49 @@
 #include "fusion.hpp"
 
 #include <algorithm>
+// Two INDEPENDENT mat-vecs over one activation, written to two destinations. Same weight
+// geometry requirement as the GLU pair -- identical shape and row stride in the reorder
+// (SoA) layout, so the second reuses the first's per-block offsets -- but with no combining
+// op, because these two feed unrelated consumers. The delta-net beta and alpha projections
+// are exactly this: two build_lora_mm calls on the same `cur`, q4_K ne=[n_embd, n_v_heads].
+bool ggml_sycl_should_fuse_mul_mat_pair(const ggml_tensor * a, const ggml_tensor * b) {
+    if (a->op != GGML_OP_MUL_MAT || b->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    const ggml_tensor * wa = a->src[0];
+    const ggml_tensor * wb = b->src[0];
+    if (wa == nullptr || wb == nullptr || wa == wb) {
+        return false;
+    }
+    if (wa->type != GGML_TYPE_Q4_K || wb->type != GGML_TYPE_Q4_K) {
+        return false;
+    }
+    if (!ggml_are_same_shape(wa, wb) || wa->nb[1] != wb->nb[1]) {
+        return false;
+    }
+    if (a->src[1] == nullptr || a->src[1] != b->src[1] || a->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (a->src[1]->ne[1] != 1) {
+        return false;
+    }
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || !ggml_are_same_shape(a, b)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b)) {
+        return false;
+    }
+    const auto * ea = (const ggml_tensor_extra_gpu *) wa->extra;
+    const auto * eb = (const ggml_tensor_extra_gpu *) wb->extra;
+    if (!ea || !eb || !ea->optimized_feature.reorder || !eb->optimized_feature.reorder) {
+        return false;
+    }
+    if (ggml_sycl_info().device_count > 1) {
+        return false;
+    }
+    return true;
+}
+
 static bool ggml_sycl_should_fuse_rope_set_rows(const ggml_tensor * rope,
                                                 const ggml_tensor * view,
                                                 const ggml_tensor * set_rows) {

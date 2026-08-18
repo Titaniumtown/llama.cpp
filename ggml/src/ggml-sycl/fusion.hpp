@@ -14,4 +14,9 @@
 bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops,
                         std::initializer_list<enum ggml_unary_op> unary_ops = {});
 
+// Two independent mat-vecs sharing one activation, folded into a single two-destination
+// dispatch. Unlike ggml_sycl_can_fuse this takes the nodes directly: the pair is not a
+// contiguous op sequence, so the caller locates the second itself.
+bool ggml_sycl_should_fuse_mul_mat_pair(const ggml_tensor * a, const ggml_tensor * b);
+
 #endif  // GGML_SYCL_FUSION_HPP

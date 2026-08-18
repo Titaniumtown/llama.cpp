@@ -8081,13 +8081,16 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 first->op == GGML_OP_MUL_MAT && glu->src[0] != nullptr && glu->src[1] != nullptr &&
                 ((glu->src[0] == first && glu->src[1] == node) ||
                  (glu->src[0] == node && glu->src[1] == first)) &&
-                node->src[0] != nullptr && node->src[1] != nullptr && node->src[1]->ne[1] == 1 &&
+                node->src[0] != nullptr && node->src[1] != nullptr &&
+                node->src[1]->ne[1] >= 1 && node->src[1]->ne[1] <= 8 &&
                 node->src[1]->ne[2] == 1 && node->src[1]->ne[3] == 1 &&
                 (node->src[0]->type == GGML_TYPE_Q4_K || node->src[0]->type == GGML_TYPE_Q5_K) &&
                 node->src[0]->ne[0] % QK_K == 0 && node->src[0]->ne[2] == 1 && node->src[0]->ne[3] == 1 &&
                 node->type == GGML_TYPE_F32 && first->type == GGML_TYPE_F32 &&
                 glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) && ggml_is_contiguous(first) &&
+                ggml_is_contiguous(node) &&
                 glu->ne[0] == node->ne[0] && first->ne[0] == node->ne[0] &&
+                glu->ne[1] == node->ne[1] && first->ne[1] == node->ne[1] &&
                 node->src[0]->extra != nullptr &&
                 ((ggml_tensor_extra_gpu *) node->src[0]->extra)->optimized_feature.reorder &&
                 ggml_sycl_info().device_count == 1;

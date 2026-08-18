@@ -3091,6 +3091,30 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
     const int64_t ne00     = src0->ne[0];
     const int64_t row_diff = row_high - row_low;
 
+    // GGML_SYCL_MMV_TRACE=1: one line per mat-vec with every variable that could explain a
+    // per-tensor throughput difference. `ssm_out` and `attn_output` are byte-identical q4_K
+    // weights (ne=[6144,5120], nb=[144,3456,...]) running the same one-column reorder kernel
+    // at 413.8 vs 502.8 GB/s, stable across profiles; reorder and an ncols split are both
+    // already refuted by measurement, so the next step must add information rather than
+    // another hypothesis. Compiled to a branch on a static int when off.
+    {
+        static const int mmv_trace = ggml_sycl_get_env("GGML_SYCL_MMV_TRACE", 0);
+        if (UNLIKELY(mmv_trace != 0)) {
+            const ggml_tensor_extra_gpu * ex = (const ggml_tensor_extra_gpu *) dst->src[0]->extra;
+            fprintf(stderr,
+                    "[MMV] %-26s ne00=%5ld rows=%5ld ncols=%ld reorder=%d "
+                    "s0%%256=%3u s1q%%256=%3u dst%%256=%3u "
+                    "src1=[%ld,%ld,%ld,%ld] src1nb1=%ld dstne=[%ld,%ld]\n",
+                    src0->name, (long) ne00, (long) row_diff, (long) src1_ncols,
+                    ex ? (int) ex->optimized_feature.reorder : -1,
+                    (unsigned) (((uintptr_t) src0_dd_i) % 256),
+                    (unsigned) (((uintptr_t) src1_ddq_i) % 256),
+                    (unsigned) (((uintptr_t) dst_dd_i) % 256),
+                    (long) src1->ne[0], (long) src1->ne[1], (long) src1->ne[2], (long) src1->ne[3],
+                    (long) src1->nb[1], (long) dst->ne[0], (long) dst->ne[1]);
+        }
+    }
+
     int id;
     SYCL_CHECK(CHECK_TRY_ERROR(id = get_current_device_id()));
     const size_t q8_1_ts = sizeof(block_q8_1);

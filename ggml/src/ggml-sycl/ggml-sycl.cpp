@@ -3062,7 +3062,14 @@ inline void ggml_sycl_op_mul_mat_sycl(
                                 break;
                             }
                         }
-                        snprintf(ckey + cn, sizeof(ckey) - (size_t) cn, "[%s]", pop);
+                        // ...and the CONSUMER's op, which needs no scan at all -- `dst` IS
+                        // the consuming node here. Three patches aimed at this row have now
+                        // collected nothing, and the untested half of the story is the
+                        // consumer: the mirror's lookahead accepts only GGML_OP_MUL_MAT, and
+                        // a MoE activation arrives at this very conversion through
+                        // GGML_OP_MUL_MAT_ID, which that test rejects outright.
+                        snprintf(ckey + cn, sizeof(ckey) - (size_t) cn, "[%s->%s]", pop,
+                                 ggml_op_name(dst->op));
                     }
                 }
                 ggml_sycl_prof_mark_sub(ckey, ne * (sizeof(float) + sizeof(sycl::half)));

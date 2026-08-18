@@ -365,6 +365,24 @@ struct ggml_backend_sycl_context {
         std::unique_ptr<ggml_sycl_pool_alloc<sycl::half>> buf;
     } src1_f16;
 
+    // The same redundancy on the DECODE side, which the f16 cache above structurally cannot
+    // reach: the mat-VEC path quantizes src1 to q8_1 rather than converting it to f16, once
+    // per mat-mul. A transformer block feeds ONE normed activation to every projection that
+    // hangs off it -- Q/K/V and the GDN gate all read attn_norm, up and gate both read
+    // ffn_norm -- so the same rows are re-quantized 2-4x per block. Counted on this model
+    // from a GGML_SYCL_DEBUG trace: 510 mat-muls per graph over 266 distinct src1, i.e.
+    // 1.92x, stable to +/-0.01 across five consecutive graphs.
+    struct src1_q8_cache {
+        const ggml_cgraph * graph   = nullptr;
+        const void *        key     = nullptr;  // src1_ddf of the cached tensor
+        const void *        stream  = nullptr;  // separates the multi-device split path
+        size_t              bytes   = 0;        // size of the q8_1 buffer
+        size_t              src_ne  = 0;        // f32 elements the key spans, for the overlap test
+        int                 variant = -1;       // which quantize functor wrote this layout
+        int                 node    = -1;       // graph node index it was produced at
+        std::unique_ptr<ggml_sycl_pool_alloc<char>> buf;
+    } src1_q8;
+
     // set by the graph walker so the matmul op can locate itself in the graph
     const ggml_cgraph * cur_graph = nullptr;
     int                 cur_node  = -1;
@@ -384,11 +402,33 @@ struct ggml_backend_sycl_context {
 
     ggml_sycl_pool & src1_pool() { return src1_pool(device); }
 
+    // A SEPARATE pool, not a second tenant of src1_pools: that pool is stack-disciplined and
+    // holds exactly one allocation, which is what makes LIFO trivially true there. Two caches
+    // replacing their buffers in either order would violate it.
+    std::unique_ptr<ggml_sycl_pool> src1q_pools[GGML_SYCL_MAX_DEVICES];
+
+    ggml_sycl_pool & src1q_pool(int device) {
+        if (src1q_pools[device] == nullptr) {
+            src1q_pools[device] = new_pool_for_device(stream(device, 0), device);
+        }
+        return *src1q_pools[device];
+    }
+
+    ggml_sycl_pool & src1q_pool() { return src1q_pool(device); }
+
     void src1_f16_reset() {
         src1_f16.buf.reset();
         src1_f16.graph = nullptr;
         src1_f16.key   = nullptr;
         src1_f16.node  = -1;
+    }
+
+    void src1_q8_reset() {
+        src1_q8.buf.reset();
+        src1_q8.graph   = nullptr;
+        src1_q8.key     = nullptr;
+        src1_q8.node    = -1;
+        src1_q8.variant = -1;
     }
 
     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
@@ -408,7 +448,7 @@ struct ggml_backend_sycl_context {
     // on no decode-only one -- decode's ne1 == 1 takes mmvq, never converts src1, and so never
     // populates the cache. The results had already been printed by then, which is exactly what
     // makes it easy to miss.
-    ~ggml_backend_sycl_context() { src1_f16_reset(); }
+    ~ggml_backend_sycl_context() { src1_f16_reset(); src1_q8_reset(); }
 
     queue_ptr stream(int device, int stream) {
         if (qptrs[device][stream] == nullptr) {

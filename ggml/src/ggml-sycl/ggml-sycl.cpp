@@ -2851,6 +2851,63 @@ static sycl::half * src1_f16_store(ggml_backend_sycl_context & ctx, const void *
     return c.buf->get();
 }
 
+// 0 disables the src1 q8_1 quantize cache, restoring a fresh quantize per mat-vec.
+static inline bool ggml_sycl_src1_q8_cache_enabled() {
+    static const int e = ggml_sycl_get_env("GGML_SYCL_SRC1_Q8_CACHE", 1);
+    return e != 0;
+}
+
+static inline bool src1_q8_overlaps(const ggml_backend_sycl_context & ctx, const void * p, size_t bytes) {
+    if (ctx.src1_q8.key == nullptr || p == nullptr) { return false; }
+    const char * b0 = (const char *) ctx.src1_q8.key;
+    const char * b1 = b0 + ctx.src1_q8.src_ne * sizeof(float);
+    const char * p0 = (const char *) p;
+    return p0 < b1 && b0 < p0 + bytes;
+}
+
+// Same validity argument as src1_f16_lookup, and deliberately the same shape so the two cannot
+// drift: a hit requires the identical source pointer, stream, size and quantize LAYOUT, the same
+// graph, a bounded node distance, and -- the part that actually makes it safe -- that no node
+// between the store and here writes over the source range. ggml's allocator reuses buffers, so
+// the pointer alone proves nothing.
+//
+// The graph-pointer check is load-bearing ONLY in combination with the per-graph reset in
+// ggml_backend_sycl_graph_compute_impl. ggml recycles the cgraph allocation, so a later graph can
+// legitimately carry the same address; and in a single-node graph cur_node == c.node, which makes
+// the overlap walk below run ZERO iterations. Both conditions hold in test-backend-ops, which is
+// how the un-reset version of this cache served one op's activation to the next op entirely.
+static char * src1_q8_lookup(ggml_backend_sycl_context & ctx, const void * key, const void * strm,
+                             size_t bytes, size_t src_ne, int variant) {
+    auto & c = ctx.src1_q8;
+    if (!c.buf || c.key != key || c.stream != strm)           { return nullptr; }
+    if (c.bytes != bytes || c.src_ne != src_ne)               { return nullptr; }
+    if (c.variant != variant)                                 { return nullptr; }
+    if (ctx.cur_graph == nullptr || c.graph != ctx.cur_graph) { return nullptr; }
+    if (ctx.cur_node < c.node || ctx.cur_node - c.node > 64)  { return nullptr; }
+    for (int j = c.node + 1; j <= ctx.cur_node; ++j) {
+        const ggml_tensor * n = ctx.cur_graph->nodes[j];
+        if (n->data != nullptr && src1_q8_overlaps(ctx, n->data, ggml_nbytes(n))) {
+            return nullptr;
+        }
+    }
+    return c.buf->get();
+}
+
+static char * src1_q8_store(ggml_backend_sycl_context & ctx, const void * key, const void * strm,
+                            size_t bytes, size_t src_ne, int variant) {
+    auto & c = ctx.src1_q8;
+    c.buf = std::make_unique<ggml_sycl_pool_alloc<char>>(ctx.src1q_pool());
+    c.buf->alloc(bytes);
+    c.graph   = ctx.cur_graph;
+    c.key     = key;
+    c.stream  = strm;
+    c.bytes   = bytes;
+    c.src_ne  = src_ne;
+    c.variant = variant;
+    c.node    = ctx.cur_node;
+    return c.buf->get();
+}
+
 inline void ggml_sycl_op_mul_mat_sycl(
     ggml_backend_sycl_context & ctx,
     const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
@@ -3419,7 +3476,23 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
         }
 
         if constexpr(quantize_enabled) {
-            dev[i].src1_ddq = dev[i].src1_ddq_alloc.alloc(ctx.pool(i), nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs);
+            const size_t ddq_bytes = (size_t) nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs;
+            // The two functors write different layouts into this buffer; tag which one did, so a
+            // reordered-SoA buffer can never be handed to a consumer expecting the plain one.
+            const int  qvariant  = std::is_same<quantize_f<QK8_1 / WARP_SIZE>,
+                                                quantize_and_reorder_q8_1_soa<QK8_1 / WARP_SIZE>>::value ? 1 : 0;
+            const bool cacheable = src1_on_device && src1_is_contiguous && !split
+                                   && ggml_sycl_src1_q8_cache_enabled();
+            char * qhit = cacheable ? src1_q8_lookup(ctx, dev[i].src1_ddf, (const void *) stream,
+                                                     ddq_bytes, (size_t) ggml_nelements(src1), qvariant)
+                                    : nullptr;
+            if (qhit != nullptr) {
+                dev[i].src1_ddq = qhit;
+            } else {
+            dev[i].src1_ddq = cacheable
+                ? src1_q8_store(ctx, dev[i].src1_ddf, (const void *) stream, ddq_bytes,
+                                (size_t) ggml_nelements(src1), qvariant)
+                : dev[i].src1_ddq_alloc.alloc(ctx.pool(i), ddq_bytes);
 
             if (src1_on_device && src1_is_contiguous) {
                 // Bracket the submit so the row below measures this kernel and not the
@@ -3441,6 +3514,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                 ggml_sycl_prof_mark_sub("QUANTIZE/src1/f32->q8_1",
                                         (uint64_t) nrows1 * ne10 * sizeof(float)
                                             + (uint64_t) nrows1 * src1_padded_col_size * q8_1_ts / q8_1_bs);
+            }
             }
         }
 
@@ -6317,6 +6391,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // A tensor's bytes can be written between graphs (ggml_backend_tensor_set), and buffer
     // addresses are reused across graphs, so nothing survives the boundary.
     sycl_ctx->src1_f16_reset();
+    sycl_ctx->src1_q8_reset();
     sycl_ctx->cur_graph = cgraph;
     ggml_sycl_op_prof prof;
     prof.begin(sycl_ctx->stream());

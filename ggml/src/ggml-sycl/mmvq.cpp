@@ -2150,6 +2150,198 @@ static void reorder_mul_mat_vec_q5_k_q8_1_sycl(const void * vx, const void * vy,
     });
 }
 
+// Wide multi-column Q5_K reorder MMVQ (MTP verify). Same lane->iqs mapping as
+// the generic mul_mat_vec_q_reorder_ncols, but the weight load + 5-bit decode
+// (vl|vh, scales, mins, dm) is hoisted out of the per-column loop -- the scalar
+// path redid all of it per column. Math is identical to
+// vec_dot_q5_K_q8_1_impl_vmmq_presum.
+template <int ncols_dst>
+static void mul_mat_vec_q5_K_reorder_wide_ncols(const void * __restrict__ vx, const void * __restrict__ vy,
+                                                float * __restrict__ dst, const int ncols, const int nrows,
+                                                const int stride_col_y_bytes, const int stride_col_dst,
+                                                const sycl::nd_item<3> & nd_item) {
+    using block_type   = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q5_K>;
+    using block_traits = typename block_type::traits;
+
+    const auto sg       = nd_item.get_sub_group();
+    const int  sg_range = sg.get_group_linear_range();
+    const int  row      = nd_item.get_group_linear_id() * sg_range + sg.get_group_linear_id();
+    if (row >= nrows) {
+        return;
+    }
+
+    const int     blocks_per_row              = ncols / block_traits::qk;
+    constexpr int blocks_per_subgroup         = ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
+    constexpr int block_elements_per_subgroup = block_traits::qi / block_traits::vdr_mmvq;
+    const int     nblocks                     = nrows * (ncols / block_traits::qk);
+
+    const uint8_t * vbq = static_cast<const uint8_t *>(vx);
+
+    float partial[ncols_dst] = { 0.0f };
+    for (int i = sg.get_local_linear_id() / block_elements_per_subgroup; i < blocks_per_row;
+         i += blocks_per_subgroup) {
+        const int  ibx       = row * blocks_per_row + i;
+        const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
+        const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+        const int  iby       = i * block_type::block_to_q8_1_ratio();
+
+#pragma unroll
+        for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+            const int iqs = elem + block_traits::vdr_mmvq * (sg.get_local_linear_id() % block_elements_per_subgroup);
+
+            // ---- weight load + 5-bit decode: hoisted once, reused across columns ----
+            const uint8_t *     qs         = vbq + bx_offset.first;
+            const uint8_t *     qh_base    = vbq + bx_offset.second;
+            const uint16_t *    scales     = reinterpret_cast<const uint16_t *>(vbq + d_offset.first);
+            const sycl::half2 * dms        = reinterpret_cast<const sycl::half2 *>(vbq + d_offset.second);
+            const int           bq8_offset = QR5_K * ((iqs / 2) / (QI8_1 / 2));
+            const int *         ql_ptr     = reinterpret_cast<const int *>(qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+            const int *         qh_ptr     = reinterpret_cast<const int *>(qh_base + 4 * ((iqs / 2) % 4));
+            const int           vl0 = ql_ptr[0], vl1 = ql_ptr[4];
+            const int           vh0 = qh_ptr[0] >> bq8_offset, vh1 = qh_ptr[4] >> bq8_offset;
+            uint16_t            aux[2];
+            const int           jsc = bq8_offset / 2;
+            if (jsc < 2) {
+                aux[0] = scales[jsc + 0] & 0x3f3f;
+                aux[1] = scales[jsc + 2] & 0x3f3f;
+            } else {
+                aux[0] = ((scales[jsc + 2] >> 0) & 0x0f0f) | ((scales[jsc - 2] & 0xc0c0) >> 2);
+                aux[1] = ((scales[jsc + 2] >> 4) & 0x0f0f) | ((scales[jsc - 0] & 0xc0c0) >> 2);
+            }
+            const uint8_t *    sc      = reinterpret_cast<const uint8_t *>(aux);
+            const uint8_t *    m       = sc + 2;
+            const sycl::float2 dm5f    = (*dms).convert<float, sycl::rounding_mode::automatic>();
+            const bool         add_min = ((iqs / 2) % (QI8_1 / 2)) == 0;
+            const int          qoff    = (iqs / 2) % 4;
+
+            int v0[QR5_K], v1[QR5_K];
+#pragma unroll
+            for (int ii = 0; ii < QR5_K; ++ii) {
+                const int vh0i = ((vh0 >> ii) << 4) & 0x10101010;
+                const int vh1i = ((vh1 >> ii) << 4) & 0x10101010;
+                v0[ii] = ((vl0 >> (4 * ii)) & 0x0F0F0F0F) | vh0i;
+                v1[ii] = ((vl1 >> (4 * ii)) & 0x0F0F0F0F) | vh1i;
+            }
+
+            // ---- per-column dot (activation-dependent) ----
+#pragma unroll
+            for (int col = 0; col < ncols_dst; ++col) {
+                const char *        vy_j = static_cast<const char *>(vy) + col * stride_col_y_bytes;
+                const int8_t *      q8p  = reinterpret_cast<const int8_t *>(vy_j) + iby * QK8_1;
+                const sycl::half2 * q8ds = reinterpret_cast<const sycl::half2 *>(vy_j + ncols + iby * sizeof(sycl::half2));
+                float sumf_d = 0.0f;
+                float sumf_m = 0.0f;
+#pragma unroll
+                for (int ii = 0; ii < QR5_K; ++ii) {
+                    const sycl::float2 dsv = (*(q8ds + bq8_offset + ii)).convert<float, sycl::rounding_mode::automatic>();
+                    const int *       q8   = reinterpret_cast<const int *>(q8p + (bq8_offset + ii) * QK8_1) + qoff;
+                    const int         dot1 = dpct::dp4a(v0[ii], q8[0], dpct::dp4a(v1[ii], q8[4], 0));
+                    sumf_d += dsv[0] * (dot1 * sc[ii]);
+                    sumf_m += add_min ? (dsv[1] * m[ii]) : 0.0f;
+                }
+                partial[col] += dm5f.x() * sumf_d - dm5f.y() * sumf_m;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int col = 0; col < ncols_dst; ++col) {
+        const float sum = sycl::reduce_over_group(sg, partial[col], std::plus<>());
+        if (sg.leader()) {
+            dst[col * stride_col_dst + row] = sum;
+        }
+    }
+}
+
+// Wide multi-column Q6_K reorder MMVQ (MTP verify). Hoists the weight load +
+// 6-bit decode (vl|vh, int8 scales, d; Q6_K is symmetric, no min) out of the
+// per-column loop. Math is identical to vec_dot_q6_K_q8_1_impl_mmvq_scalar.
+template <int ncols_dst>
+static void mul_mat_vec_q6_K_reorder_wide_ncols(const void * __restrict__ vx, const void * __restrict__ vy,
+                                                float * __restrict__ dst, const int ncols, const int nrows,
+                                                const int stride_col_y_bytes, const int stride_col_dst,
+                                                const sycl::nd_item<3> & nd_item) {
+    using block_type   = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q6_K>;
+
+    const auto sg       = nd_item.get_sub_group();
+    const int  sg_range = sg.get_group_linear_range();
+    const int  row      = nd_item.get_group_linear_id() * sg_range + sg.get_group_linear_id();
+    if (row >= nrows) {
+        return;
+    }
+
+    // 128-bit-load layout mirroring the Q4_K wide kernel: 8 lanes own one Q6_K
+    // block -- each lane a 16-byte int4 of ql (4 quant groups iqs=4c..4c+3) -- with
+    // WARP_SIZE/8 blocks per sub-group. ql, qh and the activation quads all load as
+    // int4 (fewer, wider, coalesced transactions) and the per-block offset math runs
+    // 1/4 as often. Numerically identical to the scalar VDR=1 path.
+    const int blocks_per_row  = ncols / QK_K;
+    const int nblocks         = nrows * blocks_per_row;
+    const int lane            = sg.get_local_linear_id();
+    const int blocks_per_wave = WARP_SIZE / 8;
+    const int lb              = lane / 8;
+    const int c               = lane % 8;
+
+    // per-lane constants (constant across the lane's 4 quant groups iqs=4c..4c+3)
+    const int qh_i4_idx = 2 * (c / 4) + (c % 2);
+    const int vh_shift  = 2 * (((4 * c) % 16) / 8);
+    const int scale_off = 8 * (c / 4) + ((4 * c) % 16) / 4;
+    const int bq8       = 4 * (c / 4) + ((4 * c) % 16) / 8;
+    const int uoff_i4   = ((4 * c) % 8) / 4;
+
+    const uint8_t * base = static_cast<const uint8_t *>(vx);
+
+    float partial[ncols_dst] = { 0.0f };
+    for (int blk = lb; blk < blocks_per_row; blk += blocks_per_wave) {
+        const int  ibx       = row * blocks_per_row + blk;
+        const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
+        const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+        const int  iby       = blk * block_type::block_to_q8_1_ratio();
+
+        // ql/qh/scales/d: loaded ONCE per block via 128-bit int4, reused across columns
+        const sycl::int4 ql4 = *(reinterpret_cast<const sycl::int4 *>(base + bx_offset.first) + c);
+        const sycl::int4 qh4 = *(reinterpret_cast<const sycl::int4 *>(base + bx_offset.second) + qh_i4_idx);
+        const int8_t *   scs = reinterpret_cast<const int8_t *>(base + d_offset.first) + scale_off;
+        const int8_t     sc0 = scs[0], sc1 = scs[4];
+        const float      d   = *reinterpret_cast<const ggml_half *>(base + d_offset.second);
+
+        // 6-bit decode for the 4 quant groups, hoisted out of the column loop
+        int vi0[4], vi1[4];
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const int vl   = ql4[p];
+            const int vh   = qh4[p] >> vh_shift;
+            const int vih0 = ((vh >> 0) << 4) & 0x30303030;
+            const int vih1 = ((vh >> 4) << 4) & 0x30303030;
+            vi0[p] = byte_sub_4(((vl >> 0) & 0x0F0F0F0F) | vih0, 0x20202020);
+            vi1[p] = byte_sub_4(((vl >> 4) & 0x0F0F0F0F) | vih1, 0x20202020);
+        }
+
+#pragma unroll
+        for (int col = 0; col < ncols_dst; ++col) {
+            const char *        vy_j = static_cast<const char *>(vy) + col * stride_col_y_bytes;
+            const int8_t *      q8p  = reinterpret_cast<const int8_t *>(vy_j) + iby * QK8_1;
+            const sycl::half2 * q8ds = reinterpret_cast<const sycl::half2 *>(vy_j + ncols + iby * sizeof(sycl::half2));
+            const sycl::int4    u0   = *(reinterpret_cast<const sycl::int4 *>(q8p + bq8 * QK8_1) + uoff_i4);
+            const sycl::int4    u1   = *(reinterpret_cast<const sycl::int4 *>(q8p + (bq8 + 2) * QK8_1) + uoff_i4);
+            const float         d80  = (*(q8ds + bq8 + 0))[0];
+            const float         d81  = (*(q8ds + bq8 + 2))[0];
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                partial[col] += d * (d80 * (dpct::dp4a(vi0[p], u0[p], 0) * sc0) + d81 * (dpct::dp4a(vi1[p], u1[p], 0) * sc1));
+            }
+        }
+    }
+
+#pragma unroll
+    for (int col = 0; col < ncols_dst; ++col) {
+        const float sum = sycl::reduce_over_group(sg, partial[col], std::plus<>());
+        if (sg.leader()) {
+            dst[col * stride_col_dst + row] = sum;
+        }
+    }
+}
+
 template <int ncols_dst>
 static void reorder_mul_mat_vec_q5_k_q8_1_sycl_ncols(
         const void * vx, const void * vy, float * dst,
@@ -2166,9 +2358,8 @@ static void reorder_mul_mat_vec_q5_k_q8_1_sycl_ncols(
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                          [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             mul_mat_vec_q_reorder_ncols<reorder_vec_dot_q_sycl<GGML_TYPE_Q5_K>, ncols_dst>(
-                                 vx, /*vgate=*/ nullptr, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst,
-                                 /*glu_op=*/ GGML_GLU_OP_SWIGLU, nd_item);
+                             mul_mat_vec_q5_K_reorder_wide_ncols<ncols_dst>(
+                                 vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, nd_item);
                          });
     });
 }
@@ -2225,9 +2416,8 @@ static void reorder_mul_mat_vec_q6_k_q8_1_sycl_ncols(
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                          [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             mul_mat_vec_q_reorder_ncols<reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K>, ncols_dst>(
-                                 vx, /*vgate=*/ nullptr, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst,
-                                 /*glu_op=*/ GGML_GLU_OP_SWIGLU, nd_item);
+                             mul_mat_vec_q6_K_reorder_wide_ncols<ncols_dst>(
+                                 vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, nd_item);
                          });
     });
 }

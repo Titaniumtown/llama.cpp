@@ -491,6 +491,53 @@ static void l2_norm_f32_sycl(const float *   x,
     }
 }
 
+// Batched L2 norm: N independent, same-shape, contiguous F32 tensors normalized in
+// one launch. The GDN layer emits q/k (and, across adjacent GDN layers, more)
+// l2_norms as consecutive independent siblings; on the latency-bound decode path
+// collapsing N launches into 1 removes per-launch overhead. The tensor index is
+// folded into grid dim0; each row's reduction is identical to the single-tensor
+// kernel, so the result is bit-exact.
+#define GGML_SYCL_L2_BATCH_MAX 8
+struct l2_batch_ptrs {
+    const float * src[GGML_SYCL_L2_BATCH_MAX];
+    float *       dst[GGML_SYCL_L2_BATCH_MAX];
+};
+
+template <int warp_size>
+static void l2_norm_f32_batch(l2_batch_ptrs p, const int ncols, const float eps,
+                              const sycl::nd_item<3> & item_ct1) {
+    const int t   = item_ct1.get_group(0);  // tensor index
+    const int row = item_ct1.get_group(2);  // flattened row (contiguous: ne1*ne2*ne3)
+    const int tid = item_ct1.get_local_id(2);
+
+    const float * x   = p.src[t] + (int64_t) row * ncols;
+    float *       dst = p.dst[t] + (int64_t) row * ncols;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += warp_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+    tmp = block_reduce<block_reduce_method::SUM, warp_size>(tmp, (float *) nullptr, warp_size);
+    const float scale = sycl::rsqrt(sycl::fmax(tmp, eps * eps));
+    for (int col = tid; col < ncols; col += warp_size) {
+        dst[col] = scale * x[col];
+    }
+}
+
+template <int warp_size>
+static void l2_norm_f32_batch_sycl(l2_batch_ptrs p, const int n_tensors, const int ncols,
+                                   const int nrows_total, const float eps, queue_ptr stream) {
+    const dpct::dim3 blocks_num(nrows_total, 1, n_tensors);
+    const dpct::dim3 block_dims(warp_size, 1, 1);
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(blocks_num * block_dims, block_dims),
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(warp_size)]] {
+                l2_norm_f32_batch<warp_size>(p, ncols, eps, item_ct1);
+            });
+    });
+}
+
 void ggml_sycl_op_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
 
@@ -823,4 +870,23 @@ void ggml_sycl_op_l2_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
     */
     l2_norm_f32_sycl<WARP_SIZE>(src0_d, dst_d, ne00, ne01, ne02, ne03,
             ss0, ss1, ss2, ss3, ds0, ds1, ds2, ds3, eps, stream, ctx.device);
+}
+
+// Batched entry: nodes[0..count) are independent, same-shape, contiguous F32 L2_NORM
+// ops with identical eps (validated by the caller). Requires ncols < 1024 (the warp
+// reduction path); the caller must not batch wider rows.
+void ggml_sycl_l2_norm_batch(ggml_backend_sycl_context & ctx, ggml_tensor ** nodes, int count) {
+    const ggml_tensor * s0 = nodes[0]->src[0];
+    const int ncols       = (int) s0->ne[0];
+    const int nrows_total = (int) ggml_nrows(s0);
+    float eps;
+    memcpy(&eps, nodes[0]->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    l2_batch_ptrs p{};
+    for (int t = 0; t < count; ++t) {
+        p.src[t] = (const float *) nodes[t]->src[0]->data;
+        p.dst[t] = (float *) nodes[t]->data;
+    }
+    l2_norm_f32_batch_sycl<WARP_SIZE>(p, count, ncols, nrows_total, eps, ctx.stream());
 }

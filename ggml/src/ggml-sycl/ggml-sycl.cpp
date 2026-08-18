@@ -5683,6 +5683,44 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             i += 2;
             continue;
         }
+        // batch consecutive independent same-shape contiguous F32 L2_NORM siblings
+        // (GDN q/k norms) into one launch -- decode is launch-bound. Single device.
+        if (node->op == GGML_OP_L2_NORM && ggml_sycl_info().device_count == 1 &&
+            node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F32 &&
+            node->src[0]->ne[0] < 1024 &&
+            ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node)) {
+            ggml_tensor * batch[8];  // must match GGML_SYCL_L2_BATCH_MAX in norm.cpp
+            int           count = 0;
+            float         eps0;
+            memcpy(&eps0, node->op_params, sizeof(float));
+            for (int j = i; j < cgraph->n_nodes && count < 8; ++j) {
+                ggml_tensor * nj = cgraph->nodes[j];
+                if (nj->op != GGML_OP_L2_NORM || (nj->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+                    nj->type != GGML_TYPE_F32 || nj->src[0]->type != GGML_TYPE_F32 ||
+                    !ggml_is_contiguous(nj->src[0]) || !ggml_is_contiguous(nj) ||
+                    !ggml_are_same_shape(nj, node)) {
+                    break;
+                }
+                float epsj;
+                memcpy(&epsj, nj->op_params, sizeof(float));
+                if (epsj != eps0) {
+                    break;
+                }
+                bool indep = true;  // must not read an earlier batched node's output
+                for (int k = 0; k < count; ++k) {
+                    if (nj->src[0] == batch[k]) { indep = false; break; }
+                }
+                if (!indep) {
+                    break;
+                }
+                batch[count++] = nj;
+            }
+            if (count >= 2) {
+                ggml_sycl_l2_norm_batch(*sycl_ctx, batch, count);
+                i += count - 1;
+                continue;
+            }
+        }
 
         if (node->op == GGML_OP_MUL_MAT && ggml_sycl_mul_mat_glu_mmvq_fused(*sycl_ctx, cgraph, i)) {
             i += 2;

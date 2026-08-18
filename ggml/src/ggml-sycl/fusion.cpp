@@ -21,9 +21,14 @@ static bool ggml_sycl_should_fuse_rope_set_rows(const ggml_tensor * rope,
     if (!ggml_is_contiguous(view) || view->ne[0] != rope->ne[0] * rope->ne[1]) {
         return false;
     }
-    // only the norm/neox rope kernels carry the fused set_rows write
+    // Which rope kernels carry the fused set_rows write. VISION is the one that still
+    // does not: rope_vision() has no row_indices/set_rows_stride plumbing, and unlike
+    // rope_multi() it is not otherwise identical to rope_neox(), so adding it there is
+    // a separate change. Keep this an allowlist rather than "not VISION" so a new mode
+    // is excluded until someone has looked at its kernel.
     const int mode = ((const int32_t *) rope->op_params)[2];
-    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
+    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX &&
+        mode != GGML_ROPE_TYPE_MROPE && mode != GGML_ROPE_TYPE_IMROPE) {
         return false;
     }
     return true;

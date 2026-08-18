@@ -156,15 +156,16 @@ static void rope_neox(const T *x, D *dst, const int ne00, const int ne01,
     dst[idst + n_dims / 2] = ggml_sycl_cast<D>(x0 * sin_theta + x1 * cos_theta);
 }
 
-template <bool forward, bool has_ff, typename T>
-static void rope_multi(const T *x, T *dst, const int ne00, const int ne01,
+template <bool forward, bool has_ff, typename T, typename D>
+static void rope_multi(const T *x, D *dst, const int ne00, const int ne01,
                        const int ne02, const int s01, const int s02,
                        const int s03, const int s1, const int s2, const int s3,
                        const int n_dims, const int32_t *pos,
                        const float freq_scale, const float ext_factor,
                        const float attn_factor, const rope_corr_dims corr_dims,
                        const float theta_scale, const float *freq_factors,
-                       const mrope_sections sections, const bool is_imrope) {
+                       const mrope_sections sections, const bool is_imrope,
+                       const int64_t *row_indices, const int set_rows_stride) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int i0 = 2 * (item_ct1.get_local_range(1) * item_ct1.get_group(1) +
                         item_ct1.get_local_id(1));
@@ -183,9 +184,17 @@ static void rope_multi(const T *x, T *dst, const int ne00, const int ne01,
     int idst = i0 / 2 + i1 * s1 + i2 * s2 + i3 * s3;
     const int ix = i0 / 2 + i1 * s01 + i2 * s02 + i3 * s03;
 
+    // Same fused set_rows write rope_norm/rope_neox carry: when the following
+    // SET_ROWS has been folded in, the destination row is chosen by the index
+    // vector instead of by this node's own strides.
+    if (set_rows_stride != 0) {
+        idst = i1 * s1 + i0 / 2;
+        idst += row_indices[i2] * set_rows_stride;
+    }
+
     if (i0 >= n_dims) {
-        dst[idst + i0 / 2 + 0] = x[ix + i0 / 2 + 0];
-        dst[idst + i0 / 2 + 1] = x[ix + i0 / 2 + 1];
+        dst[idst + i0 / 2 + 0] = ggml_sycl_cast<D>(x[ix + i0 / 2 + 0]);
+        dst[idst + i0 / 2 + 1] = ggml_sycl_cast<D>(x[ix + i0 / 2 + 1]);
 
         return;
     }
@@ -229,8 +238,8 @@ static void rope_multi(const T *x, T *dst, const int ne00, const int ne01,
     const float x0 = x[ix + 0];
     const float x1 = x[ix + n_dims / 2];
 
-    dst[idst + 0] = x0 * cos_theta - x1 * sin_theta;
-    dst[idst + n_dims / 2] = x0 * sin_theta + x1 * cos_theta;
+    dst[idst + 0] = ggml_sycl_cast<D>(x0 * cos_theta - x1 * sin_theta);
+    dst[idst + n_dims / 2] = ggml_sycl_cast<D>(x0 * sin_theta + x1 * cos_theta);
 }
 
 template <bool forward, bool has_ff, typename T>
@@ -370,16 +379,17 @@ rope_neox_sycl(const T *x, D *dst, const int ne00, const int ne01,
     }
 }
 
-template <bool forward, typename T>
+template <bool forward, typename T, typename D>
 static void
-rope_multi_sycl(const T *x, T *dst, const int ne00, const int ne01,
+rope_multi_sycl(const T *x, D *dst, const int ne00, const int ne01,
                 const int ne02, const int s01, const int s02, const int s03,
                 const int s1, const int s2, const int s3, const int n_dims,
                 const int nr, const int32_t *pos, const float freq_scale,
                 const float freq_base, const float ext_factor,
                 const float attn_factor, const rope_corr_dims corr_dims,
                 const float *freq_factors, const mrope_sections sections,
-                const bool is_imrope, dpct::queue_ptr stream) {
+                const bool is_imrope, const int64_t *row_indices,
+                const int set_rows_stride, dpct::queue_ptr stream) {
     GGML_ASSERT(ne00 % 2 == 0);
     const dpct::dim3 block_dims(1, SYCL_ROPE_BLOCK_SIZE, 1);
     const int n_blocks_x =
@@ -393,20 +403,22 @@ rope_multi_sycl(const T *x, T *dst, const int ne00, const int ne01,
             sycl::nd_range<3>(block_nums * block_dims, block_dims),
             [=](sycl::nd_item<3> item_ct1) {
                 GGML_UNUSED(item_ct1);
-                rope_multi<forward, false, T>(
+                rope_multi<forward, false, T, D>(
                     x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims,
                     pos, freq_scale, ext_factor, attn_factor, corr_dims,
-                    theta_scale, freq_factors, sections, is_imrope);
+                    theta_scale, freq_factors, sections, is_imrope, row_indices,
+                    set_rows_stride);
             });
     } else {
         stream->parallel_for(
             sycl::nd_range<3>(block_nums * block_dims, block_dims),
             [=](sycl::nd_item<3> item_ct1) {
                 GGML_UNUSED(item_ct1);
-                rope_multi<forward, true, T>(
+                rope_multi<forward, true, T, D>(
                     x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims,
                     pos, freq_scale, ext_factor, attn_factor, corr_dims,
-                    theta_scale, freq_factors, sections, is_imrope);
+                    theta_scale, freq_factors, sections, is_imrope, row_indices,
+                    set_rows_stride);
             });
     }
 }
@@ -565,18 +577,24 @@ void ggml_sycl_op_rope_impl(ggml_backend_sycl_context &ctx, ggml_tensor *dst,
         }
     } else if (is_mrope && !is_vision) {
         GGML_SYCL_DEBUG("%s: mrope path\n", __func__);
-        if (src0->type == GGML_TYPE_F32) {
-            rope_multi_sycl<forward>((const float *)src0_d, (float *)dst_d,
-                                     ne00, ne01, ne02, s01, s02, s03, s1, s2,
-                                     s3, n_dims, nr, pos, freq_scale, freq_base,
-                                     ext_factor, attn_factor, corr_dims,
-                                     freq_factors, sections, is_imrope, stream);
-        } else if (src0->type == GGML_TYPE_F16) {
-            rope_multi_sycl<forward>(
+        if (src0->type == GGML_TYPE_F32 && dst_type == GGML_TYPE_F32) {
+            rope_multi_sycl<forward, float, float>(
+                (const float *)src0_d, (float *)dst_d, ne00, ne01, ne02, s01,
+                s02, s03, s1, s2, s3, n_dims, nr, pos, freq_scale, freq_base,
+                ext_factor, attn_factor, corr_dims, freq_factors, sections,
+                is_imrope, row_indices, set_rows_stride, stream);
+        } else if (src0->type == GGML_TYPE_F32 && dst_type == GGML_TYPE_F16) {
+            rope_multi_sycl<forward, float, sycl::half>(
+                (const float *)src0_d, (sycl::half *)dst_d, ne00, ne01, ne02,
+                s01, s02, s03, s1, s2, s3, n_dims, nr, pos, freq_scale,
+                freq_base, ext_factor, attn_factor, corr_dims, freq_factors,
+                sections, is_imrope, row_indices, set_rows_stride, stream);
+        } else if (src0->type == GGML_TYPE_F16 && dst_type == GGML_TYPE_F16) {
+            rope_multi_sycl<forward, sycl::half, sycl::half>(
                 (const sycl::half *)src0_d, (sycl::half *)dst_d, ne00, ne01,
                 ne02, s01, s02, s03, s1, s2, s3, n_dims, nr, pos, freq_scale,
                 freq_base, ext_factor, attn_factor, corr_dims, freq_factors,
-                sections, is_imrope, stream);
+                sections, is_imrope, row_indices, set_rows_stride, stream);
         } else {
             GGML_ABORT("Fatal error: Tensor type unsupported!");
         }

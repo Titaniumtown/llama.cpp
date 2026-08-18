@@ -2412,79 +2412,97 @@ static void top_k_scan_merge_f32(
 ) {
     const int tid = item_ct1.get_local_id(0);
 
-    float local_vals[32];
-    int local_idx[32];
+    // The running top-k lives in SLM, not in a private array. An array indexed by a
+    // runtime position cannot be register-allocated, so a private one lands in scratch --
+    // device memory. That is the whole cost of this kernel: at ncols = 200000 it measured
+    // 22.10 us/run at k = 1 against 437.39 us/run at k = 10, and the only difference
+    // between those is 288 extra candidate insertions, i.e. ~1.4 us each.
+    //
+    // Lane-strided (lv[i * block_size]) rather than lane-blocked (lv[i]) so that a given
+    // i is contiguous across lanes: a k-strided layout would put every lane of a shift
+    // step in the same SLM bank.
+    float * lv = shared_vals + tid;
+    int * li = shared_idx + tid;
 
     for (int i = 0; i < k; i++) {
-        local_vals[i] = -FLT_MAX;
-        local_idx[i] = -1;
+        lv[i * block_size] = -FLT_MAX;
+        li[i * block_size] = -1;
     }
+
+    // The k-th best, cached in a register, so the reject test -- taken for all but ~k*ln
+    // of the elements scanned -- touches no memory at all.
+    float kth = -FLT_MAX;
 
     for (int col = begin + tid; col < end; col += block_size) {
         float val = src_vals[col];
 
-        if (val > local_vals[k-1]) {
+        if (val > kth) {
             int pos = k - 1;
-            while (pos > 0 && val > local_vals[pos - 1]) {
+            while (pos > 0 && val > lv[(pos - 1) * block_size]) {
                 pos--;
             }
 
             for (int i = k - 1; i > pos; i--) {
-                local_vals[i] = local_vals[i - 1];
-                local_idx[i] = local_idx[i - 1];
+                lv[i * block_size] = lv[(i - 1) * block_size];
+                li[i * block_size] = li[(i - 1) * block_size];
             }
-            local_vals[pos] = val;
-            local_idx[pos] = src_map ? src_map[col] : col;
+            lv[pos * block_size] = val;
+            li[pos * block_size] = src_map ? src_map[col] : col;
+
+            kth = lv[(k - 1) * block_size];
         }
     }
 
-    for (int i = 0; i < k; i++) {
-        shared_vals[tid * k + i] = local_vals[i];
-        shared_idx[tid * k + i] = local_idx[i];
-    }
     item_ct1.barrier(sycl::access::fence_space::local_space);
 
     if (tid != 0) {
         return;
     }
 
-    float final_vals[32];
-    int final_idx[32];
+    // Same treatment for the merge accumulator, past the per-lane region.
+    float * fv = shared_vals + (size_t) k * block_size;
+    int * fi = shared_idx + (size_t) k * block_size;
 
     for (int i = 0; i < k; i++) {
-        final_vals[i] = -FLT_MAX;
-        final_idx[i] = -1;
+        fv[i] = -FLT_MAX;
+        fi[i] = -1;
     }
 
+    float fkth = -FLT_MAX;
+
+    // Candidates are visited in the same (t, i) order as before, so tie-breaking is
+    // unchanged.
     for (int t = 0; t < block_size; t++) {
         for (int i = 0; i < k; i++) {
-            float val = shared_vals[t * k + i];
-            int idx = shared_idx[t * k + i];
+            float val = shared_vals[i * block_size + t];
+            int idx = shared_idx[i * block_size + t];
 
-            if (val > final_vals[k-1]) {
+            if (val > fkth) {
                 int pos = k - 1;
-                while (pos > 0 && val > final_vals[pos - 1]) {
+                while (pos > 0 && val > fv[pos - 1]) {
                     pos--;
                 }
 
                 for (int j = k - 1; j > pos; j--) {
-                    final_vals[j] = final_vals[j - 1];
-                    final_idx[j] = final_idx[j - 1];
+                    fv[j] = fv[j - 1];
+                    fi[j] = fi[j - 1];
                 }
-                final_vals[pos] = val;
-                final_idx[pos] = idx;
+                fv[pos] = val;
+                fi[pos] = idx;
+
+                fkth = fv[k - 1];
             }
         }
     }
 
     if (out_vals) {
         for (int i = 0; i < k; i++) {
-            out_vals[i] = final_vals[i];
+            out_vals[i] = fv[i];
         }
     }
 
     for (int i = 0; i < k; i++) {
-        out_idx[i] = final_idx[i];
+        out_idx[i] = fi[i];
     }
 
     if (swap01 && k > 1) {
@@ -2539,8 +2557,8 @@ static void top_k_f32_sycl(
         const sycl::range<1> block_dims(split_block);
 
         main_stream->submit([&](sycl::handler &cgh) {
-            sycl::local_accessor<float, 1> shared_vals(sycl::range<1>(split_block * k), cgh);
-            sycl::local_accessor<int, 1> shared_idx(sycl::range<1>(split_block * k), cgh);
+            sycl::local_accessor<float, 1> shared_vals(sycl::range<1>((split_block + 1) * k), cgh);
+            sycl::local_accessor<int, 1> shared_idx(sycl::range<1>((split_block + 1) * k), cgh);
 
             cgh.parallel_for(
                 sycl::nd_range<1>(sycl::range<1>(nrows * nsplit) * block_dims, block_dims),
@@ -2564,8 +2582,8 @@ static void top_k_f32_sycl(
         });
 
         main_stream->submit([&](sycl::handler &cgh) {
-            sycl::local_accessor<float, 1> shared_vals(sycl::range<1>(split_block * k), cgh);
-            sycl::local_accessor<int, 1> shared_idx(sycl::range<1>(split_block * k), cgh);
+            sycl::local_accessor<float, 1> shared_vals(sycl::range<1>((split_block + 1) * k), cgh);
+            sycl::local_accessor<int, 1> shared_idx(sycl::range<1>((split_block + 1) * k), cgh);
 
             cgh.parallel_for(
                 sycl::nd_range<1>(sycl::range<1>(nrows) * block_dims, block_dims),
@@ -2590,8 +2608,8 @@ static void top_k_f32_sycl(
     const sycl::range<1> grid_dims(nrows);
 
     main_stream->submit([&](sycl::handler &cgh) {
-        sycl::local_accessor<float, 1> shared_vals(sycl::range<1>(block_size * k), cgh);
-        sycl::local_accessor<int, 1> shared_idx(sycl::range<1>(block_size * k), cgh);
+        sycl::local_accessor<float, 1> shared_vals(sycl::range<1>((block_size + 1) * k), cgh);
+        sycl::local_accessor<int, 1> shared_idx(sycl::range<1>((block_size + 1) * k), cgh);
 
         cgh.parallel_for(
             sycl::nd_range<1>(grid_dims * block_dims, block_dims),

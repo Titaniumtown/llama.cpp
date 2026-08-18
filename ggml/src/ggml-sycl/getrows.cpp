@@ -11,6 +11,7 @@
 //
 
 #include "ggml-impl.h"
+#include <type_traits>
 #include "common.hpp"
 #include "dequantize.hpp"
 #include "getrows.hpp"
@@ -137,6 +138,49 @@ static void k_get_rows_float(
     dst_row[i00] = src0_row[i00];
 }
 
+// Vectorised same-type row copy: 4 elements per work-item instead of 1.
+//
+// k_get_rows_float above moves 4 bytes per lane and re-reads the row index out of src1
+// for every single element. For the large contiguous rows that recurrent-state gathers
+// pull out of the state cache that leaves most of the achievable copy bandwidth unused
+// -- the same narrow-access defect that made the scalar q6_K decode path slow.
+//
+// Only dispatched when src0 and dst have the same type and every row base and stride is
+// 16-byte aligned, so the vector accesses below are always well-formed; anything else
+// falls back to the scalar kernel.
+template<typename T>
+static void k_get_rows_float_vec4(
+            const T * src0, const int32_t * src1, T * dst,
+            int64_t ne00, int64_t ne12,
+            size_t s1, size_t s2, size_t s3,
+            size_t nb01, size_t nb02, size_t nb03,
+            size_t s10, size_t s11, size_t s12,
+            const sycl::nd_item<3> &item_ct1) {
+
+    const int64_t i00 = ((int64_t) item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+                         item_ct1.get_local_id(2)) * 4;
+    const int i10 = item_ct1.get_local_range(1) * item_ct1.get_group(1) +
+                    item_ct1.get_local_id(1);
+    const int i11 = (item_ct1.get_group(0) * item_ct1.get_local_range(0) +
+                     item_ct1.get_local_id(0)) /
+                    ne12;
+    const int i12 = (item_ct1.get_group(0) * item_ct1.get_local_range(0) +
+                     item_ct1.get_local_id(0)) %
+                    ne12;
+
+    if (i00 >= ne00) {
+        return;
+    }
+
+    const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+    T *       dst_row  = dst + i10*s1 + i11*s2 + i12*s3;
+    const T * src0_row = (const T *)((const char *)src0 + i01*nb01 + i11*nb02 + i12*nb03);
+
+    using vec4 = sycl::vec<T, 4>;
+    *reinterpret_cast<vec4 *>(dst_row + i00) = *reinterpret_cast<const vec4 *>(src0_row + i00);
+}
+
 template <int qk, int qr, dequantize_kernel_t dq>
 static void get_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor *src0, const ggml_tensor *src1,
                           ggml_tensor *dst, const void *src0_dd,
@@ -228,6 +272,32 @@ static void get_rows_sycl_float(ggml_backend_sycl_context & ctx, const ggml_tens
     const size_t s11 = nb11 / ggml_element_size(src1);
     const size_t s12 = nb12 / ggml_element_size(src1);
     //const size_t s13 = nb13 / ggml_element_size(src1);
+
+    // 4-wide path when the copy is same-type and every base/stride the kernel indexes is
+    // 16-byte aligned. ne00 % 4 covers the row length; the stride checks cover the row
+    // origins, which are what i01/i11/i12 select between.
+    if constexpr (std::is_same_v<src0_t, dst_t>) {
+        const size_t esz = sizeof(src0_t);
+        const bool aligned =
+            (ne00 % 4 == 0) &&
+            (nb01 % 16 == 0) && (nb02 % 16 == 0) && (nb03 % 16 == 0) &&
+            ((s1 * esz) % 16 == 0) && ((s2 * esz) % 16 == 0) && ((s3 * esz) % 16 == 0) &&
+            ((reinterpret_cast<uintptr_t>(src0_dd) % 16) == 0) &&
+            ((reinterpret_cast<uintptr_t>(dst_dd)  % 16) == 0);
+        if (aligned) {
+            const int vec_num_x = (ne00 / 4 + SYCL_GET_ROWS_BLOCK_SIZE - 1) / SYCL_GET_ROWS_BLOCK_SIZE;
+            const sycl::range<3> vec_nums(ne11 * ne12, ne10, vec_num_x);
+            stream->parallel_for(
+                sycl::nd_range<3>(vec_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1) {
+                    k_get_rows_float_vec4<src0_t>(src0_dd, src1_dd, dst_dd, ne00, ne12, s1, s2,
+                                                  s3, nb01, nb02, nb03, s10, s11, s12, item_ct1);
+                });
+            GGML_UNUSED(dst);
+            GGML_UNUSED(ctx);
+            return;
+        }
+    }
 
     {
         dpct::has_capability_or_fail(stream->get_device(),

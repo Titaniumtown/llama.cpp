@@ -14,6 +14,10 @@
 
 #include "concat.hpp"
 
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
 static inline size_t elem_size(ggml_type t) {
     return ggml_type_size(t) / ggml_blck_size(t);
 }
@@ -53,6 +57,7 @@ static void concat_T_dim0(const T *x, const T *y, T *dst,
 template <typename T>
 static void concat_T_dim0_flat(const T * x, const T * y, T * dst,
                                const int64_t ne0, const int64_t ne00, const int64_t nelem,
+                               const int32_t * s0_rows, const int64_t ne1, const int64_t s0_row_elems,
                                const sycl::nd_item<1> & item_ct1) {
   const int64_t i = item_ct1.get_global_linear_id();
   if (i >= nelem) {
@@ -61,6 +66,13 @@ static void concat_T_dim0_flat(const T * x, const T * y, T * dst,
   const int64_t row = i / ne0;
   const int64_t col = i - row * ne0;
   if (col < ne00) {  // src0
+    // s0_rows folds away a preceding GET_ROWS: x is then the state cache itself and
+    // this sequence's row is selected here. The branch is on a kernel-wide constant.
+    if (s0_rows) {
+      const int64_t i2 = row / ne1;
+      dst[i] = x[(int64_t) s0_rows[i2] * s0_row_elems + (row - i2 * ne1) * ne00 + col];
+      return;
+    }
     dst[i] = x[row * ne00 + col];
   } else {           // src1
     dst[i] = y[row * (ne0 - ne00) + (col - ne00)];
@@ -118,7 +130,10 @@ static void concat_T_dim2(const T *x, const T *y, T *dst,
 template <typename T>
 static void concat_T_sycl(const T *x, const T *y, T *dst,
                             int ne00, int ne01, int ne02, int ne0, int ne1,
-                            int ne2, int dim, queue_ptr stream) {
+                            int ne2, int dim, queue_ptr stream,
+                            const int32_t * s0_rows = nullptr, int64_t s0_row_elems = 0) {
+  // only the dim-0 flat form below implements the fold
+  GGML_ASSERT(s0_rows == nullptr || dim == 0);
   int num_blocks = (ne0 + SYCL_CONCAT_BLOCK_SIZE - 1) / SYCL_CONCAT_BLOCK_SIZE;
   sycl::range<3> gridDim(ne2, ne1, num_blocks);
   switch (dim) {
@@ -128,11 +143,12 @@ static void concat_T_sycl(const T *x, const T *y, T *dst,
       const int64_t nwg    = (nelem + SYCL_CONCAT_BLOCK_SIZE - 1) / SYCL_CONCAT_BLOCK_SIZE;
       const int64_t ne0_l  = ne0;
       const int64_t ne00_l = ne00;
+      const int64_t ne1_l  = ne1;
       stream->parallel_for(
           sycl::nd_range<1>(sycl::range<1>(nwg * SYCL_CONCAT_BLOCK_SIZE),
                             sycl::range<1>(SYCL_CONCAT_BLOCK_SIZE)),
           [=](sycl::nd_item<1> item_ct1) {
-              concat_T_dim0_flat<T>(x, y, dst, ne0_l, ne00_l, nelem, item_ct1);
+              concat_T_dim0_flat<T>(x, y, dst, ne0_l, ne00_l, nelem, s0_rows, ne1_l, s0_row_elems, item_ct1);
           });
       break;
   }
@@ -165,6 +181,7 @@ static void concat_T_non_cont_flat(const char * src0, const char * src1, char * 
                                    const uint64_t nb0, const uint64_t nb1, const uint64_t nb2,
                                    const uint64_t nb3, const int64_t o0, const int64_t o1,
                                    const int64_t o2, const int64_t o3, const int64_t nelem,
+                                   const int32_t * s0_rows,
                                    const sycl::nd_item<1> & item_ct1) {
   const int64_t idx = item_ct1.get_global_linear_id();
   if (idx >= nelem) {
@@ -178,9 +195,17 @@ static void concat_T_non_cont_flat(const char * src0, const char * src1, char * 
   const int64_t i3 = r1 / ne2;
   const int64_t i2 = r1 - i3 * ne2;
 
+  // s0_rows folds away a preceding GET_ROWS: src0 is then the state cache itself rather
+  // than a gathered copy of it, and this sequence's row is selected here instead of by a
+  // whole kernel that copied it first. The gathered view's nb[2] is by construction the
+  // cache's nb[1] (the gather is contiguous and the reshape only splits dim 0), so the
+  // entire fold is i2 -> s0_rows[i2]; every other stride is already correct. The detector
+  // in ggml-sycl.cpp asserts that equality rather than assuming it.
+  const int64_t s0_i2 = s0_rows ? (int64_t) s0_rows[i2] : i2;
+
   const T * x;
   if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
-    x = (const T *) (src0 + i3 * nb03 + i2 * nb02 + i1 * nb01 + i0 * nb00);
+    x = (const T *) (src0 + i3 * nb03 + s0_i2 * nb02 + i1 * nb01 + i0 * nb00);
   } else {
     x = (const T *) (src1 + (i3 - o3) * nb13 + (i2 - o2) * nb12 + (i1 - o1) * nb11 + (i0 - o0) * nb10);
   }
@@ -197,8 +222,11 @@ static void concat_T_sycl_non_cont(
     int64_t /*ne11*/, int64_t /*ne12*/, int64_t /*ne13*/, uint64_t nb10,
     uint64_t nb11, uint64_t nb12, uint64_t nb13, int64_t ne0, int64_t ne1,
     int64_t ne2, int64_t ne3, uint64_t nb0, uint64_t nb1, uint64_t nb2,
-    uint64_t nb3, int32_t dim) {
+    uint64_t nb3, int32_t dim, const int32_t * s0_rows = nullptr) {
   sycl::range<3> gridDim(ne3, ne2, ne1);
+  // the fold is only wired into the flat path below; the detector restricts itself to
+  // shapes that take it, so reaching the per-row form with a row index is a bug
+  GGML_ASSERT(s0_rows == nullptr || ne0 < WARP_SIZE);
 
   // A row shorter than a sub-group cannot fill even one, so the per-row form below
   // wastes (WARP_SIZE - ne0) lanes in every work-group and launches one work-group
@@ -220,7 +248,7 @@ static void concat_T_sycl_non_cont(
           [=](sycl::nd_item<1> item_ct1) {
               concat_T_non_cont_flat<T>(src0, src1, dst, ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03,
                                         nb10, nb11, nb12, nb13, ne0, ne1, ne2, nb0, nb1, nb2, nb3,
-                                        o0, o1, o2, o3, nelem, item_ct1);
+                                        o0, o1, o2, o3, nelem, s0_rows, item_ct1);
           });
       return;
   }
@@ -258,7 +286,7 @@ static void concat_T_sycl_non_cont(
 }
 
 template <typename T>
-void concat_impl_sycl(ggml_backend_sycl_context & ctx, ggml_tensor *dst) {
+void concat_impl_sycl(ggml_backend_sycl_context & ctx, ggml_tensor *dst, const ggml_tensor * gather) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
     const ggml_tensor *  src0   = dst->src[0];
     const ggml_tensor *  src1   = dst->src[1];
@@ -266,16 +294,32 @@ void concat_impl_sycl(ggml_backend_sycl_context & ctx, ggml_tensor *dst) {
 
     const int32_t dim = ((int32_t *) dst->op_params)[0];
 
+    // when a GET_ROWS was folded away, src0's bytes are the cache's and the row comes
+    // from the gather's index tensor. BOTH dim-0 kernels implement the fold, because
+    // which of them runs is decided by contiguity and at decode that is decided by the
+    // token width: ggml_transpose of a one-token tensor has ne[0] == 1, which
+    // ggml_is_contiguous accepts whatever the strides say.
+    const char *    s0_data = (const char *) src0->data;
+    const int32_t * s0_rows = nullptr;
+    if (gather != nullptr) {
+        GGML_ASSERT(dim == 0 && dst->ne[3] == 1);
+        s0_data = (const char *) gather->src[0]->data;
+        s0_rows = (const int32_t *) gather->src[1]->data;
+    }
+
     if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
         const T * src0_d = (const T *) src0->data;
         const T * src1_d = (const T *) src1->data;
         T * dst_d = (T *) dst->data;
         size_t type_size = elem_size(dst->type);
+        // when the fold is active src0's bytes are the cache's, so the per-i3 slice below
+        // would have to be added to the folded address; the detector rejects ne[3] != 1
+        const int64_t s0_row_elems = gather != nullptr ? (int64_t) (gather->src[0]->nb[1] / type_size) : 0;
         if (dim != 3) {
             for (int i3 = 0; i3 < dst->ne[3]; i3++) {
-                concat_T_sycl<T>(src0_d + i3 * (src0->nb[3] / type_size), src1_d + i3 * (src1->nb[3] / type_size),
+                concat_T_sycl<T>(s0_rows ? (const T *) s0_data : src0_d + i3 * (src0->nb[3] / type_size), src1_d + i3 * (src1->nb[3] / type_size),
                                 dst_d + i3 * (dst->nb[3] / type_size), src0->ne[0], src0->ne[1], src0->ne[2], dst->ne[0],
-                                dst->ne[1], dst->ne[2], dim, stream);
+                                dst->ne[1], dst->ne[2], dim, stream, s0_rows, s0_row_elems);
             }
         } else {
             const size_t size0 = ggml_nbytes(src0);
@@ -285,11 +329,11 @@ void concat_impl_sycl(ggml_backend_sycl_context & ctx, ggml_tensor *dst) {
             SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(dst_d + size0 / type_size, src1_d, size1)));
         }
     } else {
-        concat_T_sycl_non_cont<T>(stream, (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+        concat_T_sycl_non_cont<T>(stream, s0_data, (const char *) src1->data, (char *) dst->data,
                                  src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], src0->nb[0], src0->nb[1],
                                  src0->nb[2], src0->nb[3], src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
                                  src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3], dst->ne[0], dst->ne[1], dst->ne[2],
-                                 dst->ne[3], dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3], dim);
+                                 dst->ne[3], dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3], dim, s0_rows);
     }
 }
 
@@ -557,31 +601,76 @@ static void concat_impl_q8_0_sycl(ggml_backend_sycl_context & ctx, ggml_tensor *
     }
 }
 
-void ggml_sycl_op_concat(ggml_backend_sycl_context & ctx, ggml_tensor *dst) {
+bool ggml_sycl_conv_fold_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("GGML_SYCL_CONV_FOLD");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
+    return on;
+}
+
+bool ggml_sycl_conv_fold_diag() {
+    static const bool on = [] {
+        const char * e = std::getenv("GGML_SYCL_CONV_FOLD_DIAG");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return on;
+}
+
+// Only reachable under GGML_SYCL_CONV_FOLD_DIAG, where the gather was left in the graph.
+// Proves the fold's address arithmetic against the bytes the gather actually produced,
+// per sequence, at whatever width the server is really running.
+static void conv_fold_verify(ggml_backend_sycl_context & ctx, const ggml_tensor * dst, const ggml_tensor * gather) {
+    const ggml_tensor * view  = dst->src[0];
+    const ggml_tensor * cache = gather->src[0];
+    const int64_t       nseq  = view->ne[2];
+    queue_ptr           q     = ctx.stream();
+
+    std::vector<int32_t> rows(nseq);
+    SYCL_CHECK(CHECK_TRY_ERROR(q->memcpy(rows.data(), gather->src[1]->data, nseq * sizeof(int32_t)).wait()));
+
+    const size_t         len = (size_t) view->ne[1] * view->nb[1];
+    std::vector<char>    a(len), b(len);
+    int                  bad = 0;
+    for (int64_t i2 = 0; i2 < nseq; i2++) {
+        const char * folded   = (const char *) cache->data + (size_t) rows[i2] * cache->nb[1];
+        const char * gathered = (const char *) view->data + (size_t) i2 * view->nb[2];
+        SYCL_CHECK(CHECK_TRY_ERROR(q->memcpy(a.data(), folded, len).wait()));
+        SYCL_CHECK(CHECK_TRY_ERROR(q->memcpy(b.data(), gathered, len).wait()));
+        bad += (std::memcmp(a.data(), b.data(), len) != 0);
+    }
+    fprintf(stderr, "[CONVFOLD] nseq=%d rows=%d,%d bytes/seq=%zu mismatches=%d\n", (int) nseq,
+            nseq > 0 ? rows[0] : -1, nseq > 1 ? rows[1] : -1, len, bad);
+}
+
+void ggml_sycl_op_concat(ggml_backend_sycl_context & ctx, ggml_tensor *dst, const ggml_tensor * gather) {
+    if (gather != nullptr && ggml_sycl_conv_fold_diag()) {
+        conv_fold_verify(ctx, dst, gather);
+    }
 
     switch (dst->type) {
     case GGML_TYPE_F32:
-        concat_impl_sycl<float>(ctx, dst);
+        concat_impl_sycl<float>(ctx, dst, gather);
         break;
     case GGML_TYPE_F16:
-        concat_impl_sycl<sycl::half>(ctx, dst);
+        concat_impl_sycl<sycl::half>(ctx, dst, gather);
         break;
 #ifdef GGML_SYCL_HAS_BF16
     case GGML_TYPE_BF16:
-        concat_impl_sycl<sycl::ext::oneapi::bfloat16>(ctx, dst);
+        concat_impl_sycl<sycl::ext::oneapi::bfloat16>(ctx, dst, gather);
         break;
 #endif
     case GGML_TYPE_I32:
-        concat_impl_sycl<int32_t>(ctx, dst);
+        concat_impl_sycl<int32_t>(ctx, dst, gather);
         break;
     case GGML_TYPE_I16:
-        concat_impl_sycl<int16_t>(ctx, dst);
+        concat_impl_sycl<int16_t>(ctx, dst, gather);
         break;
     case GGML_TYPE_I64:
-        concat_impl_sycl<int64_t>(ctx, dst);
+        concat_impl_sycl<int64_t>(ctx, dst, gather);
         break;
     case GGML_TYPE_I8:
-        concat_impl_sycl<int8_t>(ctx, dst);
+        concat_impl_sycl<int8_t>(ctx, dst, gather);
         break;
     case GGML_TYPE_Q4_0:
         concat_impl_q4_0_sycl(ctx, dst);

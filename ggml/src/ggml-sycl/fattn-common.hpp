@@ -3,6 +3,8 @@
 #include <sycl/sycl.hpp>
 #include "dpct/helper.hpp"
 #include "common.hpp"
+
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include "convert.hpp"
 #include "vecdotq.hpp"
 #include "fattn-buffers.hpp"
@@ -905,11 +907,18 @@ static void lauch_kernel(
     const int32_t nb32,
     const int64_t nb33) {
     GGML_UNUSED(local_mem_size);
+    // 492 of this build's 638 IGC spill warnings are flash_attn_ext_vec, 64 of them the
+    // D=512 shape this model actually runs (key_length/value_length 512), all "allocated
+    // 128 regs and spilled". FA is 36% of decode at production depth, and spill traffic
+    // goes to scratch -- DRAM the byte accounting in the ledger never counted. 256 GRF
+    // removes the spill at the cost of half the resident threads; which wins is measured.
     q->submit([&](sycl::handler &cgh) {
         cgh.parallel_for(
             sycl::nd_range<3>(
                 static_cast<sycl::range<3>>(group_range * local_range),
                 static_cast<sycl::range<3>>(local_range)),
+            sycl::ext::oneapi::experimental::properties{
+                sycl::ext::intel::experimental::grf_size<256>},
             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(warp_size)]] {
                 GGML_UNUSED(item_ct1);
                 fattn_kernel(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,

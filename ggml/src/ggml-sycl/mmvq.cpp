@@ -2561,9 +2561,18 @@ static void mul_mat_vec_q5_K_reorder_wide_ncols(const void * __restrict__ vx, co
         return;
     }
 
+    // Local lane width, deliberately NOT block_traits::vdr_mmvq. vdr=4 gives each
+    // lane two consecutive int-pairs, halving the per-lane fixed cost (5-bit decode
+    // hoist, scale unpack, per-column ds converts) per weight byte -- measured
+    // -10.3%/-5.3% us/call on ffn_down/ffn_up at the production verify width. The
+    // batch-1 functor path measured -1.2% from the same widening (a 4-deep dp4a
+    // chain with no second column to overlap it), so the trait stays at 2 and only
+    // this multi-column kernel, where the columns hide the chain, takes the width.
+    constexpr int vdr_wide = 4;
+
     const int     blocks_per_row              = ncols / block_traits::qk;
-    constexpr int blocks_per_subgroup         = ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
-    constexpr int block_elements_per_subgroup = block_traits::qi / block_traits::vdr_mmvq;
+    constexpr int blocks_per_subgroup         = ceil_div(vdr_wide * WARP_SIZE, block_traits::qi);
+    constexpr int block_elements_per_subgroup = block_traits::qi / vdr_wide;
     const int     nblocks                     = nrows * (ncols / block_traits::qk);
 
     const uint8_t * vbq = static_cast<const uint8_t *>(vx);
@@ -2578,9 +2587,13 @@ static void mul_mat_vec_q5_K_reorder_wide_ncols(const void * __restrict__ vx, co
 
 #pragma unroll
         for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
-            const int iqs = elem + block_traits::vdr_mmvq * (sg.get_local_linear_id() % block_elements_per_subgroup);
+            const int iqs = elem + vdr_wide * (sg.get_local_linear_id() % block_elements_per_subgroup);
 
             // ---- weight load + 5-bit decode: hoisted once, reused across columns ----
+            // vdr_wide = 4: the lane owns two consecutive int-pairs (ql [0],[1] and
+            // [4],[5]) of one 32-quant sub-block pair, so this hoisted decode and the
+            // per-column ds converts amortize over twice the weight bytes. add_min
+            // still fires on exactly one of the two lanes that share the pair.
             const uint8_t *     qs         = vbq + bx_offset.first;
             const uint8_t *     qh_base    = vbq + bx_offset.second;
             const uint16_t *    scales     = reinterpret_cast<const uint16_t *>(vbq + d_offset.first);
@@ -2588,8 +2601,9 @@ static void mul_mat_vec_q5_K_reorder_wide_ncols(const void * __restrict__ vx, co
             const int           bq8_offset = QR5_K * ((iqs / 2) / (QI8_1 / 2));
             const int *         ql_ptr     = reinterpret_cast<const int *>(qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
             const int *         qh_ptr     = reinterpret_cast<const int *>(qh_base + 4 * ((iqs / 2) % 4));
-            const int           vl0 = ql_ptr[0], vl1 = ql_ptr[4];
-            const int           vh0 = qh_ptr[0] >> bq8_offset, vh1 = qh_ptr[4] >> bq8_offset;
+            const int           vl0 = ql_ptr[0], vl1 = ql_ptr[1], vl2 = ql_ptr[4], vl3 = ql_ptr[5];
+            const int           vh0 = qh_ptr[0] >> bq8_offset, vh1 = qh_ptr[1] >> bq8_offset;
+            const int           vh2 = qh_ptr[4] >> bq8_offset, vh3 = qh_ptr[5] >> bq8_offset;
             uint16_t            aux[2];
             const int           jsc = bq8_offset / 2;
             if (jsc < 2) {
@@ -2605,13 +2619,13 @@ static void mul_mat_vec_q5_K_reorder_wide_ncols(const void * __restrict__ vx, co
             const bool         add_min = ((iqs / 2) % (QI8_1 / 2)) == 0;
             const int          qoff    = (iqs / 2) % 4;
 
-            int v0[QR5_K], v1[QR5_K];
+            int v0[QR5_K], v1[QR5_K], v2[QR5_K], v3[QR5_K];
 #pragma unroll
             for (int ii = 0; ii < QR5_K; ++ii) {
-                const int vh0i = ((vh0 >> ii) << 4) & 0x10101010;
-                const int vh1i = ((vh1 >> ii) << 4) & 0x10101010;
-                v0[ii] = ((vl0 >> (4 * ii)) & 0x0F0F0F0F) | vh0i;
-                v1[ii] = ((vl1 >> (4 * ii)) & 0x0F0F0F0F) | vh1i;
+                v0[ii] = ((vl0 >> (4 * ii)) & 0x0F0F0F0F) | (((vh0 >> ii) << 4) & 0x10101010);
+                v1[ii] = ((vl1 >> (4 * ii)) & 0x0F0F0F0F) | (((vh1 >> ii) << 4) & 0x10101010);
+                v2[ii] = ((vl2 >> (4 * ii)) & 0x0F0F0F0F) | (((vh2 >> ii) << 4) & 0x10101010);
+                v3[ii] = ((vl3 >> (4 * ii)) & 0x0F0F0F0F) | (((vh3 >> ii) << 4) & 0x10101010);
             }
 
             // ---- per-column dot (activation-dependent) ----
@@ -2626,7 +2640,8 @@ static void mul_mat_vec_q5_K_reorder_wide_ncols(const void * __restrict__ vx, co
                 for (int ii = 0; ii < QR5_K; ++ii) {
                     const sycl::float2 dsv = (*(q8ds + bq8_offset + ii)).convert<float, sycl::rounding_mode::automatic>();
                     const int *       q8   = reinterpret_cast<const int *>(q8p + (bq8_offset + ii) * QK8_1) + qoff;
-                    const int         dot1 = dpct::dp4a(v0[ii], q8[0], dpct::dp4a(v1[ii], q8[4], 0));
+                    int dot1 = dpct::dp4a(v0[ii], q8[0], dpct::dp4a(v2[ii], q8[4], 0));
+                    dot1     = dpct::dp4a(v1[ii], q8[1], dpct::dp4a(v3[ii], q8[5], dot1));
                     sumf_d += dsv[0] * (dot1 * sc[ii]);
                     sumf_m += add_min ? (dsv[1] * m[ii]) : 0.0f;
                 }

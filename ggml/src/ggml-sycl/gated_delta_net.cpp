@@ -283,21 +283,28 @@ void gated_delta_net_sycl(
 // below this, which keeps every warp's columns inside the state.
 //
 // A group covers C * warps columns, so each (head, token)'s q_t/k_t row is re-read by
-// S_v / (C * warps) groups. Raising this is therefore the direct test of whether the
-// GDN row is bound by redundant q/k load traffic: it cuts exactly that redundancy and
-// reaches nothing else (the kernel takes its warp index from the nd_item at runtime,
-// so no registers and no s_shard change). Selected by GGML_SYCL_GDN_WARPS.
-// The cols clamp below keeps its shipped meaning (C small enough for a 4-warp group);
-// the warp count is clamped separately, against the columns a group actually has.
+// S_v / (C * warps) groups. Selected by GGML_SYCL_GDN_WARPS. The cols clamp below keeps
+// its shipped meaning (C small enough for a 4-warp group); the warp count is clamped
+// separately, against the columns a group actually has.
+//
+// Default swept on Qwen3.6 prefill (pp2048, GATED_DELTA_NET us/call, r=1 PROF):
+//
+//     WARPS=32 (old default, one group/head)   829.8
+//     WARPS=2  COLS=4/8/16                     785.5-787.4   <- -5.1%
+//     WARPS=1  COLS=4/8/16                     795.1-798.9
+//     WARPS=4  COLS=4                          900.5
+//
+// Fewer, smaller groups win despite the extra q/k re-reads: 2 warps x C=4 columns
+// leaves 16 groups per head for the scheduler instead of one 1024-thread block.
+// Decode is neutral-or-better (tg64@d8192 26.52 -> 26.54-26.55, 2x2 rounds).
 static constexpr int gdn_cols_clamp_warps = 4;
 
 static int ggml_sycl_gdn_num_warps() {
     static const int v = [] {
-        int n = 32;
+        int n = 2;
         if (const char * e = std::getenv("GGML_SYCL_GDN_WARPS")) {
             const int p = std::atoi(e);
-            // block is warp_size * n work-items; 32 keeps that inside every device's
-            // limit and, at S_v=128/C=4, is exactly one group per head.
+            // block is warp_size * n work-items; 32 keeps that inside every device's limit.
             if (p >= 1 && p <= 32) {
                 n = p;
             }

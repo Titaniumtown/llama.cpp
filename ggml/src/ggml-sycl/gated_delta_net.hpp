@@ -11,9 +11,12 @@ struct ggml_sycl_gated_delta_net_fused_cache {
     int64_t slot_stride; // between rollback slots (0 when K==1)
 };
 
-void ggml_sycl_op_gated_delta_net(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
-void ggml_sycl_gated_delta_net(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
+// beta_sigmoid: apply sigmoid to src[4] at the kernel's single beta load, so a preceding
+// standalone SIGMOID node can be skipped entirely. Defaults off; the caller opts in only
+// after checking that the sigmoid feeds this GDN and nothing else.
+void ggml_sycl_op_gated_delta_net(ggml_backend_sycl_context & ctx, ggml_tensor * dst, bool beta_sigmoid = false);
+void ggml_sycl_gated_delta_net(ggml_backend_sycl_context & ctx, ggml_tensor * dst, bool beta_sigmoid = false);
 
 // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_sycl_try_gdn_cache_fusion)
 void ggml_sycl_op_gated_delta_net_fused_cache(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
-                                              ggml_sycl_gated_delta_net_fused_cache cache);
+                                              ggml_sycl_gated_delta_net_fused_cache cache, bool beta_sigmoid = false);

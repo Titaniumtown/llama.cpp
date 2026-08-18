@@ -6089,6 +6089,58 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
     return skip;
 }
 
+// A gated-delta-net's beta input arrives as a standalone SIGMOID node whose only consumer
+// is that GDN (qwen35.cpp builds `beta = ggml_sigmoid(beta)` straight into src[4]). The
+// GDN kernel already loads beta once per token per head, so applying the sigmoid at that
+// load is free and the SIGMOID launch disappears.
+//
+// Worth being explicit about why a 48-float op is worth removing at all: decode here is
+// dispatch-bound, not bandwidth-bound (the GPU measures ~1.6% busy while one CPU core is
+// pegged submitting ~1650 kernels per token). The launch IS the cost -- this node moves
+// 192 bytes and bills the same ~4.7 us as any other launch. One per GDN layer, 48 per
+// graph.
+//
+// Returns the GDN to fold into, or nullptr. Guards, in order:
+//   - the sigmoid's result is used exactly once, so dropping the materialised tensor
+//     cannot be observed by another consumer;
+//   - the GDN is the first *executed* node after it (views are skipped exactly as the
+//     compute loop skips them), so no dispatch in between can read the buffer;
+//   - it really is that GDN's beta operand, by pointer identity, not by shape;
+//   - the sigmoid's own input is a drop-in for it (same shape and strides), because those
+//     strides also drive g's offsets inside the kernel.
+static ggml_tensor * find_gdn_beta_sigmoid(const ggml_cgraph * cgraph, int i) {
+    ggml_tensor * sig = cgraph->nodes[i];
+    if (sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID) {
+        return nullptr;
+    }
+    ggml_tensor * src = sig->src[0];
+    if (sig->type != GGML_TYPE_F32 || src == nullptr || src->type != GGML_TYPE_F32) {
+        return nullptr;
+    }
+    if (!ggml_is_contiguous(sig) || !ggml_is_contiguous(src)) {
+        return nullptr;
+    }
+    if (!ggml_are_same_shape(src, sig) || !ggml_are_same_stride(src, sig)) {
+        return nullptr;
+    }
+    if (ggml_node_get_use_count(cgraph, i) != 1) {
+        return nullptr;
+    }
+    for (int j = i + 1; j < cgraph->n_nodes; j++) {
+        ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_is_empty(n) || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_TRANSPOSE ||
+            n->op == GGML_OP_VIEW || n->op == GGML_OP_PERMUTE || n->op == GGML_OP_NONE ||
+            (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;  // skip exactly what the compute loop skips
+        }
+        if (n->op != GGML_OP_GATED_DELTA_NET || n->src[4] != sig) {
+            return nullptr;
+        }
+        return n;
+    }
+    return nullptr;
+}
+
 // Device-side per-op profiler, enabled with GGML_SYCL_PROF=1.
 //
 // A host-side timer around each op has to synchronise per node, which inflates the
@@ -6406,6 +6458,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     sycl_ctx->src1_f16_reset();
     sycl_ctx->src1_q8_reset();
     sycl_ctx->cur_graph = cgraph;
+    // set when a SIGMOID was skipped because this GDN will apply it at its beta load
+    ggml_tensor * gdn_fold_beta = nullptr;
     ggml_sycl_op_prof prof;
     prof.begin(sycl_ctx->stream());
 
@@ -6434,13 +6488,32 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
 #endif
         // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
+        if (node->op == GGML_OP_UNARY && g_ggml_sycl_enable_fusion) {
+            if (ggml_tensor * gdn = find_gdn_beta_sigmoid(cgraph, i)) {
+                // No dispatch at all: the GDN below applies the sigmoid at its beta load.
+                gdn_fold_beta = gdn;
+                continue;
+            }
+        }
         if (node->op == GGML_OP_GATED_DELTA_NET && g_ggml_sycl_enable_fusion) {
+            // A skipped SIGMOID means src[4] is never written, so the flag MUST reach the
+            // kernel on every path leaving this block -- otherwise the GDN reads an
+            // unwritten buffer and the failure is silent garbage, not a crash. Both
+            // dispatch paths below take it, and the fall-through case cannot be reached
+            // with the flag set.
+            const bool fold_beta = (node == gdn_fold_beta);
+            gdn_fold_beta = nullptr;
             ggml_sycl_gated_delta_net_fused_cache fused_state_cpy;
             const int gdn_nodes_to_skip = ggml_sycl_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
             if (gdn_nodes_to_skip > 0) {
-                ggml_sycl_op_gated_delta_net_fused_cache(*sycl_ctx, node, fused_state_cpy);
+                ggml_sycl_op_gated_delta_net_fused_cache(*sycl_ctx, node, fused_state_cpy, fold_beta);
                 prof.mark(node);
                 i += gdn_nodes_to_skip;
+                continue;
+            }
+            if (fold_beta) {
+                ggml_sycl_gated_delta_net(*sycl_ctx, node, /*beta_sigmoid=*/true);
+                prof.mark(node);
                 continue;
             }
         }

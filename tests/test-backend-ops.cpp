@@ -4408,16 +4408,20 @@ struct test_gated_delta_net : public test_case {
     const bool    permuted;
     const bool    kda;
     const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
+    // Feed beta through a SIGMOID, as qwen35/kimi-linear do. A backend may fold that
+    // sigmoid into its GDN kernel; without a case that builds the pattern, such a fold
+    // is never exercised and the suite passes on code it never reaches.
+    const bool    beta_sigmoid;
 
     std::string vars() override {
-        return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
+        return VARS_TO_STR10(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, beta_sigmoid);
     }
 
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
-            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
+            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, bool beta_sigmoid = false)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K) {}
+          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), beta_sigmoid(beta_sigmoid) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q;
@@ -4446,6 +4450,9 @@ struct test_gated_delta_net : public test_case {
         // q/k are L2-normalised in qwen35/kimi-linear before delta_net
         q = ggml_l2_norm(ctx, q, 1e-6f);
         k = ggml_l2_norm(ctx, k, 1e-6f);
+        if (beta_sigmoid) {
+            beta = ggml_sigmoid(ctx, beta);
+        }
         ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
         return out;
     }
@@ -4456,7 +4463,13 @@ struct test_gated_delta_net : public test_case {
             if (strcmp(t->name, "g") == 0) {
                 init_tensor_uniform(t, -20.0f, -1e-4f);
             } else if (strcmp(t->name, "beta") == 0) {
-                init_tensor_uniform(t, 0.0f, 1.0f);
+                // post-sigmoid beta must still span (0,1); raw uniform(0,1) would only
+                // reach (0.50, 0.73) and would not exercise the saturating ends.
+                if (beta_sigmoid) {
+                    init_tensor_uniform(t, -6.0f, 6.0f);
+                } else {
+                    init_tensor_uniform(t, 0.0f, 1.0f);
+                }
             } else if (strcmp(t->name, "v") == 0) {
                 init_tensor_uniform(t, -0.3f, 5.0f);
             } else {
@@ -10163,6 +10176,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // overflow: n_tokens > K — only the last K snapshots kept.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+
+    // beta fed by a SIGMOID, which is how qwen35/kimi-linear actually build it. A backend
+    // that folds that sigmoid into its GDN kernel has no coverage without these: the eight
+    // cases above all hand the op a plain beta, so the folded load is never taken. Shapes
+    // mirror the ones already swept, plus head_size=128 / K=4, which is the Qwen3.5
+    // decode geometry (48 heads, 128-wide state, MTP verify width 4).
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128,  1, 1, 1, false, false, /*K=*/1, /*beta_sigmoid=*/true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8, 128,  4, 1, 1, false, false, /*K=*/4, /*beta_sigmoid=*/true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4,  64,  4, 2, 1, false, false, /*K=*/4, /*beta_sigmoid=*/true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4,  64,  1, 1, 1, false, true,  /*K=*/1, /*beta_sigmoid=*/true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4,  64,  4, 2, 1, true,  false, /*K=*/1, /*beta_sigmoid=*/true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4,  64, 127, 1, 1, false, false, /*K=*/1, /*beta_sigmoid=*/true));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

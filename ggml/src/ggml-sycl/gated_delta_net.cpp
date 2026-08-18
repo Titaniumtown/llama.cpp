@@ -37,7 +37,8 @@ void gated_delta_net_sycl(
                           const sycl::uint3 rq3_magic,
                           float             scale,
                           int64_t           state_slot_stride,
-                          int               K) {
+                          int               K,
+                          bool              beta_sigmoid) {
     auto           item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const uint32_t h_idx    = item_ct1.get_group(2);
     const uint32_t sequence = item_ct1.get_group(1);
@@ -85,7 +86,13 @@ void gated_delta_net_sycl(
         const float * beta_t = beta + gb_offset;
         const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
 
-        const float beta_val = *beta_t;
+        // beta_sigmoid folds a preceding standalone SIGMOID into this one load. The
+        // expression is op_sigmoid()'s verbatim (element_wise.cpp), so the fused and
+        // unfused paths are bit-identical rather than merely close. The branch is once
+        // per (token, head), outside the C-column loop, and uniform across the
+        // sub-group, so it costs nothing measurable.
+        const float beta_raw = *beta_t;
+        const float beta_val = beta_sigmoid ? 1.0f / (1.0f + sycl::exp(-beta_raw)) : beta_raw;
 
         // this token's q/k shard, read once and reused by all C columns -- the point of C
         float q_reg[rows_per_lane];
@@ -281,6 +288,7 @@ static void launch_gated_delta_net_cols(
                                         int64_t         rq3,
                                         float           scale,
                                         int             K,
+                                        bool            beta_sigmoid,
                                         dpct::queue_ptr stream) {
     const int warp_size = ggml_sycl_info().devices[ggml_sycl_get_device()].warp_size;
 
@@ -299,7 +307,7 @@ static void launch_gated_delta_net_cols(
                                      [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                                          gated_delta_net_sycl<sv, C, KDA, keep_rs_t>(
                                                  q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, sq1, sq2, sq3, sv1, sv2, sv3,
-                                                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
+                                                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, beta_sigmoid);
                                      });
             }
             break;
@@ -310,7 +318,7 @@ static void launch_gated_delta_net_cols(
                                      [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                                          gated_delta_net_sycl<sv, C, KDA, keep_rs_t>(
                                                  q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, sq1, sq2, sq3, sv1, sv2, sv3,
-                                                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
+                                                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, beta_sigmoid);
                                      });
             }
             break;
@@ -321,7 +329,7 @@ static void launch_gated_delta_net_cols(
                                      [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                                          gated_delta_net_sycl<sv, C, KDA, keep_rs_t>(
                                                  q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, sq1, sq2, sq3, sv1, sv2, sv3,
-                                                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
+                                                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, beta_sigmoid);
                                      });
             }
             break;
@@ -332,7 +340,7 @@ static void launch_gated_delta_net_cols(
                                      [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                                          gated_delta_net_sycl<sv, C, KDA, keep_rs_t>(
                                                  q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, sq1, sq2, sq3, sv1, sv2, sv3,
-                                                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
+                                                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, beta_sigmoid);
                                      });
             }
             break;
@@ -370,6 +378,7 @@ static void launch_gated_delta_net(
                                    float           scale,
                                    int64_t         state_slot_stride,
                                    int             K,
+                                   bool            beta_sigmoid,
                                    dpct::queue_ptr stream) {
     //TODO: Add chunked kernel for even faster pre-fill
     // Columns per warp. 1 reproduces the original launch exactly; 4 is the measured
@@ -396,23 +405,23 @@ static void launch_gated_delta_net(
         case 1:
             launch_gated_delta_net_cols<1, KDA, keep_rs_t>(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, state_slot_stride,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, K, beta_sigmoid, stream);
             break;
         case 2:
             launch_gated_delta_net_cols<2, KDA, keep_rs_t>(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, state_slot_stride,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, K, beta_sigmoid, stream);
             break;
         default:
             launch_gated_delta_net_cols<4, KDA, keep_rs_t>(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, state_slot_stride,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, K, beta_sigmoid, stream);
             break;
     }
 }
 
 static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
-                                              const ggml_sycl_gated_delta_net_fused_cache * cache) {
+                                              const ggml_sycl_gated_delta_net_fused_cache * cache, bool beta_sigmoid) {
     ggml_tensor * src_q     = dst->src[0];
     ggml_tensor * src_k     = dst->src[1];
     ggml_tensor * src_v     = dst->src[2];
@@ -444,7 +453,12 @@ static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, g
     const float * k_d = (const float *) src_k->data;
     const float * v_d = (const float *) src_v->data;
     const float * g_d = (const float *) src_g->data;
-    const float * b_d = (const float *) src_beta->data;
+    // When the producing SIGMOID is folded into the kernel its output is never
+    // materialised, so read the sigmoid's own input instead. Same shape and both
+    // contiguous, so the shared beta/g stride triple below is unchanged -- asserted
+    // below rather than assumed, because those strides also drive g's offsets.
+    const ggml_tensor * beta_src = beta_sigmoid ? src_beta->src[0] : src_beta;
+    const float * b_d = (const float *) beta_src->data;
 
     const float * s_d   = (const float *) src_state->data;
     float *       dst_d = (float *) dst->data;
@@ -456,6 +470,10 @@ static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, g
     GGML_ASSERT(src_g->ne[0] == 1 || kda);
     GGML_ASSERT(ggml_is_contiguous(src_g));
     GGML_ASSERT(ggml_is_contiguous(src_beta));
+    GGML_ASSERT(beta_src->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(beta_src));
+    GGML_ASSERT(ggml_are_same_shape(beta_src, src_beta));
+    GGML_ASSERT(ggml_are_same_stride(beta_src, src_beta));
     GGML_ASSERT(ggml_is_contiguous(src_state));
 
     // strides in floats (beta strides used for both g and beta offset computation)
@@ -489,36 +507,40 @@ static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, g
         if (keep_rs) {
             launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, beta_sigmoid, stream);
         } else {
             launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, beta_sigmoid, stream);
         }
     } else {
         if (keep_rs) {
             launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, beta_sigmoid, stream);
         } else {
             launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, beta_sigmoid, stream);
         }
     }
 }
 
-void ggml_sycl_op_gated_delta_net(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
-    ggml_sycl_op_gated_delta_net_impl(ctx, dst, nullptr);
+void ggml_sycl_op_gated_delta_net(ggml_backend_sycl_context & ctx, ggml_tensor * dst, bool beta_sigmoid) {
+    ggml_sycl_op_gated_delta_net_impl(ctx, dst, nullptr, beta_sigmoid);
 }
 
-void ggml_sycl_gated_delta_net(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
-    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/6);
-    ggml_sycl_op_gated_delta_net(ctx, dst);
+// The "_beta" suffix is not decoration: it makes the fold countable in a
+// GGML_SYCL_DEBUG dispatch census, so "is it actually firing?" is one grep rather than
+// an inference from profiler row counts. A fusion that silently declines looks exactly
+// like one that works, and this backend has shipped that twice.
+void ggml_sycl_gated_delta_net(ggml_backend_sycl_context & ctx, ggml_tensor * dst, bool beta_sigmoid) {
+    scope_op_debug_print scope_dbg_print(__func__, beta_sigmoid ? "_beta" : "", dst, /*num_src=*/6);
+    ggml_sycl_op_gated_delta_net(ctx, dst, beta_sigmoid);
 }
 
 void ggml_sycl_op_gated_delta_net_fused_cache(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
-                                              ggml_sycl_gated_delta_net_fused_cache cache) {
-    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/6);
-    ggml_sycl_op_gated_delta_net_impl(ctx, dst, &cache);
+                                              ggml_sycl_gated_delta_net_fused_cache cache, bool beta_sigmoid) {
+    scope_op_debug_print scope_dbg_print(__func__, beta_sigmoid ? "_beta" : "", dst, /*num_src=*/6);
+    ggml_sycl_op_gated_delta_net_impl(ctx, dst, &cache, beta_sigmoid);
 }

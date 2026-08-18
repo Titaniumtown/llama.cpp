@@ -243,6 +243,13 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
     cb(z, "z", il);
 
+    // Pin the two projections adjacently in the node list: the SYCL backend folds two
+    // same-type mat-vecs over one activation into a single grouped dispatch, and its
+    // pair scan is local -- topological order otherwise places z ~30 nodes downstream,
+    // next to its consumer, out of the scan window (and across an alias-unsafe gap).
+    ggml_build_forward_expand(gf, qkv_mixed);
+    ggml_build_forward_expand(gf, z);
+
     return { qkv_mixed, z };
 }
 
@@ -283,6 +290,12 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
 
     ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
     cb(Kcur, "Kcur", il);
+
+    // Pin the Q and K projections adjacently in the node list for the SYCL grouped
+    // mat-vec pair (see build_qkvz); topological order otherwise separates them by
+    // the whole q_norm/rope/attention middle, far past the pair scan window.
+    ggml_build_forward_expand(gf, Qcur_full);
+    ggml_build_forward_expand(gf, Kcur);
 
     ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
     cb(Vcur, "Vcur", il);

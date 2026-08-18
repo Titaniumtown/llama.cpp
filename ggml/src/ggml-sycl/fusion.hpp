@@ -19,4 +19,9 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
 // contiguous op sequence, so the caller locates the second itself.
 bool ggml_sycl_should_fuse_mul_mat_pair(const ggml_tensor * a, const ggml_tensor * b);
 
+// The unequal-shape (grouped/segmented dispatch) form: same quant type + ncols +
+// reorder layout required, row counts free. Covers the attention Q/K and GDN
+// qkv/gate projection pairs.
+bool ggml_sycl_should_fuse_mul_mat_pair_grouped(const ggml_tensor * a, const ggml_tensor * b);
+
 #endif  // GGML_SYCL_FUSION_HPP

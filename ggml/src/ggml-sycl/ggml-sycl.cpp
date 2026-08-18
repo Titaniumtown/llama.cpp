@@ -7303,6 +7303,7 @@ struct mul_mat_pair_fusion {
     int           chain_lo      = -1;       // graph range of the decay chain
     int           chain_hi      = -1;
     bool          anchor_is_dsa = false;
+    bool          plain         = false;   // grouped two-destination dispatch, no epilogue
 };
 
 // Locates the second of a pair of independent mat-vecs sharing one activation. Anchored at
@@ -7318,6 +7319,32 @@ struct mul_mat_pair_fusion {
 //
 // Which side is which is NOT fixed -- ggml orders these by the consuming GDN's source list,
 // not by construction order -- so both arrangements are accepted.
+// ggml-alloc reuses freed slots, so executing `b`'s write at the anchor's earlier
+// position is only safe if b's storage is disjoint from every byte the gap touches:
+// a tensor freed inside the gap may donate its slot to b's dst (early write corrupts
+// its remaining readers), and a tensor allocated inside the gap may receive b's slot
+// (its write corrupts b's early result). Both directions reduce to a range-overlap
+// scan over the gap nodes and their sources (view sources resolve to parent storage).
+static bool pair_storage_disjoint(const ggml_cgraph * cgraph, int from, int to, const ggml_tensor * b) {
+    const uintptr_t b_lo = (uintptr_t) b->data;
+    const uintptr_t b_hi = b_lo + ggml_nbytes(b);
+    for (int k = from; k < to; k++) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        for (int s = -1; s < GGML_MAX_SRC; s++) {
+            const ggml_tensor * t = s < 0 ? n : n->src[s];
+            if (t == nullptr || t->data == nullptr) {
+                continue;
+            }
+            const uintptr_t lo = (uintptr_t) t->data;
+            const uintptr_t hi = lo + ggml_nbytes(t);
+            if (lo < b_hi && b_lo < hi) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool find_mul_mat_pair(const ggml_cgraph * cgraph, int idx, mul_mat_pair_fusion & out) {
     if (!g_ggml_sycl_enable_fusion) {
         return false;
@@ -7333,23 +7360,74 @@ static bool find_mul_mat_pair(const ggml_cgraph * cgraph, int idx, mul_mat_pair_
             break;
         }
     }
-    if (b == nullptr) {
-        PAIR_REJECT("no second mul_mat in window");
-        return false;
-    }
-    if (!ggml_sycl_should_fuse_mul_mat_pair(a, b)) {
-        PAIR_REJECT("geometry/activation mismatch");
-        return false;
-    }
-
     const std::initializer_list<enum ggml_op> chain = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD,
                                                         GGML_OP_UNARY, GGML_OP_MUL };
     const bool a_dsa = idx + 4 < cgraph->n_nodes &&
                        ggml_sycl_can_fuse(cgraph, idx, chain, { GGML_UNARY_OP_SOFTPLUS });
-    const bool b_dsa = bi + 4 < cgraph->n_nodes &&
+    const bool b_dsa = b != nullptr && bi + 4 < cgraph->n_nodes &&
                        ggml_sycl_can_fuse(cgraph, bi, chain, { GGML_UNARY_OP_SOFTPLUS });
-    if (a_dsa == b_dsa) {
-        PAIR_REJECT(a_dsa ? "both are decay chains" : "neither is a decay chain");
+    if (a_dsa && b_dsa) {
+        PAIR_REJECT("both are decay chains");
+        return false;
+    }
+    if (!a_dsa && (b == nullptr || !b_dsa)) {
+        // a plain (or partnerless) anchor never carries an epilogue; a dsa anchor
+        // without a dsa partner is left for the single-mat-vec DSA fold instead.
+        // No decay chain at the anchor: try the grouped (unequal-shape) pair. The
+        // partner is the FIRST mat-vec in a wider window that shares the activation
+        // and passes geometry -- the first mat-vec outright is usually wrong here
+        // (topological order interleaves unrelated projections: V sits between Q
+        // and K, and the GDN gate lands ~30 nodes downstream, next to its consumer).
+        static const int fuse_pair_grouped = ggml_sycl_get_env("GGML_SYCL_FUSE_PAIR_GROUPED", 1);
+        if (!fuse_pair_grouped) {
+            PAIR_REJECT("grouped pair disabled");
+            return false;
+        }
+        if (ggml_sycl_can_fuse(cgraph, idx, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU })) {
+            PAIR_REJECT("glu fusion claims this pair");
+            return false;
+        }
+        const int ghi = std::min(idx + 64, cgraph->n_nodes);
+        for (int j = idx + 1; j < ghi; j++) {
+            ggml_tensor * cand = cgraph->nodes[j];
+            if (cand->op != GGML_OP_MUL_MAT) {
+                continue;
+            }
+            // a decay-chain head belongs to its own (epilogue-carrying) pairing
+            if (j + 4 < cgraph->n_nodes && ggml_sycl_can_fuse(cgraph, j, chain, { GGML_UNARY_OP_SOFTPLUS })) {
+                continue;
+            }
+            if (!ggml_sycl_should_fuse_mul_mat_pair_grouped(a, cand)) {
+                continue;
+            }
+            if (region_touched_between(cgraph, idx + 1, j, cand, /*include_reads=*/true)) {
+                PAIR_REJECT("grouped output touched in between");
+                return false;
+            }
+            if (region_touched_between(cgraph, idx + 1, j, a->src[1], /*include_reads=*/false)) {
+                PAIR_REJECT("activation rewritten in between");
+                return false;
+            }
+            if (!pair_storage_disjoint(cgraph, idx + 1, j, cand)) {
+                PAIR_REJECT("grouped storage aliases the gap");
+                return false;
+            }
+            out.other = cand;
+            out.plain = true;
+            return true;
+        }
+        PAIR_REJECT("no grouped partner in window");
+        return false;
+    }
+
+    if (b == nullptr) {
+        PAIR_REJECT("dsa anchor without a partner in window");
+        return false;
+    }
+    // Exactly one decay chain: the equal-shape two-destination kernel carries the
+    // epilogue. Its geometry requirements are stricter than the grouped form's.
+    if (!ggml_sycl_should_fuse_mul_mat_pair(a, b)) {
+        PAIR_REJECT("geometry/activation mismatch");
         return false;
     }
 
@@ -7782,7 +7860,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // [lo, hi], plus the single paired node when the anchor was the chain itself
     int           pair_skip_lo   = -1;
     int           pair_skip_hi   = -1;
-    ggml_tensor * pair_skip_node = nullptr;
+    // Up to 4 pending pair-absorbed nodes: a grouped pair's partner can sit ~30
+    // nodes downstream, and a DSA pair may fire inside that gap -- one slot would
+    // silently drop the earlier skip and double-dispatch the partner.
+    ggml_tensor * pair_skip_node[4] = {};
     ggml_sycl_op_prof prof;
     prof.begin(sycl_ctx->stream());
 
@@ -7828,9 +7909,18 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
             continue;
         }
-        if (node == pair_skip_node) {
-            pair_skip_node = nullptr;
-            continue;
+        {
+            bool pair_skipped = false;
+            for (auto & sk : pair_skip_node) {
+                if (sk == node) {
+                    sk           = nullptr;
+                    pair_skipped = true;
+                    break;
+                }
+            }
+            if (pair_skipped) {
+                continue;
+            }
         }
         if (ggml_sycl_is_view_or_noop(node)) {
             continue;
@@ -8284,8 +8374,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     GGML_ASSERT(ssm_wb_conv == nullptr && "conv-state writeback skipped but never performed");
     GGML_ASSERT(collapse_conv == nullptr && collapse_cpy == nullptr && collapse_silu == nullptr &&
                 "conv chain collapsed but a node it absorbed was never reached");
-    GGML_ASSERT(pair_skip_lo == -1 && pair_skip_node == nullptr &&
-                "mat-vec pair folded but a node it absorbed was never reached");
+    GGML_ASSERT(pair_skip_lo == -1 && "mat-vec pair folded but a node it absorbed was never reached");
+    for (const auto & sk : pair_skip_node) {
+        GGML_ASSERT(sk == nullptr && "mat-vec pair folded but a node it absorbed was never reached");
+    }
     prof.flush();
 }
 

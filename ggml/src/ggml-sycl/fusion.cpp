@@ -1,6 +1,8 @@
 #include "fusion.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+
 // Two INDEPENDENT mat-vecs over one activation, written to two destinations. Same weight
 // geometry requirement as the GLU pair -- identical shape and row stride in the reorder
 // (SoA) layout, so the second reuses the first's per-block offsets -- but with no combining
@@ -41,6 +43,70 @@ bool ggml_sycl_should_fuse_mul_mat_pair(const ggml_tensor * a, const ggml_tensor
     if (ggml_sycl_info().device_count > 1) {
         return false;
     }
+    return true;
+}
+
+// The grouped (segmented-dispatch) form of the pair: two independent mat-vecs over
+// one activation whose weights need NOT have the same shape -- only the same quant
+// type, the same ncols and the reorder layout. This is the Q/K projection pair and
+// the GDN qkv/gate pair in qwen3.5/3.6: same src1, 12288-vs-1024 and 10240-vs-6144
+// rows respectively. Kernel: mul_mat_vec_q_reorder_grouped2 (segmented row space).
+bool ggml_sycl_should_fuse_mul_mat_pair_grouped(const ggml_tensor * a, const ggml_tensor * b) {
+    // per-candidate rejects are scan-noise at DIAG=1 (the byte-compare level); =2 traces them
+    static const bool diag = [] {
+        const char * e = getenv("GGML_SYCL_FUSE_PAIR_DIAG");
+        return e != nullptr && atoi(e) >= 2;
+    }();
+#define GRP_REJECT(tag)                                                                     \
+    do {                                                                                    \
+        if (diag) {                                                                         \
+            fprintf(stderr, "[MMGRP] reject %s: a=%s b=%s\n", tag, a->name, b->name);       \
+        }                                                                                   \
+        return false;                                                                       \
+    } while (0)
+    if (a->op != GGML_OP_MUL_MAT || b->op != GGML_OP_MUL_MAT) {
+        GRP_REJECT("op");
+    }
+    const ggml_tensor * wa = a->src[0];
+    const ggml_tensor * wb = b->src[0];
+    if (wa == nullptr || wb == nullptr || wa == wb) {
+        GRP_REJECT("weights");
+    }
+    if (wa->type != wb->type || (wa->type != GGML_TYPE_Q4_K && wa->type != GGML_TYPE_Q5_K)) {
+        GRP_REJECT("type");
+    }
+    // shared activation implies equal ncols; rows may differ
+    if (wa->ne[0] != wb->ne[0] || wa->ne[0] % QK_K != 0) {
+        GRP_REJECT("ncols");
+    }
+    if (wa->ne[2] != 1 || wa->ne[3] != 1 || wb->ne[2] != 1 || wb->ne[3] != 1) {
+        GRP_REJECT("batch dims");
+    }
+    if (a->src[1] == nullptr || a->src[1] != b->src[1] || a->src[1]->type != GGML_TYPE_F32) {
+        GRP_REJECT("activation");
+    }
+    if (a->src[1]->ne[1] != 1 || a->src[1]->ne[2] != 1 || a->src[1]->ne[3] != 1) {
+        GRP_REJECT("ncols_dst");
+    }
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) {
+        GRP_REJECT("dst type");
+    }
+    if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b)) {
+        GRP_REJECT("contiguity");
+    }
+    // a row-limited mat-vec (the MTP draft head) must keep its own dispatch
+    if (ggml_mul_mat_get_row_limit(a) > 0 || ggml_mul_mat_get_row_limit(b) > 0) {
+        GRP_REJECT("row limit");
+    }
+    const auto * ea = (const ggml_tensor_extra_gpu *) wa->extra;
+    const auto * eb = (const ggml_tensor_extra_gpu *) wb->extra;
+    if (!ea || !eb || !ea->optimized_feature.reorder || !eb->optimized_feature.reorder) {
+        GRP_REJECT("reorder");
+    }
+    if (ggml_sycl_info().device_count > 1) {
+        GRP_REJECT("multi-device");
+    }
+#undef GRP_REJECT
     return true;
 }
 

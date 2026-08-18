@@ -5889,11 +5889,21 @@ struct ggml_sycl_op_prof {
             key += buf;
             return key;
         }
-        // matmul cost is dominated by the weight, so keep type and shape apart
+        // matmul cost is dominated by the weight, so keep type and shape apart. Carry the
+        // higher dimensions too: an expert stack is ne[0]xne[1]xne[2] and printing only the
+        // first two makes the row appear to move ne[2] times its own weight, which reads as
+        // a double-counting bug in the profiler rather than as the shape it is. It would
+        // also merge a genuinely 2-D tensor with a stack that shares its first two dims.
         if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0]) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "/%s/%ldx%ld", ggml_type_name(node->src[0]->type),
-                     (long) node->src[0]->ne[0], (long) node->src[0]->ne[1]);
+            const ggml_tensor * w = node->src[0];
+            char buf[80];
+            if (w->ne[2] > 1 || w->ne[3] > 1) {
+                snprintf(buf, sizeof(buf), "/%s/%ldx%ldx%ldx%ld", ggml_type_name(w->type),
+                         (long) w->ne[0], (long) w->ne[1], (long) w->ne[2], (long) w->ne[3]);
+            } else {
+                snprintf(buf, sizeof(buf), "/%s/%ldx%ld", ggml_type_name(w->type),
+                         (long) w->ne[0], (long) w->ne[1]);
+            }
             key += buf;
         }
         return key;
@@ -5912,7 +5922,16 @@ struct ggml_sycl_op_prof {
         } else {
             bytes = node_bytes(node);
         }
-        marks.push_back({ node_key(node), bytes, q->ext_oneapi_submit_barrier() });
+        // A fused span is charged every node's bytes but named only after its head, so a
+        // gate/up+GLU dispatch shows up as MUL_MAT/<gate shape> moving ~2x that weight.
+        // That reads as a double-counting bug in the profiler and is not one; say so in
+        // the key instead, and keep fused and unfused dispatches of the same head op in
+        // separate rows, because they are not the same work.
+        std::string key = node_key(node);
+        if (cgraph && span > 1) {
+            key += "+" + std::to_string(span - 1);
+        }
+        marks.push_back({ std::move(key), bytes, q->ext_oneapi_submit_barrier() });
     }
 
     // Totals are accumulated across every graph and dumped once at exit.

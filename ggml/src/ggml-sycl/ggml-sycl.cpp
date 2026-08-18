@@ -6475,7 +6475,16 @@ struct ggml_sycl_op_prof {
         uint64_t ns    = 0;
         uint64_t calls = 0;
         uint64_t bytes = 0;
+        // A row's us/call is a mean, and a mean cannot tell 554 uniform gaps from four huge
+        // ones plus 550 empty. That distinction decides whether HOST/gpu-idle+setup is
+        // dispatch overhead (attack it with fusion) or a few blocking host copies (attack it
+        // with an async readback), so keep enough shape to answer it.
+        uint64_t max_ns    = 0;
+        uint64_t big_ns    = 0;  // ns accumulated in marks >= BIG_MARK_NS
+        uint64_t big_calls = 0;
     };
+
+    static constexpr uint64_t BIG_MARK_NS = 100000;  // 100 us
 
     // Deliberately leaked. atexit(dump) is registered from enabled(), which runs before
     // this map is first constructed, so a function-local static would be destroyed
@@ -6497,10 +6506,18 @@ struct ggml_sycl_op_prof {
                 marks[i - 1].ev.get_profiling_info<sycl::info::event_profiling::command_end>();
             const uint64_t cur =
                 marks[i].ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+            const uint64_t d = cur > prev ? cur - prev : 0;
             auto & slot = t[marks[i].name];
-            slot.ns    += cur > prev ? cur - prev : 0;
+            slot.ns    += d;
             slot.calls += 1;
             slot.bytes += marks[i].bytes;
+            if (d > slot.max_ns) {
+                slot.max_ns = d;
+            }
+            if (d >= BIG_MARK_NS) {
+                slot.big_ns    += d;
+                slot.big_calls += 1;
+            }
         }
         marks.clear();
         active() = nullptr;
@@ -6522,15 +6539,19 @@ struct ggml_sycl_op_prof {
         });
         fprintf(stderr, "\n=== SYCL device-time profile (total %.2f ms, %.2f GB over all graphs) ===\n",
                 grand / 1e6, grand_bytes / 1e9);
-        fprintf(stderr, "%-30s %11s %9s %10s %8s %10s\n", "op", "gpu_ms", "calls", "us/call",
-                "share", "GB/s");
+        fprintf(stderr, "%-30s %11s %9s %10s %8s %10s %10s %8s %7s\n", "op", "gpu_ms", "calls",
+                "us/call", "share", "GB/s", "max_us", ">=100us", "%in_big");
         for (const auto & kv : v) {
             const double ms = kv.second.ns / 1e6;
-            fprintf(stderr, "%-30s %11.3f %9llu %10.2f %7.2f%% %10.1f\n", kv.first.c_str(), ms,
+            fprintf(stderr, "%-30s %11.3f %9llu %10.2f %7.2f%% %10.1f %10.1f %8llu %6.1f%%\n",
+                    kv.first.c_str(), ms,
                     (unsigned long long) kv.second.calls,
                     kv.second.ns / 1e3 / (double) kv.second.calls,
                     grand ? 100.0 * kv.second.ns / grand : 0.0,
-                    kv.second.ns ? kv.second.bytes / (double) kv.second.ns : 0.0);
+                    kv.second.ns ? kv.second.bytes / (double) kv.second.ns : 0.0,
+                    kv.second.max_ns / 1e3,
+                    (unsigned long long) kv.second.big_calls,
+                    kv.second.ns ? 100.0 * kv.second.big_ns / kv.second.ns : 0.0);
         }
         fflush(stderr);
     }

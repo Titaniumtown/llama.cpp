@@ -1212,6 +1212,31 @@ static void fused_add_unary_mul_sycl(const T * a, const T * bias, const T * scal
         });
 }
 
+// Plain binary MUL with a producer-side q8_1 emission. The GDN gating chain's second
+// gate is a standalone GGML_OP_MUL (inplace over the gated norm's buffer) whose output,
+// read through a contiguous reshape, is the ssm_out/attn_output mat-vec's src1 -- the
+// last quantize-pool family (528+96+48+48 misses per 12-token trace). Emitting from the
+// upstream fused norm was built and falsified (0145): these are the only bytes the
+// consumer sees. Same recipe as the GLU/UNARY+MUL producers; the identity op turns
+// fused_unary_mul's kernel into a plain product with the emission's sub-group layout.
+// Only fires when the gate helper hands back a buffer; every other MUL keeps the
+// generic bin_bcast path untouched.
+bool ggml_sycl_mul_emit_q8_fast(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * s0 = dst->src[0];
+    const ggml_tensor * s1 = dst->src[1];
+    if (dst->type != GGML_TYPE_F32 || s0->type != GGML_TYPE_F32 || s1->type != GGML_TYPE_F32) { return false; }
+    if (!ggml_are_same_shape(s0, s1) || !ggml_are_same_shape(s0, dst)) { return false; }
+    if (!ggml_is_contiguous(s0) || !ggml_is_contiguous(s1) || !ggml_is_contiguous(dst)) { return false; }
+    int    q8_kx  = 0;
+    char * q8_out = ggml_sycl_q8_emit_for_next_matvec(ctx, dst, &q8_kx);
+    if (q8_out == nullptr) { return false; }
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    const int64_t k = ggml_nelements(dst);
+    fused_unary_mul_sycl<float>((const float *) s0->data, (const float *) s1->data, (float *) dst->data,
+                                k, ctx.stream(), [](auto v) { return v; }, nullptr, q8_out, q8_kx);
+    return true;
+}
+
 static inline void ggml_sycl_op_fused_unary_mul(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
     const ggml_tensor * unary_src = unary_node->src[0];
     const ggml_tensor * other_src = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];

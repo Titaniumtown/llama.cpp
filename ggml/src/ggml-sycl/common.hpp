@@ -910,6 +910,11 @@ sycl::half * ggml_sycl_f16_mirror_for_next_matmul(ggml_backend_sycl_context & ct
 char * ggml_sycl_q8_emit_for_next_matvec(ggml_backend_sycl_context & ctx,
                                          const ggml_tensor * dst, int * kx);
 
+// Binary GGML_OP_MUL fast path: same-shape contiguous f32 product fused with the q8_1
+// emission above. Returns false (and launches nothing) when the emission gate declines;
+// the caller then takes the generic bin_bcast path. Defined in element_wise.cpp.
+bool ggml_sycl_mul_emit_q8_fast(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
+
 // Aligned memory transfers of 8/16 bytes can be faster than 2 transfers with 4 bytes.
 template <int nbytes, int alignment = 0>
 static __dpct_inline__ void ggml_sycl_memcpy_1(void * dst, const void * src) {

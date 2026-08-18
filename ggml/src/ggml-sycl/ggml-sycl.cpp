@@ -5090,7 +5090,24 @@ char * ggml_sycl_q8_emit_for_next_matvec(ggml_backend_sycl_context & ctx,
     }
     if (prod < 0 || prod + 1 >= g->n_nodes) { return nullptr; }
     ggml_tensor * nxt = g->nodes[prod + 1];
-    if (nxt->op != GGML_OP_MUL_MAT || nxt->src[1] != dst) { return nullptr; }
+    // The consumer may sit one contiguous same-data view away: the GDN gating chain is
+    // MUL -> RESHAPE([head_dim, heads*t] -> [6144, t]) -> MUL_MAT, and 0145's falsification
+    // established the MUL as the only node whose bytes the mat-vec actually reads. The
+    // emission then must speak the VIEW's dims: its ne[0] is the q8_1 row length the
+    // consumer's lookup hashes, and the store is stamped on the view node so the cache's
+    // overwrite walk starts at the consumer. Off switch: GGML_SYCL_MUL_EMIT_Q8=0 (also
+    // disables the binary-MUL fast path that feeds through this hop).
+    static const int hop_emit = ggml_sycl_get_env("GGML_SYCL_MUL_EMIT_Q8", 1);
+    const ggml_tensor * tgt = dst;
+    if (nxt->op != GGML_OP_MUL_MAT || nxt->src[1] != dst) {
+        if (hop_emit == 0 || prod + 2 >= g->n_nodes) { return nullptr; }
+        if ((nxt->op != GGML_OP_RESHAPE && nxt->op != GGML_OP_VIEW) || nxt->src[0] != dst ||
+            nxt->data != dst->data || !ggml_is_contiguous(nxt)) { return nullptr; }
+        ggml_tensor * mm = g->nodes[prod + 2];
+        if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != nxt) { return nullptr; }
+        tgt = nxt;
+        nxt = mm;
+    }
 
     const char * why = nullptr;
     // The consumer must take the quantizing mat-vec path: not DMMV (reads f32 directly) and
@@ -5105,12 +5122,12 @@ char * ggml_sycl_q8_emit_for_next_matvec(ggml_backend_sycl_context & ctx,
     // src1_q8_lookup ran and missed 704 times at precisely the bytes this would have stored.
     // Decline only when DMMV is genuinely prioritized; a stored entry that some corner-case
     // consumer never looks up is a harmless 19.5 KB write into a buffer the next op reuses.
-    if (!can_use_mul_mat_vec_q(nxt->src[0], dst, nxt))              { why = "not-mmvq"; }
+    if (!can_use_mul_mat_vec_q(nxt->src[0], tgt, nxt))              { why = "not-mmvq"; }
     else if (g_ggml_sycl_prioritize_dmmv)                           { why = "dmmv-prioritized"; }
-    else if (dst->ne[1] < 1 || dst->ne[1] > MMVQ_MAX_BATCH_SIZE)    { why = "rows"; }
-    else if (dst->ne[2] != 1 || dst->ne[3] != 1)                    { why = "dims23"; }
-    else if (!ggml_is_contiguous(dst))                              { why = "noncontig"; }
-    else if (dst->ne[0] % MATRIX_ROW_PADDING != 0)                  { why = "ne00%pad"; }
+    else if (tgt->ne[1] < 1 || tgt->ne[1] > MMVQ_MAX_BATCH_SIZE)    { why = "rows"; }
+    else if (tgt->ne[2] != 1 || tgt->ne[3] != 1)                    { why = "dims23"; }
+    else if (!ggml_is_contiguous(tgt))                              { why = "noncontig"; }
+    else if (tgt->ne[0] % MATRIX_ROW_PADDING != 0)                  { why = "ne00%pad"; }
     if (why != nullptr) {
         if (trace) {
             fprintf(stderr, "[GQ8] decline=%s ne=[%ld,%ld,%ld,%ld]\n", why, (long) dst->ne[0],
@@ -5119,15 +5136,15 @@ char * ggml_sycl_q8_emit_for_next_matvec(ggml_backend_sycl_context & ctx,
         return nullptr;
     }
 
-    const size_t bytes  = (size_t) dst->ne[1] * dst->ne[0] * sizeof(block_q8_1) / QK8_1;
-    const size_t src_ne = (size_t) ggml_nelements(dst);
-    char * p = ggml_sycl_src1_q8_store_ext(ctx, (const void *) dst->data, (const void *) ctx.stream(),
-                                           bytes, src_ne, /*SoA=*/1, dst);
+    const size_t bytes  = (size_t) tgt->ne[1] * tgt->ne[0] * sizeof(block_q8_1) / QK8_1;
+    const size_t src_ne = (size_t) ggml_nelements(tgt);
+    char * p = ggml_sycl_src1_q8_store_ext(ctx, (const void *) tgt->data, (const void *) ctx.stream(),
+                                           bytes, src_ne, /*SoA=*/1, tgt);
     if (trace) {
-        fprintf(stderr, "[GQ8] EMIT ne=[%ld,%ld] bytes=%zu key=%p\n", (long) dst->ne[0],
-                (long) dst->ne[1], bytes, (const void *) dst->data);
+        fprintf(stderr, "[GQ8] EMIT%s ne=[%ld,%ld] bytes=%zu key=%p\n", tgt == dst ? "" : "-VIEW",
+                (long) tgt->ne[0], (long) tgt->ne[1], bytes, (const void *) tgt->data);
     }
-    *kx = (int) dst->ne[0];
+    *kx = (int) tgt->ne[0];
     return p;
 }
 

@@ -317,7 +317,11 @@ inline void ggml_sycl_op_sub(ggml_backend_sycl_context & ctx, ggml_tensor *dst) 
 }
 
 inline void ggml_sycl_op_mul(ggml_backend_sycl_context & ctx, ggml_tensor *dst) {
-
+    // Producer-side q8_1 emission for the mat-vec consumer one (view,) node ahead --
+    // the GDN second gate. Declines cheaply for every MUL that is not that shape.
+    if (ggml_sycl_mul_emit_q8_fast(ctx, dst)) {
+        return;
+    }
     ggml_sycl_op_bin_bcast<bin_bcast_sycl<op_mul>>(ctx, dst->src[0], dst->src[1], dst);
 }
 

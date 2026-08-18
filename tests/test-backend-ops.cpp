@@ -4486,16 +4486,22 @@ struct test_gated_delta_net : public test_case {
     // sigmoid into its GDN kernel; without a case that builds the pattern, such a fold
     // is never exercised and the suite passes on code it never reaches.
     const bool    beta_sigmoid;
+    // Build the state as GET_ROWS(cache, row_index), which is how build_rs() actually
+    // feeds it. A backend may fold that gather into the kernel; with a plain state tensor
+    // the folded path is never built and so never tested.
+    const int64_t state_rows;   // 0 = plain state tensor; >0 = gather from a cache of this many rows
 
     std::string vars() override {
-        return VARS_TO_STR10(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, beta_sigmoid);
+        return VARS_TO_STR11(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, beta_sigmoid, state_rows);
     }
 
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
-            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, bool beta_sigmoid = false)
+            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, bool beta_sigmoid = false,
+            int64_t state_rows = 0)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), beta_sigmoid(beta_sigmoid) {}
+          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), beta_sigmoid(beta_sigmoid),
+          state_rows(state_rows) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q;
@@ -4517,10 +4523,22 @@ struct test_gated_delta_net : public test_case {
         const int64_t g_ne0 = kda ? head_size : 1;
         ggml_tensor * g     = ggml_new_tensor_4d(ctx, type, g_ne0, head_count * v_repeat, n_seq_tokens, n_seqs);
         ggml_tensor * beta  = ggml_new_tensor_4d(ctx, type, 1, head_count * v_repeat, n_seq_tokens, n_seqs);
-        ggml_tensor * state = ggml_new_tensor_4d(ctx, type, head_size, head_size, head_count * v_repeat, n_seqs);
+        ggml_tensor * state;
+        if (state_rows > 0) {
+            // state = GET_ROWS(cache, idx), reshaped -- build_rs()'s exact shape
+            const int64_t row = head_size * head_size * head_count * v_repeat;
+            ggml_tensor * cache = ggml_new_tensor_2d(ctx, type, row, state_rows);
+            ggml_set_name(cache, "state_cache");
+            ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+            ggml_set_name(idx, "state_idx");
+            state = ggml_reshape_4d(ctx, ggml_get_rows(ctx, cache, idx),
+                                    head_size, head_size, head_count * v_repeat, n_seqs);
+        } else {
+            state = ggml_new_tensor_4d(ctx, type, head_size, head_size, head_count * v_repeat, n_seqs);
+            ggml_set_name(state, "state");
+        }
         ggml_set_name(g,     "g");
         ggml_set_name(beta,  "beta");
-        ggml_set_name(state, "state");
         // q/k are L2-normalised in qwen35/kimi-linear before delta_net
         q = ggml_l2_norm(ctx, q, 1e-6f);
         k = ggml_l2_norm(ctx, k, 1e-6f);
@@ -4534,7 +4552,15 @@ struct test_gated_delta_net : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
-            if (strcmp(t->name, "g") == 0) {
+            if (strcmp(t->name, "state_idx") == 0) {
+                // valid rows only, and deliberately NOT the identity mapping: a fold that
+                // ignored the index and read row `seq` would pass an identity test.
+                std::vector<int32_t> v(n_seqs);
+                for (int64_t s = 0; s < n_seqs; s++) {
+                    v[s] = (int32_t) ((state_rows - 1) - (s % state_rows));
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "g") == 0) {
                 init_tensor_uniform(t, -20.0f, -1e-4f);
             } else if (strcmp(t->name, "beta") == 0) {
                 // post-sigmoid beta must still span (0,1); raw uniform(0,1) would only
@@ -10265,6 +10291,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // overflow: n_tokens > K — only the last K snapshots kept.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+
+    // state arriving as GET_ROWS(cache, idx), which is how build_rs() feeds it. A backend
+    // that folds the gather into its GDN kernel has no coverage without these. The index
+    // is non-identity (see initialize_tensors), so a fold that ignores it fails. The last
+    // two carry the production geometry, with and without the beta fold, since the two
+    // folds share a dispatch path and could interact.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1, 1, 1, false, false, /*K=*/1, /*beta_sigmoid=*/false, /*state_rows=*/4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1, 2, 1, false, false, /*K=*/1, /*beta_sigmoid=*/false, /*state_rows=*/5));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, false, false, /*K=*/4, /*beta_sigmoid=*/false, /*state_rows=*/3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, false, /*K=*/1, /*beta_sigmoid=*/false, /*state_rows=*/2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, false, /*K=*/1, /*beta_sigmoid=*/true,  /*state_rows=*/2));
 
     // beta fed by a SIGMOID, which is how qwen35/kimi-linear actually build it. A backend
     // that folds that sigmoid into its GDN kernel has no coverage without these: the eight

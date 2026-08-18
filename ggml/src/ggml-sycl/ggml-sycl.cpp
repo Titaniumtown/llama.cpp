@@ -6142,6 +6142,93 @@ static ggml_tensor * find_gdn_beta_sigmoid(const ggml_cgraph * cgraph, int i) {
     return nullptr;
 }
 
+// A gated-delta-net's recurrent state reaches it as GET_ROWS(state_cache, row_index):
+// build_rs() gathers the sequence's row out of the cache into a fresh tensor, and the GDN
+// reads that. With one sequence the gather is a 3 MB copy of the cache into a temp so the
+// kernel can read the temp -- 48 per graph here, ~12 us each, ~1% of all GPU time.
+//
+// The kernel can select the row itself. That is not a new capability: it already writes
+// its result straight into the cache (find_gdn_state_writeback), so this only makes the
+// read side agree with the write side.
+//
+// Returns the consuming GDN, or nullptr. Unlike the beta fold, the GDN is NOT the next
+// executed node -- build_rs() calls ggml_build_forward_expand() on the gather at its own
+// call site, so several dispatches sit between them. Adjacency therefore cannot be the
+// guard, and the real hazard is explicit: deferring the read to the GDN is only sound if
+// nothing WRITES the cache in between. Reads in between are irrelevant; the cache is not
+// being modified, only read later than it used to be.
+static ggml_tensor * find_gdn_state_gather(const ggml_cgraph * cgraph, int i) {
+    ggml_tensor * g = cgraph->nodes[i];
+    if (g->op != GGML_OP_GET_ROWS || g->type != GGML_TYPE_F32) {
+        return nullptr;
+    }
+    if (g->src[0] == nullptr || g->src[1] == nullptr) {
+        return nullptr;
+    }
+    if (g->src[0]->type != GGML_TYPE_F32 || g->src[1]->type != GGML_TYPE_I32) {
+        return nullptr;
+    }
+    // the kernel indexes the cache as row_index * nb[1], so the cache must be a plain
+    // contiguous [row_size, n_rows] matrix and the gathered copy must be contiguous too
+    if (!ggml_is_contiguous(g->src[0]) || !ggml_is_contiguous(g)) {
+        return nullptr;
+    }
+    if (g->src[0]->ne[2] != 1 || g->src[0]->ne[3] != 1) {
+        return nullptr;
+    }
+    // dropping the materialised copy must be unobservable, so it may have one consumer
+    if (ggml_node_get_use_count(cgraph, i) != 1) {
+        return nullptr;
+    }
+
+    // The state reaches the GDN through a reshape, which is a view of the gather. Only the
+    // first GDN after it can be the consumer -- a later one reads some other state.
+    ggml_tensor * gdn     = nullptr;
+    int           gdn_idx = -1;
+    for (int j = i + 1; j < cgraph->n_nodes; j++) {
+        ggml_tensor * n = cgraph->nodes[j];
+        if (n->op != GGML_OP_GATED_DELTA_NET) {
+            continue;
+        }
+        const ggml_tensor * st = n->src[5];
+        if (st == g || (st != nullptr && st->view_src == g)) {
+            gdn     = n;
+            gdn_idx = j;
+        }
+        break;
+    }
+    if (gdn == nullptr) {
+        return nullptr;
+    }
+
+    const char * cache_beg = (const char *) g->src[0]->data;
+    const size_t cache_len = ggml_nbytes(g->src[0]);
+    auto hits_cache = [&](const ggml_tensor * t) {
+        if (t == nullptr || t->data == nullptr) {
+            return false;
+        }
+        const char * tb = (const char *) t->data;
+        return tb < cache_beg + cache_len && cache_beg < tb + ggml_nbytes(t);
+    };
+    for (int j = i + 1; j < gdn_idx; j++) {
+        ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_is_empty(n) || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_TRANSPOSE ||
+            n->op == GGML_OP_VIEW || n->op == GGML_OP_PERMUTE || n->op == GGML_OP_NONE ||
+            (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;  // not a launch, writes nothing
+        }
+        // a node writes its own tensor; CPY and SET_ROWS write through src[1] instead.
+        // In-place ops alias src[0] into the node itself, so checking the node covers them.
+        if (hits_cache(n)) {
+            return nullptr;
+        }
+        if ((n->op == GGML_OP_CPY || n->op == GGML_OP_SET_ROWS) && hits_cache(n->src[1])) {
+            return nullptr;
+        }
+    }
+    return gdn;
+}
+
 // Device-side per-op profiler, enabled with GGML_SYCL_PROF=1.
 //
 // A host-side timer around each op has to synchronise per node, which inflates the
@@ -6461,6 +6548,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     sycl_ctx->cur_graph = cgraph;
     // set when a SIGMOID was skipped because this GDN will apply it at its beta load
     ggml_tensor * gdn_fold_beta = nullptr;
+    // set when a GET_ROWS was skipped because this GDN will select the cache row itself;
+    // gdn_gather_node is the gather it replaces, which carries the cache and the indices
+    ggml_tensor * gdn_fold_gather = nullptr;
+    ggml_tensor * gdn_gather_node = nullptr;
     ggml_sycl_op_prof prof;
     prof.begin(sycl_ctx->stream());
 
@@ -6496,24 +6587,35 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 continue;
             }
         }
+        if (node->op == GGML_OP_GET_ROWS && g_ggml_sycl_enable_fusion) {
+            if (ggml_tensor * gdn = find_gdn_state_gather(cgraph, i)) {
+                // No dispatch: the GDN below reads the cache row this would have copied.
+                gdn_fold_gather = gdn;
+                gdn_gather_node = node;
+                continue;
+            }
+        }
         if (node->op == GGML_OP_GATED_DELTA_NET && g_ggml_sycl_enable_fusion) {
-            // A skipped SIGMOID means src[4] is never written, so the flag MUST reach the
-            // kernel on every path leaving this block -- otherwise the GDN reads an
-            // unwritten buffer and the failure is silent garbage, not a crash. Both
-            // dispatch paths below take it, and the fall-through case cannot be reached
-            // with the flag set.
-            const bool fold_beta = (node == gdn_fold_beta);
-            gdn_fold_beta = nullptr;
+            // A skipped SIGMOID means src[4] is never written, and a skipped GET_ROWS means
+            // src[5] is never written, so BOTH flags MUST reach the kernel on every path
+            // leaving this block -- otherwise the GDN reads an unwritten buffer and the
+            // failure is silent garbage, not a crash. Every dispatch path below takes them,
+            // and the fall-through cannot be reached with either set.
+            const bool          fold_beta = (node == gdn_fold_beta);
+            const ggml_tensor * gather    = (node == gdn_fold_gather) ? gdn_gather_node : nullptr;
+            gdn_fold_beta   = nullptr;
+            gdn_fold_gather = nullptr;
+            gdn_gather_node = nullptr;
             ggml_sycl_gated_delta_net_fused_cache fused_state_cpy;
             const int gdn_nodes_to_skip = ggml_sycl_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
             if (gdn_nodes_to_skip > 0) {
-                ggml_sycl_op_gated_delta_net_fused_cache(*sycl_ctx, node, fused_state_cpy, fold_beta);
+                ggml_sycl_op_gated_delta_net_fused_cache(*sycl_ctx, node, fused_state_cpy, fold_beta, gather);
                 prof.mark(node);
                 i += gdn_nodes_to_skip;
                 continue;
             }
-            if (fold_beta) {
-                ggml_sycl_gated_delta_net(*sycl_ctx, node, /*beta_sigmoid=*/true);
+            if (fold_beta || gather != nullptr) {
+                ggml_sycl_gated_delta_net(*sycl_ctx, node, fold_beta, gather);
                 prof.mark(node);
                 continue;
             }

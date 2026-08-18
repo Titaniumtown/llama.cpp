@@ -4540,6 +4540,13 @@ static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * 
            src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 }
 
+// Read once, not per dispatch: this sits in the mul_mat hot path. 0 disables the short-row
+// f32 kernels and restores the GEMM-library fallback for A/B.
+static inline bool ggml_sycl_f32mm_enabled() {
+    static const int m = ggml_sycl_get_env("GGML_SYCL_F32MM", 2);
+    return m != 0;
+}
+
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
     const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
@@ -4628,11 +4635,18 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_q);
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
                dst->type == GGML_TYPE_F32 &&
-               src1->ne[1] >= 1 && src1->ne[1] <= 8 && src0->ne[0] % 4 == 0 &&
+               src1->ne[1] >= 1 &&
+               src1->ne[1] <= ((src0->ne[0] < 4096 && ggml_sycl_f32mm_enabled()) ? 256 : 8) &&
+               src0->ne[0] % 4 == 0 &&
                ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
         // f32 mat-vec. The generic path below runs these through a GEMM library, which
         // for a tall-thin f32 src0 costs far more in setup than the weight read itself.
         // Capped at 8 columns: past that a real blocked GEMM wins again.
+        //
+        // ...except when src0 is short, where the whole product is smaller than the GEMM
+        // library's setup cost. Those get a dedicated kernel and a 256-column cap. The cap
+        // still matters: these same nodes reach ne[1] == 24*n_tokens and 96*n_tokens, so at
+        // prefill ubatch sizes they are real GEMMs and must keep falling through.
         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_f32);
     } else {
         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl);

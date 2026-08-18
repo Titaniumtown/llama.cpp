@@ -2561,92 +2561,93 @@ static void mul_mat_vec_q5_K_reorder_wide_ncols(const void * __restrict__ vx, co
         return;
     }
 
-    // Local lane width, deliberately NOT block_traits::vdr_mmvq. vdr=4 gives each
-    // lane two consecutive int-pairs, halving the per-lane fixed cost (5-bit decode
-    // hoist, scale unpack, per-column ds converts) per weight byte -- measured
-    // -10.3%/-5.3% us/call on ffn_down/ffn_up at the production verify width. The
-    // batch-1 functor path measured -1.2% from the same widening (a 4-deep dp4a
-    // chain with no second column to overlap it), so the trait stays at 2 and only
-    // this multi-column kernel, where the columns hide the chain, takes the width.
-    constexpr int vdr_wide = 4;
+    // Same lane geometry as the q4_K wide kernel above: lane c (0..7) owns one
+    // contiguous sycl::int4 (16 low-nibble bytes) of a 128-byte block -- scale
+    // group g = c/2, byte-half `half` = c&1 -- plus one int4 of the 32-byte qh
+    // plane at byte 16*half. That replaces the vdr=4 scalar form's 8 int weight
+    // loads with 2 int4 loads and its 8 per-column q8 int loads with 2 int4
+    // loads, and the 5-bit decode is still hoisted out of the column loop.
+    // The geometry is self-contained (block_traits is used only for ::qk); the
+    // trait's vdr_mmvq stays 2 for the batch-1 generic-template path, where the
+    // same widening measured -1.2% (a deeper dp4a chain with no second column
+    // to overlap it). Block partition matches the vdr=4 form it replaces:
+    // WARP_SIZE/8 blocks per wave, lane/8 selects the block.
+    const int lane            = sg.get_local_linear_id();
+    const int blocks_per_wave = WARP_SIZE / 8;
+    const int lb              = lane / 8;
+    const int c               = lane % 8;
+    const int g               = c >> 1;
+    const int half            = c & 1;
+    const int uoff            = half ? 4 : 0;
 
-    const int     blocks_per_row              = ncols / block_traits::qk;
-    constexpr int blocks_per_subgroup         = ceil_div(vdr_wide * WARP_SIZE, block_traits::qi);
-    constexpr int block_elements_per_subgroup = block_traits::qi / vdr_wide;
-    const int     nblocks                     = nrows * (ncols / block_traits::qk);
+    const int blocks_per_row = ncols / block_traits::qk;
+    const int nblocks        = nrows * blocks_per_row;
 
     const uint8_t * vbq = static_cast<const uint8_t *>(vx);
 
     float partial[ncols_dst] = { 0.0f };
-    for (int i = sg.get_local_linear_id() / block_elements_per_subgroup; i < blocks_per_row;
-         i += blocks_per_subgroup) {
-        const int  ibx       = row * blocks_per_row + i;
+    for (int blk = lb; blk < blocks_per_row; blk += blocks_per_wave) {
+        const int  ibx       = row * blocks_per_row + blk;
         const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
         const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
-        const int  iby       = i * block_type::block_to_q8_1_ratio();
+        const int  iby       = blk * block_type::block_to_q8_1_ratio();
 
+        const uint8_t *     qs      = vbq + bx_offset.first;
+        const uint8_t *     qh_base = vbq + bx_offset.second;
+        const uint16_t *    scales  = reinterpret_cast<const uint16_t *>(vbq + d_offset.first);
+        const sycl::half2 * dms     = reinterpret_cast<const sycl::half2 *>(vbq + d_offset.second);
+
+        // ---- weight load + 5-bit decode: hoisted once, reused across columns ----
+        const sycl::int4 vq  = *(reinterpret_cast<const sycl::int4 *>(qs) + c);
+        const sycl::int4 qh4 = *(reinterpret_cast<const sycl::int4 *>(qh_base) + half);
+
+        uint16_t  aux[2];
+        const int jsc = g;
+        if (jsc < 2) {
+            aux[0] = scales[jsc + 0] & 0x3f3f;
+            aux[1] = scales[jsc + 2] & 0x3f3f;
+        } else {
+            aux[0] = ((scales[jsc + 2] >> 0) & 0x0f0f) | ((scales[jsc - 2] & 0xc0c0) >> 2);
+            aux[1] = ((scales[jsc + 2] >> 4) & 0x0f0f) | ((scales[jsc - 0] & 0xc0c0) >> 2);
+        }
+        const uint8_t *    sc   = reinterpret_cast<const uint8_t *>(aux);
+        const uint8_t *    m    = sc + 2;
+        const sycl::float2 dm5f = (*dms).convert<float, sycl::rounding_mode::automatic>();
+
+        // 5-bit values for the two sub-blocks of group g: low nibbles carry sub
+        // 2g, high nibbles sub 2g+1, and qh bit (2g+i) of each byte supplies the
+        // fifth bit for position = byte index. qh4 covers exactly this lane's 16
+        // positions (bytes 16*half..+15), so vq[p] and qh4[p] are position-matched.
+        int v_lo[4], v_hi[4];
 #pragma unroll
-        for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
-            const int iqs = elem + vdr_wide * (sg.get_local_linear_id() % block_elements_per_subgroup);
+        for (int p = 0; p < 4; ++p) {
+            v_lo[p] = ((vq[p] >> 0) & 0x0F0F0F0F) | (((qh4[p] >> (2 * g + 0)) << 4) & 0x10101010);
+            v_hi[p] = ((vq[p] >> 4) & 0x0F0F0F0F) | (((qh4[p] >> (2 * g + 1)) << 4) & 0x10101010);
+        }
 
-            // ---- weight load + 5-bit decode: hoisted once, reused across columns ----
-            // vdr_wide = 4: the lane owns two consecutive int-pairs (ql [0],[1] and
-            // [4],[5]) of one 32-quant sub-block pair, so this hoisted decode and the
-            // per-column ds converts amortize over twice the weight bytes. add_min
-            // still fires on exactly one of the two lanes that share the pair.
-            const uint8_t *     qs         = vbq + bx_offset.first;
-            const uint8_t *     qh_base    = vbq + bx_offset.second;
-            const uint16_t *    scales     = reinterpret_cast<const uint16_t *>(vbq + d_offset.first);
-            const sycl::half2 * dms        = reinterpret_cast<const sycl::half2 *>(vbq + d_offset.second);
-            const int           bq8_offset = QR5_K * ((iqs / 2) / (QI8_1 / 2));
-            const int *         ql_ptr     = reinterpret_cast<const int *>(qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
-            const int *         qh_ptr     = reinterpret_cast<const int *>(qh_base + 4 * ((iqs / 2) % 4));
-            const int           vl0 = ql_ptr[0], vl1 = ql_ptr[1], vl2 = ql_ptr[4], vl3 = ql_ptr[5];
-            const int           vh0 = qh_ptr[0] >> bq8_offset, vh1 = qh_ptr[1] >> bq8_offset;
-            const int           vh2 = qh_ptr[4] >> bq8_offset, vh3 = qh_ptr[5] >> bq8_offset;
-            uint16_t            aux[2];
-            const int           jsc = bq8_offset / 2;
-            if (jsc < 2) {
-                aux[0] = scales[jsc + 0] & 0x3f3f;
-                aux[1] = scales[jsc + 2] & 0x3f3f;
-            } else {
-                aux[0] = ((scales[jsc + 2] >> 0) & 0x0f0f) | ((scales[jsc - 2] & 0xc0c0) >> 2);
-                aux[1] = ((scales[jsc + 2] >> 4) & 0x0f0f) | ((scales[jsc - 0] & 0xc0c0) >> 2);
+        const int gq8 = iby + 2 * g;
+
+        // ---- per-column dot (activation-dependent) ----
+#pragma unroll
+        for (int col = 0; col < ncols_dst; ++col) {
+            const char *        vy_j = static_cast<const char *>(vy) + col * stride_col_y_bytes;
+            const int8_t *      vy8  = reinterpret_cast<const int8_t *>(vy_j);
+            const sycl::half2 * vyds = reinterpret_cast<const sycl::half2 *>(vy_j + ncols);
+            const sycl::float2  ds0  = vyds[gq8 + 0].convert<float, sycl::rounding_mode::automatic>();
+            const sycl::float2  ds1  = vyds[gq8 + 1].convert<float, sycl::rounding_mode::automatic>();
+            const sycl::int4    u0   = *reinterpret_cast<const sycl::int4 *>(reinterpret_cast<const int *>(vy8 + (gq8 + 0) * QK8_1) + uoff);
+            const sycl::int4    u1   = *reinterpret_cast<const sycl::int4 *>(reinterpret_cast<const int *>(vy8 + (gq8 + 1) * QK8_1) + uoff);
+
+            int dot0 = 0;
+            int dot1 = 0;
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                dot0 = dpct::dp4a(v_lo[p], u0[p], dot0);
+                dot1 = dpct::dp4a(v_hi[p], u1[p], dot1);
             }
-            const uint8_t *    sc      = reinterpret_cast<const uint8_t *>(aux);
-            const uint8_t *    m       = sc + 2;
-            const sycl::float2 dm5f    = (*dms).convert<float, sycl::rounding_mode::automatic>();
-            const bool         add_min = ((iqs / 2) % (QI8_1 / 2)) == 0;
-            const int          qoff    = (iqs / 2) % 4;
-
-            int v0[QR5_K], v1[QR5_K], v2[QR5_K], v3[QR5_K];
-#pragma unroll
-            for (int ii = 0; ii < QR5_K; ++ii) {
-                v0[ii] = ((vl0 >> (4 * ii)) & 0x0F0F0F0F) | (((vh0 >> ii) << 4) & 0x10101010);
-                v1[ii] = ((vl1 >> (4 * ii)) & 0x0F0F0F0F) | (((vh1 >> ii) << 4) & 0x10101010);
-                v2[ii] = ((vl2 >> (4 * ii)) & 0x0F0F0F0F) | (((vh2 >> ii) << 4) & 0x10101010);
-                v3[ii] = ((vl3 >> (4 * ii)) & 0x0F0F0F0F) | (((vh3 >> ii) << 4) & 0x10101010);
-            }
-
-            // ---- per-column dot (activation-dependent) ----
-#pragma unroll
-            for (int col = 0; col < ncols_dst; ++col) {
-                const char *        vy_j = static_cast<const char *>(vy) + col * stride_col_y_bytes;
-                const int8_t *      q8p  = reinterpret_cast<const int8_t *>(vy_j) + iby * QK8_1;
-                const sycl::half2 * q8ds = reinterpret_cast<const sycl::half2 *>(vy_j + ncols + iby * sizeof(sycl::half2));
-                float sumf_d = 0.0f;
-                float sumf_m = 0.0f;
-#pragma unroll
-                for (int ii = 0; ii < QR5_K; ++ii) {
-                    const sycl::float2 dsv = (*(q8ds + bq8_offset + ii)).convert<float, sycl::rounding_mode::automatic>();
-                    const int *       q8   = reinterpret_cast<const int *>(q8p + (bq8_offset + ii) * QK8_1) + qoff;
-                    int dot1 = dpct::dp4a(v0[ii], q8[0], dpct::dp4a(v2[ii], q8[4], 0));
-                    dot1     = dpct::dp4a(v1[ii], q8[1], dpct::dp4a(v3[ii], q8[5], dot1));
-                    sumf_d += dsv[0] * (dot1 * sc[ii]);
-                    sumf_m += add_min ? (dsv[1] * m[ii]) : 0.0f;
-                }
-                partial[col] += dm5f.x() * sumf_d - dm5f.y() * sumf_m;
-            }
+            const float sumf_d = ds0.x() * (float) (dot0 * sc[0]) + ds1.x() * (float) (dot1 * sc[1]);
+            const float sumf_m = (half == 0) ? (ds0.y() * m[0] + ds1.y() * m[1]) : 0.0f;
+            partial[col] += dm5f.x() * sumf_d - dm5f.y() * sumf_m;
         }
     }
 

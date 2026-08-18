@@ -5773,6 +5773,36 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
 }
 #endif
 
+#ifdef GGML_SYCL_GRAPH
+// Signature over the parts of a cgraph baked into a recorded SYCL command graph: node
+// op/type/flags/shape/strides/op_params and every tensor data pointer. Buffer *contents*
+// are deliberately excluded -- a replay re-runs the recorded kernels over whatever the
+// (identically located) buffers hold at execution time, so per-token inputs (positions,
+// token ids, freshly written KV) are picked up without re-recording. Any change to
+// structure, allocation, shape, stride or a scalar op-param flips the signature and
+// forces a fresh record, so replay is correct by construction.
+static uint64_t ggml_sycl_graph_signature(const ggml_cgraph * cgraph) {
+    uint64_t h = 14695981039346656037ULL;  // FNV-1a offset basis
+    auto mix = [&h](uint64_t v) { h = (h ^ v) * 1099511628211ULL; };
+    mix((uint64_t) cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        mix((uint64_t) n->op);
+        mix((uint64_t) n->type);
+        mix((uint64_t) n->flags);
+        for (int d = 0; d < GGML_MAX_DIMS; d++) { mix((uint64_t) n->ne[d]); mix((uint64_t) n->nb[d]); }
+        for (size_t p = 0; p < GGML_MAX_OP_PARAMS / sizeof(int32_t); p++) { mix((uint64_t) (uint32_t) n->op_params[p]); }
+        mix((uint64_t) (uintptr_t) n->data);
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            const ggml_tensor * src = n->src[s];
+            mix(src ? (uint64_t) (uintptr_t) src->data : 0ULL);
+            if (src) { for (int d = 0; d < GGML_MAX_DIMS; d++) { mix((uint64_t) src->ne[d]); mix((uint64_t) src->nb[d]); } }
+        }
+    }
+    return h;
+}
+#endif
+
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
 
@@ -5789,29 +5819,25 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
             return GGML_STATUS_SUCCESS;
         }
 
-        sycl_ex::command_graph model_sycl_graph(*(sycl_ctx->stream()), {sycl_ex::property::graph::assume_buffer_outlives_graph{}});
+        // Record-once / replay: steady-state decode reuses an identical graph topology
+        // every token (only buffer contents change), so replay the recorded graph and
+        // skip the per-node re-record walk -- the dominant CPU cost when submission-bound.
+        const uint64_t sig = ggml_sycl_graph_signature(cgraph);
+        if (sycl_ctx->exec_graph && sig == sycl_ctx->exec_graph_sig) {
+            GGML_SYCL_DEBUG("[SYCL-GRAPH] replay (skip re-record)\n");
+            sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->exec_graph));
+            return GGML_STATUS_SUCCESS;
+        }
 
+        sycl_ex::command_graph model_sycl_graph(*(sycl_ctx->stream()), {sycl_ex::property::graph::assume_buffer_outlives_graph{}});
         model_sycl_graph.begin_recording(*(sycl_ctx->stream()));
         ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
         model_sycl_graph.end_recording();
 
-        const bool graph_update_support = dpct::get_device(sycl_ctx->device).has(sycl::aspect::ext_oneapi_graph);
-        if (!sycl_ctx->exec_graph || !graph_update_support) {
-            auto exec_graph = graph_update_support ? model_sycl_graph.finalize(sycl_ex::property::graph::updatable{}) :
-                                                     model_sycl_graph.finalize();
-            sycl_ctx->exec_graph = std::make_unique<
-                sycl_ex::command_graph<sycl_ex::graph_state::executable>>(exec_graph);
-        } else {
-            try {
-                sycl_ctx->exec_graph->update(model_sycl_graph);
-                GGML_SYCL_DEBUG("[SYCL-GRAPH] update success\n");
-            } catch (sycl::exception const & e) {
-                GGML_SYCL_DEBUG("[SYCL-GRAPH] Exception when updating graph, %s\n", e.what());
-                auto exec_graph = model_sycl_graph.finalize({sycl_ex::property::graph::updatable{}});
-                sycl_ctx->exec_graph = std::make_unique<
-                    sycl_ex::command_graph<sycl_ex::graph_state::executable>>(exec_graph);
-            }
-        }
+        sycl_ctx->exec_graph = std::make_unique<
+            sycl_ex::command_graph<sycl_ex::graph_state::executable>>(model_sycl_graph.finalize());
+        sycl_ctx->exec_graph_sig = sig;
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] record (topology changed)\n");
 
         sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->exec_graph));
     } else

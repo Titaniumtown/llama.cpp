@@ -2935,6 +2935,80 @@ struct test_set : public test_case {
     }
 };
 
+// GGML_OP_CPY x N: sibling copies of one source into N disjoint slots of one destination.
+//
+// This is the recurrent rollback-snapshot shape ([TAG_RECURRENT_ROLLBACK_SPLITS] in
+// delta-net-base.cpp): with speculative decoding, K = n_rs_seq + 1 sliding windows of the
+// conv input are written back into K cache slots, as K separate ggml_cpy. A backend may
+// merge those into one launch, and no single-op case can reach that path -- a batch needs
+// two adjacent CPY siblings in the same graph, which only a case like this builds.
+//
+// The copies are chained through views of each other's result so the graph keeps all of
+// them: ggml_cpy returns a view of its destination, so viewing that result makes the next
+// copy depend on the previous one and none get pruned. They still write disjoint slots,
+// so a backend running them concurrently must match the sequential reference exactly.
+struct test_cpy_siblings : public test_case {
+    const ggml_type type;
+    const int64_t   win;     // window width copied per sibling (d_conv - 1)
+    const int64_t   chans;   // channels
+    const int64_t   slots;   // number of siblings (K)
+    const int64_t   extra;   // source columns beyond the window, so windows can slide
+
+    // Without this the returned tensor is an ADD and the case files under "ADD", where
+    // `-o CPY` can never select it and it is invisible among hundreds of add cases.
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "CPY_SIBLINGS"; }
+
+    std::string vars() override { return VARS_TO_STR5(type, win, chans, slots, extra); }
+
+    test_cpy_siblings(ggml_type type = GGML_TYPE_F32, int64_t win = 3, int64_t chans = 64,
+                      int64_t slots = 4, int64_t extra = 4)
+        : type(type), win(win), chans(chans), slots(slots), extra(extra) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // Source width is derived, not taken on trust: the windows slide by one column per
+        // slot, so the source needs at least (slots - 1) columns beyond the window or the
+        // last window reads past the end. Taking `extra` at face value made two cases in the
+        // first version invalid -- one silently compared garbage, the other tripped
+        // ggml_view_2d's bounds assert and dumped core. Deriving it makes every (win, chans,
+        // slots, extra) combination legal by construction.
+        const int64_t span = std::max<int64_t>(extra, slots - 1);
+        ggml_tensor * src = ggml_new_tensor_2d(ctx, type, win + span, chans);
+        ggml_set_name(src, "src");
+        // destination: one row per slot, each holding a flattened win*chans block
+        ggml_tensor * dst = ggml_new_tensor_2d(ctx, type, win * chans, slots);
+        ggml_set_name(dst, "dst");
+
+        // Each copy's destination is a view of the previous copy's result, which is what
+        // makes them a dependency chain rather than K unreachable siblings the graph
+        // builder would prune. ggml_cpy returns a view of its destination, so the previous
+        // result sits at slot t-1 and advancing by +1 slot is a positive offset -- the only
+        // direction expressible, since view offsets are unsigned.
+        ggml_tensor * cur = nullptr;
+        for (int64_t t = 0; t < slots; ++t) {
+            // window offset runs opposite to slot index, exactly as the rollback code does
+            const int64_t off = slots - 1 - t;
+            ggml_tensor * s = ggml_view_2d(ctx, src, win, chans, src->nb[1], off * src->nb[0]);
+            ggml_tensor * d = (t == 0)
+                ? ggml_view_2d(ctx, dst, win * chans, 1, dst->nb[1], 0)
+                : ggml_view_2d(ctx, cur, win * chans, 1, dst->nb[1], dst->nb[1]);
+            cur = ggml_cpy(ctx, s, d);
+        }
+
+        // The comparison must cover every slot, but `cur` sits at the last one and a view
+        // cannot walk back to the base. So read the whole destination and tie it to the
+        // chain with a zero term.
+        //
+        // `all` must stay a bare view and not a cast/cont: a view performs no read, but any
+        // real op reading `dst` is emitted by the DFS *before* the chain (its operand is the
+        // leaf) and would therefore sample the destination before a single copy had run.
+        // As written, the ADD is the only node that reads `dst` and it is emitted last.
+        ggml_tensor * all  = ggml_view_2d(ctx, dst, win * chans, slots, dst->nb[1], 0);
+        ggml_tensor * out  = ggml_add(ctx, all, ggml_scale(ctx, cur, 0.0f));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_CPY
 struct test_cpy : public test_case {
     const ggml_type type_src;
@@ -9027,6 +9101,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             } while (cur != canonical);
         }
     }
+
+    // Adjacent CPY siblings: the recurrent rollback-snapshot shape. A backend that merges
+    // them into one launch has no coverage from the single-op cases above, because a batch
+    // needs two adjacent CPY nodes in one graph and each case there builds exactly one.
+    // slots=1 is the negative control (nothing to batch); 2 is the boundary where merging
+    // starts; 4 is the production K for --spec-draft-n-max 3; 9 deliberately exceeds a
+    // plausible batch cap so the tail must still be handled.
+    for (int64_t slots : { 1, 2, 3, 4, 5, 9 }) {
+        test_cases.emplace_back(new test_cpy_siblings(GGML_TYPE_F32, 3, 64, slots, 4));
+    }
+    // width/channel variation; the last two are the production conv-state geometry
+    // (win = d_conv - 1 = 3, chans = 10240) and a non-power-of-two channel count.
+    test_cases.emplace_back(new test_cpy_siblings(GGML_TYPE_F32, 1, 10240, 4, 4));
+    test_cases.emplace_back(new test_cpy_siblings(GGML_TYPE_F32, 3, 10240, 4, 4));
+    test_cases.emplace_back(new test_cpy_siblings(GGML_TYPE_F32, 7, 33,    4, 0));
 
     for (ggml_type type_dst : { GGML_TYPE_F32, GGML_TYPE_I32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
         for (bool use_view_slice : { true, false }) {

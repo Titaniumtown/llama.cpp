@@ -294,6 +294,63 @@ static void ggml_cpy_f32_f32_sycl(const char * cx, char * cdst, const int ne, co
     }
 }
 
+// Batched flat copy: `count` independent CPY ops that share one ne/nb pair, merged
+// into a single launch. The per-op index arithmetic below is cpy_f32_f16()'s verbatim --
+// only the base pointers vary, selected by the second grid dimension.
+//
+// This exists for the recurrent rollback snapshots ([TAG_RECURRENT_ROLLBACK_SPLITS] in
+// delta-net-base.cpp): with speculative decoding a conv state is written back once per
+// rollback slot, so a K=4 model emits 4 ggml_cpy of 122 KB each per layer, per graph. At
+// that size the copy is entirely launch-bound (~50 GB/s against a 2951 GB/s wall), so
+// four launches cost four times one launch and move no more data.
+struct cpy_batch_ptrs {
+    const char * src[GGML_SYCL_CPY_BATCH_MAX];
+    char *       dst[GGML_SYCL_CPY_BATCH_MAX];
+};
+
+template <cpy_kernel_t cpy_1>
+static void cpy_flt_batch(cpy_batch_ptrs p, const int ne, const int ne00, const int ne01, const int ne02,
+                          const int nb00, const int nb01, const int nb02, const int nb03, const int ne10,
+                          const int ne11, const int ne12, const int nb10, const int nb11, const int nb12,
+                          const int nb13, const sycl::nd_item<3> & item_ct1) {
+    const int i = item_ct1.get_local_range(2) * item_ct1.get_group(2) + item_ct1.get_local_id(2);
+
+    if (i >= ne) {
+        return;
+    }
+    const int t = item_ct1.get_group(1);
+
+    const int i03      = i / (ne00 * ne01 * ne02);
+    const int i02      = (i - i03 * ne00 * ne01 * ne02) / (ne00 * ne01);
+    const int i01      = (i - i03 * ne00 * ne01 * ne02 - i02 * ne01 * ne00) / ne00;
+    const int i00      = i - i03 * ne00 * ne01 * ne02 - i02 * ne01 * ne00 - i01 * ne00;
+    const int x_offset = i00 * nb00 + i01 * nb01 + i02 * nb02 + i03 * nb03;
+
+    const int i13        = i / (ne10 * ne11 * ne12);
+    const int i12        = (i - i13 * ne10 * ne11 * ne12) / (ne10 * ne11);
+    const int i11        = (i - i13 * ne10 * ne11 * ne12 - i12 * ne10 * ne11) / ne10;
+    const int i10        = i - i13 * ne10 * ne11 * ne12 - i12 * ne10 * ne11 - i11 * ne10;
+    const int dst_offset = i10 * nb10 + i11 * nb11 + i12 * nb12 + i13 * nb13;
+
+    cpy_1(p.src[t] + x_offset, p.dst[t] + dst_offset);
+}
+
+static void ggml_cpy_f32_f32_batch_sycl(cpy_batch_ptrs p, const int count, const int ne, const int ne00,
+                                        const int ne01, const int ne02, const int nb00, const int nb01,
+                                        const int nb02, const int nb03, const int ne10, const int ne11,
+                                        const int ne12, const int nb10, const int nb11, const int nb12,
+                                        const int nb13, queue_ptr stream) {
+    const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
+    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, count, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
+                          sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
+        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            cpy_flt_batch<cpy_1_f32_f32>(p, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10,
+                                         nb11, nb12, nb13, item_ct1);
+        });
+}
+
 static void ggml_cpy_f32_f16_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
                                   const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
                                   const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
@@ -1247,6 +1304,31 @@ static void ggml_cpy_bf16_f16_sycl(const char * cx, char * cdst, const int ne, c
         });
 }
 #endif
+
+// Merge `count` CPY ops into one launch. The caller guarantees every member shares the
+// same ne/nb on both sides, is f32->f32, and that no member reads what another writes --
+// see the scan in ggml_backend_sycl_graph_compute_impl(). Named distinctly so the fold is
+// countable in a GGML_SYCL_DEBUG dispatch census.
+void ggml_sycl_cpy_batch(ggml_backend_sycl_context & ctx, ggml_tensor ** nodes, int count) {
+    GGML_ASSERT(count >= 2 && count <= GGML_SYCL_CPY_BATCH_MAX);
+    const ggml_tensor * src0 = nodes[0]->src[0];
+    const ggml_tensor * src1 = nodes[0]->src[1];
+    scope_op_debug_print scope_dbg_print(__func__, src1, /*num_src=*/0, debug_get_tensor_str("\tsrc0", src0));
+
+    const int64_t ne = ggml_nelements(src0);
+    GGML_ASSERT(ne == ggml_nelements(src1));
+    GGML_TENSOR_BINARY_OP_LOCALS01;
+
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+
+    cpy_batch_ptrs p{};
+    for (int t = 0; t < count; ++t) {
+        p.src[t] = (const char *) nodes[t]->src[0]->data;
+        p.dst[t] = (char *) nodes[t]->src[1]->data;
+    }
+    ggml_cpy_f32_f32_batch_sycl(p, count, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10,
+                                nb11, nb12, nb13, ctx.stream());
+}
 
 void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1) try {
     // Unlike other operators ggml_sycl_cpy takes 2 distinct tensors instead of a dst ggml_tensor and rely on its src field

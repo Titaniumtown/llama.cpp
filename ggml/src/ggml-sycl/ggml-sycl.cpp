@@ -59,6 +59,7 @@
 #include "ggml-sycl/add-id.hpp"
 #include "ggml-sycl/backend.hpp"
 #include "ggml-sycl/common.hpp"
+#include "ggml-sycl/cpy.hpp"
 #include "ggml-sycl/element_wise.hpp"
 #include "ggml-sycl/fwht.hpp"
 #include "ggml-sycl/gemm.hpp"
@@ -6629,6 +6630,86 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
             if (count >= 2) {
                 ggml_sycl_l2_norm_batch(*sycl_ctx, batch, count);
+                prof.mark(node, cgraph, i, last - i + 1);
+                i = last;
+                continue;
+            }
+        }
+
+        // Batch consecutive independent same-shape f32 CPY siblings into one launch.
+        //
+        // What this is for: with speculative decoding a recurrent model writes its conv
+        // state back once per rollback slot ([TAG_RECURRENT_ROLLBACK_SPLITS] in
+        // delta-net-base.cpp emits K = n_rs_seq + 1 separate ggml_cpy per layer, sliding
+        // windows of one tensor into K cache slots). On this model that is 4 x 48 = 192
+        // dispatches per graph, 91% of every CPY in the profile, at 122 KB each --
+        // ~50 GB/s against a 2951 GB/s wall, i.e. entirely launch cost. Note the
+        // asymmetry this removes: the *ssm* state's K snapshots are already written by
+        // one GDN kernel launch (that is what its K parameter is for); only the conv
+        // side paid K launches.
+        //
+        // A single ggml_cpy of 3-D views cannot express it upstream: slot index and
+        // source-window offset run in opposite directions, so one side would need a
+        // negative stride, which size_t nb cannot hold. Merging at dispatch can.
+        if (node->op == GGML_OP_CPY && g_ggml_sycl_enable_fusion && ggml_sycl_info().device_count == 1 &&
+            node->src[0] != nullptr && node->src[1] != nullptr &&
+            node->src[0]->type == GGML_TYPE_F32 && node->src[1]->type == GGML_TYPE_F32 &&
+            // leave the memcpy fast path alone: same type + both contiguous never reaches
+            // the kernel this batches
+            !(ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node->src[1]))) {
+            ggml_tensor * batch[GGML_SYCL_CPY_BATCH_MAX];
+            int           count = 0;
+            int           last  = i;
+
+            // The merged copies run concurrently, so the sequential order the graph asked
+            // for is only reproducible if none of them interact: no write may land on
+            // another's write, and no write may land on another's read. Overlapping
+            // *reads* are fine and are exactly what the rollback windows do.
+            auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+                const char * ab = (const char *) a->data;
+                const char * bb = (const char *) b->data;
+                return ab < bb + ggml_nbytes(b) && bb < ab + ggml_nbytes(a);
+            };
+
+            for (int j = i; j < cgraph->n_nodes && count < GGML_SYCL_CPY_BATCH_MAX; ++j) {
+                ggml_tensor * nj = cgraph->nodes[j];
+                if (ggml_is_empty(nj) || nj->op == GGML_OP_RESHAPE || nj->op == GGML_OP_TRANSPOSE ||
+                    nj->op == GGML_OP_VIEW || nj->op == GGML_OP_PERMUTE || nj->op == GGML_OP_NONE ||
+                    (nj->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;  // not a launch; cannot break a run of adjacent copies
+                }
+                if (nj->op != GGML_OP_CPY || nj->src[0] == nullptr || nj->src[1] == nullptr ||
+                    nj->src[0]->type != GGML_TYPE_F32 || nj->src[1]->type != GGML_TYPE_F32 ||
+                    !ggml_are_same_shape(nj->src[0], node->src[0]) ||
+                    !ggml_are_same_shape(nj->src[1], node->src[1])) {
+                    break;
+                }
+                bool same_nb = true;  // one stride set is shared by the whole batch
+                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                    if (nj->src[0]->nb[d] != node->src[0]->nb[d] || nj->src[1]->nb[d] != node->src[1]->nb[d]) {
+                        same_nb = false;
+                        break;
+                    }
+                }
+                if (!same_nb) {
+                    break;
+                }
+                bool indep = true;
+                for (int k = 0; k < count; ++k) {
+                    if (overlaps(nj->src[1], batch[k]->src[1]) || overlaps(nj->src[1], batch[k]->src[0]) ||
+                        overlaps(nj->src[0], batch[k]->src[1])) {
+                        indep = false;
+                        break;
+                    }
+                }
+                if (!indep) {
+                    break;
+                }
+                batch[count++] = nj;
+                last           = j;
+            }
+            if (count >= 2) {
+                ggml_sycl_cpy_batch(*sycl_ctx, batch, count);
                 prof.mark(node, cgraph, i, last - i + 1);
                 i = last;
                 continue;

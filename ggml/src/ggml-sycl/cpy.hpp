@@ -532,6 +532,12 @@ inline void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
 }
 
 void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1);
+
+// Max CPY ops merged into one launch. 8 covers the recurrent rollback case (K = n_rs_seq+1,
+// realistically <= 5) with headroom; the array is captured by value into the kernel, so this
+// is also the cap on that capture.
+#define GGML_SYCL_CPY_BATCH_MAX 8
+void ggml_sycl_cpy_batch(ggml_backend_sycl_context & ctx, ggml_tensor ** nodes, int count);
 void ggml_sycl_dup(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
 #endif  // GGML_SYCL_CPY_HPP

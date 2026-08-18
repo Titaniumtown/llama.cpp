@@ -5,7 +5,12 @@
 
 using namespace sycl;
 
-static void kernel_ssm_conv(
+// DC is d_conv as a compile-time constant, or 0 to keep the runtime loop. The window
+// loop reads DC *contiguous* floats per lane, which is one wide load -- but only if the
+// trip count is known, and d_conv arrives as a runtime argument. Every model that reaches
+// this kernel so far uses 4.
+template <int DC>
+static void kernel_ssm_conv_impl(
     queue &q,
     const float *src_data,
     const float *weights,
@@ -53,8 +58,15 @@ static void kernel_ssm_conv(
                 const float *c = weights + static_cast<size_t>(channel) * static_cast<size_t>(d_conv);
 
                 float sumf = 0.0f;
-                for (int i0 = 0; i0 < d_conv; ++i0) {
-                    sumf += s[i0] * c[i0];
+                if constexpr (DC > 0) {
+#pragma unroll
+                    for (int i0 = 0; i0 < DC; ++i0) {
+                        sumf += s[i0] * c[i0];
+                    }
+                } else {
+                    for (int i0 = 0; i0 < d_conv; ++i0) {
+                        sumf += s[i0] * c[i0];
+                    }
                 }
 
                 const size_t dst_idx =
@@ -67,6 +79,36 @@ static void kernel_ssm_conv(
             }
         );
     });
+}
+
+// GGML_SYCL_SSM_CONV_UNROLL=0 keeps the runtime-trip-count loop, for A/B.
+static void kernel_ssm_conv(
+    queue &q,
+    const float *src_data,
+    const float *weights,
+    float *dst_data,
+    int d_conv,
+    int d_inner,
+    int n_t,
+    int n_s,
+    int ncs,
+    int src_stride_inner,
+    int src_stride_seq,
+    int dst_stride_token,
+    int dst_stride_seq,
+    bool apply_silu
+) {
+    static const bool unroll = ggml_sycl_get_env("GGML_SYCL_SSM_CONV_UNROLL", 1) != 0;
+
+    if (unroll && d_conv == 4) {
+        kernel_ssm_conv_impl<4>(q, src_data, weights, dst_data, d_conv, d_inner, n_t, n_s, ncs,
+                                src_stride_inner, src_stride_seq, dst_stride_token, dst_stride_seq,
+                                apply_silu);
+        return;
+    }
+    kernel_ssm_conv_impl<0>(q, src_data, weights, dst_data, d_conv, d_inner, n_t, n_s, ncs,
+                            src_stride_inner, src_stride_seq, dst_stride_token, dst_stride_seq,
+                            apply_silu);
 }
 
 inline void ggml_sycl_op_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor * dst, ggml_tensor * silu_dst = nullptr) {

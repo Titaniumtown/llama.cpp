@@ -1,4 +1,5 @@
 #include "ssm_conv.hpp"
+#include <algorithm>
 #include <vector>
 #include <cstdlib>
 #include "common.hpp"
@@ -188,6 +189,81 @@ bool ggml_sycl_ssm_conv_prefers_tiled(int d_conv, int d_inner, int n_t) {
     return map_mode == 2 && d_conv == 4 && n_t >= 32 && (d_inner % 32) == 0;
 }
 
+// Collapsed causal-conv at a decode width of one token. The CONCAT that materialises
+// [state | x] and the CPY that writes the next state both disappear: this kernel reads the
+// cache row and the projection directly, convolves, and stores the shifted state.
+//
+// Mapping is one work-item per CHANNEL, not per (channel, seq), and that is the whole
+// safety argument. Merging the cache read and the state write into one dispatch creates a
+// hazard the separate CONCAT and CPY never had: the read row is rows[seq] and the write row
+// is the destination slot, both runtime values, so with a per-(channel, seq) mapping
+// work-item (c, s0) could write the very slice (c, s1) is reading. Per channel, every
+// address either kernel touches is inside [c*(DC-1), c*DC), owned by exactly one work-item
+// -- and the two phases below keep all reads ahead of all writes within it. No barrier
+// exists that could have ordered the other mapping.
+template <int DC, int MAX_NS>
+static void kernel_ssm_conv_collapsed_t1(
+    queue &q,
+    const float *cache, const int32_t *rows, int cache_stride_seq,
+    const float *x, int x_stride_inner, int x_stride_seq,
+    const float *weights,
+    float *dst_data, int dst_stride_seq,
+    float *state_out, int state_stride_seq,
+    int d_inner, int n_s, bool apply_silu
+) {
+    const size_t work_group_size = 256;
+    const size_t total_work      = static_cast<size_t>(d_inner);
+    const size_t num_work_groups = (total_work + work_group_size - 1) / work_group_size;
+
+    q.submit([&](handler &h) {
+        h.parallel_for(
+            nd_range<1>(range<1>(num_work_groups * work_group_size), range<1>(work_group_size)),
+            [=](nd_item<1> item) {
+                const size_t idx = item.get_global_id(0);
+                if (idx >= total_work) {
+                    return;
+                }
+                const int channel = static_cast<int>(idx);
+
+                const float *c = weights + static_cast<size_t>(channel) * DC;
+
+                // phase 1: every load, before any store
+                float win[MAX_NS][DC];
+                for (int s = 0; s < n_s; ++s) {
+                    const float *st = cache
+                        + static_cast<size_t>(rows[s]) * static_cast<size_t>(cache_stride_seq)
+                        + static_cast<size_t>(channel) * (DC - 1);
+#pragma unroll
+                    for (int k = 0; k < DC - 1; ++k) {
+                        win[s][k] = st[k];
+                    }
+                    win[s][DC - 1] = x[static_cast<size_t>(channel) * static_cast<size_t>(x_stride_inner)
+                                       + static_cast<size_t>(s) * static_cast<size_t>(x_stride_seq)];
+                }
+
+                // phase 2: every store
+                for (int s = 0; s < n_s; ++s) {
+                    float sumf = 0.0f;
+#pragma unroll
+                    for (int i = 0; i < DC; ++i) {
+                        sumf += win[s][i] * c[i];
+                    }
+                    dst_data[static_cast<size_t>(s) * static_cast<size_t>(dst_stride_seq) + channel] =
+                        apply_silu ? sumf / (1.0f + sycl::exp(-sumf)) : sumf;
+
+                    float *so = state_out
+                        + static_cast<size_t>(s) * static_cast<size_t>(state_stride_seq)
+                        + static_cast<size_t>(channel) * (DC - 1);
+#pragma unroll
+                    for (int k = 0; k < DC - 1; ++k) {
+                        so[k] = win[s][k + 1];
+                    }
+                }
+            }
+        );
+    });
+}
+
 // GGML_SYCL_SSM_CONV_UNROLL=0 keeps the runtime-trip-count loop, for A/B.
 static bool kernel_ssm_conv(
     queue &q,
@@ -234,6 +310,25 @@ static bool kernel_ssm_conv(
     if (chan_fastest) { GGML_SYCL_SSM_CONV_CALL(0, true); } else { GGML_SYCL_SSM_CONV_CALL(0, false); }
 #undef GGML_SYCL_SSM_CONV_CALL
     return state_out != nullptr;
+}
+
+// GGML_SYCL_CONV_COLLAPSE=0 disables the collapsed one-token conv (same-binary control).
+bool ggml_sycl_conv_collapse_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("GGML_SYCL_CONV_COLLAPSE");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
+    return on;
+}
+
+// GGML_SYCL_CONV_COLLAPSE_DIAG=1 leaves the CONCAT in the graph and byte-compares the two
+// sources this kernel reads against the buffer the CONCAT materialised.
+bool ggml_sycl_conv_collapse_diag() {
+    static const bool on = [] {
+        const char * e = std::getenv("GGML_SYCL_CONV_COLLAPSE_DIAG");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return on;
 }
 
 // GGML_SYCL_CONV_WB=0 disables the fused conv-state writeback (same-binary control).
@@ -374,6 +469,80 @@ static bool ggml_sycl_op_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor *
         std::fprintf(stderr, "[SYCL-SSM_CONV] ERROR: %s\n", e.what());
         throw;
     }
+}
+
+// Proves the two-source gather reproduces the buffer the CONCAT materialises. Under the
+// diag the CONCAT is left in the graph, so conv_input exists to compare against; the
+// convolution itself is the unchanged arithmetic on those same values.
+static void conv_collapse_verify(ggml_backend_sycl_context & ctx, const ggml_tensor * concat,
+                                 const ggml_tensor * gather, const ggml_tensor * xsrc,
+                                 int d_conv, int d_inner, int n_s) {
+    queue_ptr q = ctx.stream();
+
+    std::vector<int32_t> rows(n_s);
+    SYCL_CHECK(CHECK_TRY_ERROR(q->memcpy(rows.data(), gather->src[1]->data, n_s * sizeof(int32_t)).wait()));
+
+    const size_t       ncs = (size_t) d_conv;  // n_t == 1
+    std::vector<float> ci(ncs * d_inner * n_s);
+    SYCL_CHECK(CHECK_TRY_ERROR(q->memcpy(ci.data(), concat->data, ci.size() * sizeof(float)).wait()));
+
+    const size_t       crow = gather->src[0]->nb[1] / sizeof(float);
+    std::vector<float> cache(crow * (rows.empty() ? 0 : (*std::max_element(rows.begin(), rows.end()) + 1)));
+    SYCL_CHECK(CHECK_TRY_ERROR(q->memcpy(cache.data(), gather->src[0]->data, cache.size() * sizeof(float)).wait()));
+
+    const size_t       xsi = xsrc->nb[1] / sizeof(float), xss = xsrc->nb[2] / sizeof(float);
+    std::vector<float> xh((size_t) d_inner * xsi + (size_t) n_s * xss + 1);
+    SYCL_CHECK(CHECK_TRY_ERROR(q->memcpy(xh.data(), xsrc->data, xh.size() * sizeof(float)).wait()));
+
+    long bad_state = 0, bad_x = 0;
+    for (int sq = 0; sq < n_s; ++sq) {
+        for (int c = 0; c < d_inner; ++c) {
+            for (int k = 0; k < d_conv - 1; ++k) {
+                bad_state += (cache[(size_t) rows[sq] * crow + (size_t) c * (d_conv - 1) + k] !=
+                              ci[(size_t) sq * ncs * d_inner + (size_t) c * ncs + k]);
+            }
+            bad_x += (xh[(size_t) c * xsi + (size_t) sq * xss] !=
+                      ci[(size_t) sq * ncs * d_inner + (size_t) c * ncs + (d_conv - 1)]);
+        }
+    }
+    fprintf(stderr, "[CONVCOL] n_s=%d d_inner=%d state_mismatches=%ld x_mismatches=%ld\n", n_s, d_inner,
+            bad_state, bad_x);
+}
+
+// One dispatch for what was GET_ROWS + CONCAT + CPY + SSM_CONV (+ SiLU). Runs at the
+// CONCAT's position in the graph, so both reads happen where they already did and only the
+// writes move -- see find_conv_collapse for why the mirror of that does not work.
+bool ggml_sycl_ssm_conv_collapsed(ggml_backend_sycl_context & ctx, ggml_tensor * dst, ggml_tensor * silu_dst,
+                                  const ggml_tensor * gather, const ggml_tensor * concat, const ggml_tensor * wb) {
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
+    const ggml_tensor * src1 = dst->src[1];
+    const int           d_conv  = (int) src1->ne[0];
+    const int           d_inner = (int) dst->ne[0];
+    const int           n_t     = (int) dst->ne[1];
+    const int           n_s     = (int) dst->ne[2];
+
+    // the detector admits exactly this; anything else must not have skipped the CONCAT
+    GGML_ASSERT(n_t == 1 && d_conv == 4 && n_s >= 1 && n_s <= 4);
+
+    const ggml_tensor * xsrc = concat->src[1];
+    const ggml_tensor * cch  = gather->src[0];
+    const ggml_tensor * dv   = wb->src[1];
+
+    if (ggml_sycl_conv_collapse_diag()) {
+        conv_collapse_verify(ctx, concat, gather, xsrc, d_conv, d_inner, n_s);
+    }
+
+    // a fused SiLU is written in place of the conv's own output, never alongside it
+    const ggml_tensor * outT = silu_dst != nullptr ? silu_dst : dst;
+    kernel_ssm_conv_collapsed_t1<4, 4>(
+        *ctx.stream(),
+        (const float *) cch->data, (const int32_t *) gather->src[1]->data, (int) (cch->nb[1] / sizeof(float)),
+        (const float *) xsrc->data, (int) (xsrc->nb[1] / sizeof(float)), (int) (xsrc->nb[2] / sizeof(float)),
+        (const float *) src1->data,
+        (float *) outT->data, (int) (outT->nb[2] / sizeof(float)),
+        (float *) dv->data, (int) (dv->nb[1] / sizeof(float)),
+        d_inner, n_s, silu_dst != nullptr);
+    return true;
 }
 
 bool ggml_sycl_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor * dst, const ggml_tensor * wb) {

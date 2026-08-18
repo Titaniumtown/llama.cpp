@@ -6700,6 +6700,166 @@ static ggml_tensor * find_ssm_conv_for_writeback(const ggml_cgraph * cgraph, int
     return conv;
 }
 
+// The whole causal-conv chain in one dispatch, at a decode width of one token.
+//
+//   GET_ROWS(cache,rows) -> CONCAT(state, x) -> CPY(concat[:,1:], cache)
+//                                            -> SSM_CONV -> out
+//
+// `0127` removed the GET_ROWS and `0128` the CPY; this removes the CONCAT as well, by
+// having the conv read the cache row and the projection directly. 97% of the conv
+// dispatches this server issues are n_t == 1 (measured: 6048 of 6240 across --parallel 2
+// with speculative decoding), and restricting to that is what keeps the change small --
+// at n_t > 1 the chain keeps the `0127` + `0128` path.
+//
+// Anchored at the CONCAT, whose gather `0127` has already folded, so `gather` is in hand.
+// Fills out_conv/out_cpy and returns true when the whole chain can collapse.
+static bool find_conv_collapse(const ggml_cgraph * cgraph, int concat_idx, const ggml_tensor * gather,
+                               ggml_tensor ** out_conv, ggml_tensor ** out_cpy, ggml_tensor ** out_silu) {
+    if (!ggml_sycl_conv_collapse_enabled()) {
+        return false;
+    }
+    ggml_tensor * cat = cgraph->nodes[concat_idx];
+    ggml_tensor * x   = cat->src[1];
+    if (x == nullptr || x->type != GGML_TYPE_F32 || cat->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (x->ne[0] != 1 || x->ne[3] != 1 || x->ne[1] != cat->ne[1] || x->ne[2] != cat->ne[2]) {
+        return false;
+    }
+    if (x->nb[1] % sizeof(float) != 0 || x->nb[2] % sizeof(float) != 0) {
+        return false;
+    }
+    if (gather->src[0]->nb[1] % sizeof(float) != 0) {
+        return false;
+    }
+
+    ggml_tensor * conv     = nullptr;
+    int           conv_idx = -1;
+    for (int k = concat_idx + 1; k < cgraph->n_nodes; k++) {
+        ggml_tensor * n = cgraph->nodes[k];
+        if (n->op != GGML_OP_SSM_CONV) {
+            continue;
+        }
+        if (n->src[0] == cat) {
+            conv     = n;
+            conv_idx = k;
+        }
+        break;
+    }
+    if (conv == nullptr || conv->src[1] == nullptr) {
+        return false;
+    }
+    if (conv->type != GGML_TYPE_F32 || conv->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const int64_t d_conv  = conv->src[1]->ne[0];
+    const int64_t d_inner = conv->ne[0];
+    const int64_t n_t     = conv->ne[1];
+    const int64_t n_s     = conv->ne[2];
+    // the kernel is instantiated at DC=4 for one token, and holds n_s windows in registers
+    if (d_conv != 4 || n_t != 1 || n_s < 1 || n_s > 4) {
+        return false;
+    }
+    if (cat->ne[0] != d_conv || cat->ne[1] != d_inner || cat->ne[2] != n_s || cat->ne[3] != 1) {
+        return false;
+    }
+    if (conv->src[1]->ne[1] != d_inner) {
+        return false;
+    }
+    if (gather->ne[1] != n_s || gather->src[1]->ne[0] < n_s) {
+        return false;
+    }
+
+    ggml_tensor * cpy     = nullptr;
+    int           cpy_idx = -1;
+    for (int k = concat_idx + 1; k < conv_idx; k++) {
+        ggml_tensor * n = cgraph->nodes[k];
+        if (n->op != GGML_OP_CPY || n->type != GGML_TYPE_F32) {
+            continue;
+        }
+        ggml_tensor * a = n->src[0];
+        if (a != nullptr && (a == cat || a->view_src == cat)) {
+            cpy     = n;
+            cpy_idx = k;
+            break;
+        }
+    }
+    if (cpy == nullptr || cpy->src[0] == nullptr || cpy->src[1] == nullptr) {
+        return false;
+    }
+    ggml_tensor * a = cpy->src[0];
+    ggml_tensor * b = cpy->src[1];
+    if (b->type != GGML_TYPE_F32 || b->nb[0] != sizeof(float) || b->nb[1] % sizeof(float) != 0) {
+        return false;
+    }
+    if (a->ne[0] != d_conv - 1 || a->ne[1] != d_inner || a->ne[2] != n_s || a->ne[3] != 1) {
+        return false;
+    }
+    if (a->nb[1] != cat->nb[1] || a->nb[2] != cat->nb[2]) {
+        return false;
+    }
+    if ((const char *) a->data != (const char *) cat->data + (size_t) n_t * sizeof(float)) {
+        return false;
+    }
+    if (b->ne[0] != (d_conv - 1) * d_inner || b->ne[1] != n_s || b->ne[2] != 1 || b->ne[3] != 1) {
+        return false;
+    }
+    // the kernel indexes the weights as [d_conv, channel]
+    if (conv->src[1]->nb[0] != sizeof(float) || conv->src[1]->nb[1] != (size_t) d_conv * sizeof(float)) {
+        return false;
+    }
+    // a fused SiLU writes in place of the conv's own output, exactly as ggml_sycl_ssm_conv_Fused does
+    ggml_tensor * silu = ggml_sycl_can_fuse(cgraph, conv_idx, { GGML_OP_SSM_CONV, GGML_OP_UNARY },
+                                            { GGML_UNARY_OP_SILU })
+                             ? cgraph->nodes[conv_idx + 1]
+                             : nullptr;
+
+    // Skipping the CONCAT means conv_input is never written, so every reference to it must
+    // be inside this chain.
+    for (int k = concat_idx + 1; k < cgraph->n_nodes; k++) {
+        ggml_tensor * n        = cgraph->nodes[k];
+        const bool    in_chain = n == conv || n == cpy || n == silu || n->view_src == cat;
+        for (int q = 0; q < GGML_MAX_SRC; q++) {
+            const ggml_tensor * sq = n->src[q];
+            if (sq == nullptr || (sq != cat && sq->view_src != cat)) {
+                continue;
+            }
+            if (!in_chain) {
+                return false;
+            }
+        }
+        if (n->view_src == cat && n->op != GGML_OP_RESHAPE && n->op != GGML_OP_VIEW &&
+            n->op != GGML_OP_PERMUTE && n->op != GGML_OP_TRANSPOSE && n->op != GGML_OP_NONE) {
+            return false;
+        }
+    }
+
+    // Everything happens at the CONCAT, so both reads stay at their own consumption point
+    // and neither needs clearance. Only the writes move, earlier, and each one's
+    // destination must be unused over the span it is hoisted across.
+    //
+    // Deferring the reads to the conv instead is the obvious mirror of this and does not
+    // work: measured on this graph, a GET_ROWS 7 nodes downstream is handed the
+    // projection's own 40 KB by the allocator, which frees it the moment the concat -- its
+    // last consumer -- is done with it. That is invisible at depth 0, where the layout
+    // happens to leave it alone, and appears at every production depth.
+    ggml_tensor * out = silu != nullptr ? silu : conv;
+    if (region_touched_between(cgraph, concat_idx + 1, conv_idx, out, /*include_reads=*/true)) {
+        return false;
+    }
+    // the CPY is excluded because it is the write being hoisted, not a competing one
+    if (region_touched_between(cgraph, concat_idx + 1, cpy_idx, b, /*include_reads=*/true) ||
+        region_touched_between(cgraph, cpy_idx + 1, conv_idx, b, /*include_reads=*/true)) {
+        return false;
+    }
+
+    *out_conv = conv;
+    *out_cpy  = cpy;
+    *out_silu = silu;
+    return true;
+}
+
 // Device-side per-op profiler, enabled with GGML_SYCL_PROF=1.
 //
 // A host-side timer around each op has to synchronise per node, which inflates the
@@ -7087,12 +7247,31 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // ssm_wb_conv is that ssm_conv, ssm_wb_cpy the copy it absorbs
     ggml_tensor * ssm_wb_conv = nullptr;
     ggml_tensor * ssm_wb_cpy  = nullptr;
+    // set when the whole conv chain collapses into the CONCAT: that one dispatch gathers,
+    // convolves and writes both the output and the next state, so the CPY, the ssm_conv
+    // and any SiLU fused onto it are all skipped below
+    ggml_tensor * collapse_conv = nullptr;
+    ggml_tensor * collapse_cpy  = nullptr;
+    ggml_tensor * collapse_silu = nullptr;
     ggml_sycl_op_prof prof;
     prof.begin(sycl_ctx->stream());
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         sycl_ctx->cur_node = i;
+        // the collapsed conv at the CONCAT above already did all three of these
+        if (node == collapse_cpy) {
+            collapse_cpy = nullptr;
+            continue;
+        }
+        if (node == collapse_conv) {
+            collapse_conv = nullptr;
+            continue;
+        }
+        if (node == collapse_silu) {
+            collapse_silu = nullptr;
+            continue;
+        }
         if (ggml_sycl_is_view_or_noop(node)) {
             continue;
         }
@@ -7158,6 +7337,22 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             ggml_tensor * gth  = concat_gather_node;
             concat_fold_gather = nullptr;
             concat_gather_node = nullptr;
+            ggml_tensor * cconv = nullptr;
+            ggml_tensor * ccpy  = nullptr;
+            ggml_tensor * csilu = nullptr;
+            if (find_conv_collapse(cgraph, i, gth, &cconv, &ccpy, &csilu)) {
+                if (ggml_sycl_conv_collapse_diag()) {
+                    // the verifier compares the two sources this kernel reads against the
+                    // buffer the concat materialises, so under the diagnostic it still runs
+                    ggml_sycl_op_concat(*sycl_ctx, node, gth);
+                }
+                ggml_sycl_ssm_conv_collapsed(*sycl_ctx, cconv, csilu, gth, node, ccpy);
+                collapse_cpy  = ccpy;
+                collapse_conv = cconv;
+                collapse_silu = csilu;
+                prof.mark(node);
+                continue;
+            }
             ggml_sycl_op_concat(*sycl_ctx, node, gth);
             prof.mark(node);
             continue;
@@ -7468,6 +7663,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // the detector found that ssm_conv at a higher index in this same graph -- so make the
     // impossible case loud instead of trusting it.
     GGML_ASSERT(ssm_wb_conv == nullptr && "conv-state writeback skipped but never performed");
+    GGML_ASSERT(collapse_conv == nullptr && collapse_cpy == nullptr && collapse_silu == nullptr &&
+                "conv chain collapsed but a node it absorbed was never reached");
     prof.flush();
 }
 

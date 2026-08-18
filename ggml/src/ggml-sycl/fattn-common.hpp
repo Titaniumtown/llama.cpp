@@ -295,6 +295,40 @@ static __dpct_inline__ float vec_dot_fattn_vec_KQ_q8_0(const char * __restrict__
     return sum;
 }
 
+// Row-split ("KV reorder") twin of the q8_0 KQ dot above. K_c points at a segment: D
+// contiguous int8 qs then D/QK8_0 half scales. Lanes read consecutive 4-byte words of
+// the qs plane -- the coalesced form of the 34-byte-strided gather that measured
+// 23 GB/s against 240 GB/s for these exact bytes (kvbench, B70).
+template<int D, int nthreads, int warp_size>
+static __dpct_inline__ float vec_dot_fattn_vec_KQ_q8_0_reordered(const char * __restrict__ K_c,
+                                                                 const void * __restrict__ Q_v,
+                                                                 const int * __restrict__ Q_q8,
+                                                                 const void * __restrict__ Q_ds_v) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int * qs32 = (const int *) K_c;
+    const sycl::half * dtail = (const sycl::half *) (K_c + D);
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ =
+            k_KQ_0 + (nthreads == warp_size ? item_ct1.get_local_id(2) : item_ct1.get_local_id(2) % nthreads);
+
+        const int ib = k_KQ / QI8_0;
+
+        const int v = qs32[k_KQ];
+
+        const sycl::float2 * Q_ds = (const sycl::float2 *) Q_ds_v;
+        const float          Q_d  = Q_ds[k_KQ_0 / nthreads].x();
+
+        sum += vec_dot_q8_0_q8_1_impl<float, 1>(&v, &Q_q8[k_KQ_0/nthreads], dtail[ib], Q_d);
+    }
+
+    return sum;
+}
+
 template <typename Tds, int ni, int warp_size>
 static __dpct_inline__ void quantize_q8_1_to_shared(const float * __restrict__ x,
                                                     const float scale,
@@ -576,6 +610,41 @@ static __dpct_inline__ void dequantize_V_q8_0(const void * __restrict__ vx, void
     }
 }
 
+// Row-split twin of dequantize_V_q8_0: vx is a segment base, i0 a column inside it.
+// The ne consecutive quants come from the contiguous qs plane; the scale from the tail.
+// The ne-run never crosses a block (same alignment contract as the AoS form).
+template <typename T, int ne, int D>
+static __dpct_inline__ void dequantize_V_q8_0_reordered(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const int8_t *     qsp = (const int8_t *) vx + i0;
+    const sycl::half * dt  = (const sycl::half *) ((const char *) vx + D);
+    const sycl::half   dh  = dt[i0 / QK8_0];
+
+    static_assert(ne % 2 == 0, "bad ne");
+    int8_t qs[ne];
+    ggml_sycl_memcpy_1<ne, 2>(qs, qsp);
+
+#ifdef GGML_SYCL_F16
+    if constexpr (std::is_same<T, sycl::half>::value) {
+        const sycl::half2 d = sycl::half2(dh);
+
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            ((sycl::half2 *) dst)[l0 / 2] = d * make_half2(qs[l0 + 0], qs[l0 + 1]);
+        }
+    } else
+#endif // GGML_SYCL_F16
+    if constexpr (std::is_same<T, float>::value) {
+        const float d = (float) dh;
+
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = d * qs[l];
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
 template <int type_K, int D, int nthreads, int warp_size>
 constexpr vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -596,6 +665,13 @@ constexpr vec_dot_KQ_t get_vec_dot_KQ() {
     }
 }
 
+// KV_REORDERED form: only q8_0 has a row-split layout; every other type asserts.
+template <int type_K, int D, int nthreads, int warp_size>
+constexpr vec_dot_KQ_t get_vec_dot_KQ_reordered() {
+    static_assert(type_K == GGML_TYPE_Q8_0, "KV reorder is q8_0-only");
+    return vec_dot_fattn_vec_KQ_q8_0_reordered<D, nthreads, warp_size>;
+}
+
 template <int type_V, typename T, int ne>
 constexpr dequantize_V_t get_dequantize_V() {
     if constexpr (type_V == GGML_TYPE_F16) {
@@ -614,6 +690,12 @@ constexpr dequantize_V_t get_dequantize_V() {
         static_assert(type_V == -1, "bad type");
         return nullptr;
     }
+}
+
+template <int type_V, typename T, int ne, int D>
+constexpr dequantize_V_t get_dequantize_V_reordered() {
+    static_assert(type_V == GGML_TYPE_Q8_0, "KV reorder is q8_0-only");
+    return dequantize_V_q8_0_reordered<T, ne, D>;
 }
 
 template <int ncols1, int warp_size>
@@ -993,9 +1075,22 @@ void launch_fattn(
     if (need_f16_K && K->type != GGML_TYPE_F16) {
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
+        const int    kseg = K->type == GGML_TYPE_Q8_0 ? ggml_sycl_kv_reorder_seg(K) : 0;
 
         K_f16.alloc(ggml_nelements(K));
-        if (ggml_is_contiguously_allocated(K)) {
+        if (kseg > 0 && ggml_is_contiguously_allocated(K)) {
+            // flat walk, elementwise in place: same layout mapping as the AoS branch below
+            ggml_sycl_q8_0_reordered_to_fp16(K_data, (sycl::half *) K_f16.ptr, ggml_nelements(K), kseg, main_stream);
+            nb11 = nb11 * bs * sizeof(sycl::half) / ts;
+            nb12 = nb12 * bs * sizeof(sycl::half) / ts;
+            nb13 = nb13 * bs * sizeof(sycl::half) / ts;
+        } else if (kseg > 0) {
+            ggml_sycl_q8_0_reordered_to_fp16_nc(K_data, (sycl::half *) K_f16.ptr, K->ne[0], K->ne[1], K->ne[2],
+                                                K->ne[3], nb11, nb12, nb13, kseg, main_stream);
+            nb11 = K->ne[0] * sizeof(sycl::half);
+            nb12 = K->ne[1] * nb11;
+            nb13 = K->ne[2] * nb12;
+        } else if (ggml_is_contiguously_allocated(K)) {
             to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(K->type, dst);
             to_fp16(K_data, K_f16.ptr, ggml_nelements(K), main_stream);
 
@@ -1033,9 +1128,23 @@ void launch_fattn(
         } else {
             const size_t bs = ggml_blck_size(V->type);
             const size_t ts = ggml_type_size(V->type);
+            const int    vseg = V->type == GGML_TYPE_Q8_0 ? ggml_sycl_kv_reorder_seg(V) : 0;
 
             V_f16.alloc(ggml_nelements(V));
-            if (ggml_is_contiguously_allocated(V)) {
+            if (vseg > 0 && ggml_is_contiguously_allocated(V)) {
+                ggml_sycl_q8_0_reordered_to_fp16(V_data, (sycl::half *) V_f16.ptr, ggml_nelements(V), vseg, main_stream);
+                V_data = (char *) V_f16.ptr;
+                nb21 = nb21 * bs * sizeof(sycl::half) / ts;
+                nb22 = nb22 * bs * sizeof(sycl::half) / ts;
+                nb23 = nb23 * bs * sizeof(sycl::half) / ts;
+            } else if (vseg > 0) {
+                ggml_sycl_q8_0_reordered_to_fp16_nc(V_data, (sycl::half *) V_f16.ptr, V->ne[0], V->ne[1], V->ne[2],
+                                                    V->ne[3], nb21, nb22, nb23, vseg, main_stream);
+                V_data = (char *) V_f16.ptr;
+                nb21 = V->ne[0] * sizeof(sycl::half);
+                nb22 = V->ne[1] * nb21;
+                nb23 = V->ne[2] * nb22;
+            } else if (ggml_is_contiguously_allocated(V)) {
                 to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(V->type, dst);
                 to_fp16(V_data, V_f16.ptr, ggml_nelements(V), main_stream);
                 V_data = (char *) V_f16.ptr;

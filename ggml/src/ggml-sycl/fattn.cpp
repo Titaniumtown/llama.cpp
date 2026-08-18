@@ -273,6 +273,29 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
             if (Q->ne[1] <= 2 && !gqa_opt_applies) {
                 return BEST_FATTN_KERNEL_VEC;
             }
+            // Row-split ("KV reorder") q8_0 caches read 10x faster through the VEC
+            // kernel's streaming loads than through TILE's full-history dequant
+            // prepass (kvbench: 23 -> 240 GB/s on the same bytes; the prepass
+            // re-converts the ENTIRE cache every call). The gqa optimisation that
+            // normally makes TILE the better quantized kernel is exactly the dequant
+            // trade this layout removes, so prefer VEC whenever the reordered form
+            // is available at this head size.
+            // Measured crossover: reordered VEC wins at d8192 (+4.3%), d16384
+            // (+3.8%) and d24576 (+1.2%). Beyond that the two arms are
+            // state-dependent: one window measured VEC -15% at d32768, a later
+            // quiet-box interleaved A/B (12 paired reps, 32K/48K/64K) measured
+            // exact parity +-0.1%. The "occupancy cliff" explanation did not
+            // survive that rerun; there is no reproducible deep-VEC penalty,
+            // but no win either, so the bound conservatively keeps TILE (whose
+            // converter path is proven bit-exact) at depths where VEC has never
+            // won. The bound must sit ABOVE the n_kv of the deepest winning
+            // depth (24640 at d24576, hence not 24576).
+            static const int vec_nkv_max = ggml_sycl_get_env("GGML_SYCL_KV_REORDER_VEC_NKV_MAX", 24832);
+            if (Q->ne[1] <= 2 && K->ne[1] <= vec_nkv_max &&
+                K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
+                ggml_sycl_kv_reorder_seg(K) == K->ne[0] && ggml_sycl_kv_reorder_seg(V) == V->ne[0]) {
+                return BEST_FATTN_KERNEL_VEC;
+            }
         }
     }
     return BEST_FATTN_KERNEL_TILE;

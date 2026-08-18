@@ -915,6 +915,22 @@ char * ggml_sycl_q8_emit_for_next_matvec(ggml_backend_sycl_context & ctx,
 // the caller then takes the generic bin_bcast path. Defined in element_wise.cpp.
 bool ggml_sycl_mul_emit_q8_fast(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
+// ---- q8_0 KV cache row-split reorder ("KV reorder") ----
+// block_q8_0's 34-byte AoS stride byte-gathers on Intel: the fattn-vec K dot measured
+// 23-27.8 GB/s against 240 GB/s for the same bytes laid out as a per-segment qs plane
+// (D int8s) followed by the d halves (D/32 of them) -- same 34*D/32 bytes per segment,
+// same row stride, nothing outside the segment moves. A segment is one head's D
+// elements: FA reads K/V at nb[2] == row_size(q8_0, D), so every reader's row pointer
+// is a segment base. Registration happens per graph before any node runs (every graph
+// that writes KV also holds the FLASH_ATTN_EXT that reads it); the registry is keyed
+// by the cache tensor's base allocation and purged on buffer free.
+// Off switch: GGML_SYCL_KV_REORDER=0. GGML_SYCL_KV_REORDER_TRACE=1 prints events.
+bool ggml_sycl_kv_reorder_enabled();
+void ggml_sycl_kv_reorder_scan_graph(const ggml_cgraph * cgraph);
+void ggml_sycl_kv_reorder_try_register(const ggml_tensor * t);
+void ggml_sycl_kv_reorder_purge_range(const void * base, size_t bytes);
+// segment length in elements when `t`'s base allocation holds reordered rows, else 0
+int  ggml_sycl_kv_reorder_seg(const ggml_tensor * t);
 // Aligned memory transfers of 8/16 bytes can be faster than 2 transfers with 4 bytes.
 template <int nbytes, int alignment = 0>
 static __dpct_inline__ void ggml_sycl_memcpy_1(void * dst, const void * src) {

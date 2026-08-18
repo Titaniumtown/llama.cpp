@@ -300,7 +300,13 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
         {
             const char * K_data = (const char *)K->data;
             const bool k_non_dense = ((int64_t)K->ne[1] * K->nb[1] != K->nb[2]) && K->ne[2] > 1;
-            if (ggml_is_contiguously_allocated(K) && !k_non_dense) {
+            const int  kseg = K->type == GGML_TYPE_Q8_0 ? ggml_sycl_kv_reorder_seg(K) : 0;
+            if (kseg > 0 && ggml_is_contiguously_allocated(K) && !k_non_dense) {
+                ggml_sycl_q8_0_reordered_to_fp16(K_data, (sycl::half *) K_ptr, ggml_nelements(K), kseg, stream);
+            } else if (kseg > 0) {
+                ggml_sycl_q8_0_reordered_to_fp16_nc(K_data, (sycl::half *) K_ptr, K->ne[0], K->ne[1], K->ne[2],
+                                                    K->ne[3], K->nb[1], K->nb[2], K->nb[3], kseg, stream);
+            } else if (ggml_is_contiguously_allocated(K) && !k_non_dense) {
                 to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(K->type, dst);
                 to_fp16(K_data, K_ptr, ggml_nelements(K), stream);
             } else {
@@ -329,7 +335,13 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
         {
             const char * V_data = (const char *)V->data;
             const bool v_non_dense = ((int64_t)V->ne[1] * V->nb[1] != V->nb[2]) && V->ne[2] > 1;
-            if (ggml_is_contiguously_allocated(V) && !v_non_dense) {
+            const int  vseg = V->type == GGML_TYPE_Q8_0 ? ggml_sycl_kv_reorder_seg(V) : 0;
+            if (vseg > 0 && ggml_is_contiguously_allocated(V) && !v_non_dense) {
+                ggml_sycl_q8_0_reordered_to_fp16(V_data, (sycl::half *) V_ptr, ggml_nelements(V), vseg, stream);
+            } else if (vseg > 0) {
+                ggml_sycl_q8_0_reordered_to_fp16_nc(V_data, (sycl::half *) V_ptr, V->ne[0], V->ne[1], V->ne[2],
+                                                    V->ne[3], V->nb[1], V->nb[2], V->nb[3], vseg, stream);
+            } else if (ggml_is_contiguously_allocated(V) && !v_non_dense) {
                 to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(V->type, dst);
                 to_fp16(V_data, V_ptr, ggml_nelements(V), stream);
             } else {

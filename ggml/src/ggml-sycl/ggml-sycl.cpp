@@ -13,6 +13,9 @@
 #include <algorithm>
 #include <array>
 #include <map>
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <assert.h>
 #include <atomic>
@@ -554,6 +557,10 @@ static void
 ggml_backend_sycl_buffer_free_buffer(ggml_backend_buffer_t buffer) try {
     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
     ggml_sycl_set_device(ctx->device);
+
+    // a freed allocation's address can be recycled for a different cache with a
+    // different segment size; stale registry entries would mislabel its layout
+    ggml_sycl_kv_reorder_purge_range((const void *) ctx->dev_ptr, buffer->size);
 
     delete ctx;
 }
@@ -2918,6 +2925,115 @@ static char * src1_q8_store(ggml_backend_sycl_context & ctx, const void * key, c
 // q8_1 copy itself and register it here; the consumer's src1_q8_lookup is keyed on the float
 // data pointer, so no consumer detection is needed -- the cache IS the rendezvous. A wrong
 // `variant` guess is safe: the lookup compares it and simply misses.
+// ---- q8_0 KV reorder registry (see common.hpp) ----
+static std::mutex                            g_kv_reorder_mutex;
+static std::unordered_map<const void *, int> g_kv_reorder_segs;
+
+bool ggml_sycl_kv_reorder_enabled() {
+    static const int on = ggml_sycl_get_env("GGML_SYCL_KV_REORDER", 1);
+    return on != 0;
+}
+
+static int ggml_sycl_kv_reorder_trace() {
+    static const int t = ggml_sycl_get_env("GGML_SYCL_KV_REORDER_TRACE", 0);
+    return t;
+}
+
+static const void * kv_reorder_base(const ggml_tensor * t) {
+    if (t == nullptr) { return nullptr; }
+    const ggml_tensor * b = t->view_src != nullptr ? t->view_src : t;
+    return b->data;
+}
+
+void ggml_sycl_kv_reorder_try_register(const ggml_tensor * t) {
+    if (!ggml_sycl_kv_reorder_enabled() || t == nullptr || t->type != GGML_TYPE_Q8_0) { return; }
+    // Only rows made of whole, densely packed head segments qualify: nb[2] must be the
+    // natural segment byte size and the row stride a multiple of it. That is exactly the
+    // unified-cache shape ([D, n_kv, H] view of [D*H, n_ctx] storage); anything else --
+    // permuted views, padded strides, test tensors without a view -- stays AoS.
+    const void * base = kv_reorder_base(t);
+    if (base == nullptr || t->view_src == nullptr) { return; }
+    const int64_t seg = t->ne[0];
+    if (seg <= 0 || seg % QK8_0 != 0 || (seg & (seg - 1)) != 0) { return; }
+    const size_t segbytes = (size_t) seg / QK8_0 * sizeof(block_q8_0);
+    if ((size_t) t->nb[2] != segbytes) { return; }
+    if (t->nb[1] % segbytes != 0) { return; }
+    std::lock_guard<std::mutex> lock(g_kv_reorder_mutex);
+    auto it = g_kv_reorder_segs.find(base);
+    if (it != g_kv_reorder_segs.end()) {
+        if (it->second != (int) seg && ggml_sycl_kv_reorder_trace()) {
+            fprintf(stderr, "[KVR] seg conflict base=%p have=%d want=%d\n", base, it->second, (int) seg);
+        }
+        return;
+    }
+    g_kv_reorder_segs.emplace(base, (int) seg);
+    if (ggml_sycl_kv_reorder_trace()) {
+        fprintf(stderr, "[KVR] register base=%p seg=%d ne1=%ld nb1=%zu\n", base, (int) seg,
+                (long) t->ne[1], (size_t) t->nb[1]);
+    }
+}
+
+void ggml_sycl_kv_reorder_purge_range(const void * base, size_t bytes) {
+    std::lock_guard<std::mutex> lock(g_kv_reorder_mutex);
+    for (auto it = g_kv_reorder_segs.begin(); it != g_kv_reorder_segs.end();) {
+        const char * p = (const char *) it->first;
+        if (p >= (const char *) base && p < (const char *) base + bytes) {
+            it = g_kv_reorder_segs.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// Registration requires BOTH halves of the cache signature in one graph: a
+// FLASH_ATTN_EXT reading the base through a segment-shaped view AND a SET_ROWS/CPY
+// writing rows into the same base. FA test graphs hold only the read half (their
+// bytes arrive AoS via tensor_set, never through the quantizing writer), so the
+// write requirement is what keeps them -- and any other read-only q8_0 view -- on
+// the AoS path. llama graphs append the new token's K/V in the same graph that
+// attends over it, so the first write is reordered from the very first step.
+void ggml_sycl_kv_reorder_scan_graph(const ggml_cgraph * cgraph) {
+    if (!ggml_sycl_kv_reorder_enabled()) { return; }
+    bool has_fa = false;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (cgraph->nodes[i]->op == GGML_OP_FLASH_ATTN_EXT) { has_fa = true; break; }
+    }
+    if (!has_fa) { return; }
+    std::unordered_set<const void *> written;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (n->op != GGML_OP_SET_ROWS && n->op != GGML_OP_CPY) { continue; }
+        // SET_ROWS writes the node's own tensor (a view of the cache; src[1] is the row
+        // indices); CPY aliases its dst view through src[1] AND the node. Collect both.
+        const void * b0 = kv_reorder_base(n);
+        if (b0 != nullptr) { written.insert(b0); }
+        if (n->src[1] != nullptr) {
+            const void * b1 = kv_reorder_base(n->src[1]);
+            if (b1 != nullptr) { written.insert(b1); }
+        }
+    }
+    if (written.empty()) { return; }
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (n->op != GGML_OP_FLASH_ATTN_EXT) { continue; }
+        for (int j = 1; j <= 2; j++) {
+            const ggml_tensor * t = n->src[j];
+            if (t != nullptr && written.count(kv_reorder_base(t)) != 0) {
+                ggml_sycl_kv_reorder_try_register(t);
+            }
+        }
+    }
+}
+
+int ggml_sycl_kv_reorder_seg(const ggml_tensor * t) {
+    if (!ggml_sycl_kv_reorder_enabled() || t == nullptr) { return 0; }
+    const void * base = kv_reorder_base(t);
+    if (base == nullptr) { return 0; }
+    std::lock_guard<std::mutex> lock(g_kv_reorder_mutex);
+    auto it = g_kv_reorder_segs.find(base);
+    return it == g_kv_reorder_segs.end() ? 0 : it->second;
+}
+
 char * ggml_sycl_src1_q8_store_ext(ggml_backend_sycl_context & ctx, const void * key, const void * strm,
                                    size_t bytes, size_t src_ne, int variant, const ggml_tensor * out) {
     char * p = src1_q8_store(ctx, key, strm, bytes, src_ne, variant);
@@ -7450,6 +7566,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     ggml_tensor * pair_skip_node = nullptr;
     ggml_sycl_op_prof prof;
     prof.begin(sycl_ctx->stream());
+
+    // KV reorder registration must precede every dispatch: the first graph that writes a
+    // q8_0 cache also reads it through FLASH_ATTN_EXT, and the writer consults the
+    // registry to pick the row layout.
+    ggml_sycl_kv_reorder_scan_graph(cgraph);
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];

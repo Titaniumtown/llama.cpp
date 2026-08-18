@@ -61,6 +61,7 @@ static void set_rows_sycl_q(const char * __restrict__ src0_d,
                             const size_t  nb1,
                             const size_t  nb2,
                             const size_t  nb3,
+                            const int     reorder_seg,
                             queue_ptr     stream) {
     const int64_t total_blocks = (ne00 * ne01 * ne02 * ne03) / qk;
     constexpr int block_size   = 256;
@@ -88,16 +89,44 @@ static void set_rows_sycl_q(const char * __restrict__ src0_d,
         const size_t  dst_offset =
             calculate_offset<3>({ nb1, nb2, nb3 }, { dst_row, i02, i03 }) + (i00 / qk) * sizeof(blockType);
         char * dst_block = reinterpret_cast<char *>(reinterpret_cast<char *>(dst_d) + dst_offset);
+        float src_block_f32[qk];
+        const float * srcf;
         if constexpr (std::is_same_v<TIn, float>) {
-            cpyblck(src_block, dst_block);
+            srcf = reinterpret_cast<const float *>(src_block);
         } else {
-            float src_block_f32[qk];
             const TIn * src_block_t = reinterpret_cast<const TIn *>(src_block);
             for (int j = 0; j < qk; ++j) {
                 src_block_f32[j] = (float) src_block_t[j];
             }
-            cpyblck(reinterpret_cast<const char *>(src_block_f32), dst_block);
+            srcf = src_block_f32;
         }
+        if constexpr (std::is_same_v<blockType, block_q8_0>) {
+            if (reorder_seg > 0) {
+                // Row-split KV layout: within each seg-element segment the qs bytes form one
+                // contiguous plane and the block scales follow as a half array. Same bytes
+                // per segment, same row stride -- only intra-segment addresses change.
+                const int64_t blk      = i00 / qk;
+                const int64_t segblk   = reorder_seg / qk;
+                const int64_t g        = blk / segblk;
+                const int64_t jb       = blk - g * segblk;
+                const size_t  segbytes = (size_t) reorder_seg + (size_t) segblk * sizeof(sycl::half);
+                char * segp = reinterpret_cast<char *>(dst_d) +
+                              calculate_offset<3>({ nb1, nb2, nb3 }, { dst_row, i02, i03 }) + (size_t) g * segbytes;
+                float amax = 0.0f;
+                for (int j = 0; j < qk; j++) {
+                    amax = sycl::fmax(amax, sycl::fabs(srcf[j]));
+                }
+                const float d  = amax / 127.0f;
+                const float id = d ? 1.0f / d : 0.0f;
+                int8_t * qs = reinterpret_cast<int8_t *>(segp) + jb * qk;
+                for (int j = 0; j < qk; ++j) {
+                    qs[j] = static_cast<int8_t>(sycl::round(srcf[j] * id));
+                }
+                reinterpret_cast<sycl::half *>(segp + reorder_seg)[jb] = sycl::half(d);
+                return;
+            }
+        }
+        cpyblck(reinterpret_cast<const char *>(srcf), dst_block);
     });
     GGML_UNUSED(ne10);
     GGML_UNUSED(ne13);
@@ -355,65 +384,70 @@ static void set_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor * s
             );
             break;
 #endif
-        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q8_0: {
+            int kvseg = ggml_sycl_kv_reorder_seg(dst);
+            if (kvseg > 0 && (kvseg % QK8_0 != 0 || ne00 % kvseg != 0)) {
+                kvseg = 0;
+            }
             set_rows_sycl_q<TIn, TIdx, block_q8_0, QK8_0, cpy_blck_f32_q8_0>(
                 src0_d, src1_d, (block_q8_0 *) dst->data, ne00, ne01, ne02, ne03,
                 ne10, ne11, ne12, ne13, nb00, nb01,
-                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, kvseg, stream);
             break;
+        }
         case GGML_TYPE_Q1_0:
             set_rows_sycl_q<TIn, TIdx, block_q1_0, QK1_0, cpy_blck_f32_q1_0>(
                 src0_d, src1_d, (block_q1_0 *) dst->data, ne00, ne01, ne02, ne03,
                 ne10, ne11, ne12, ne13, nb00, nb01,
-                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, 0, stream);
             break;
         case GGML_TYPE_Q2_0:
             set_rows_sycl_q<TIn, TIdx, block_q2_0, QK2_0, cpy_blck_f32_q2_0>(
                 src0_d, src1_d, (block_q2_0 *) dst->data, ne00, ne01, ne02, ne03,
                 ne10, ne11, ne12, ne13, nb00, nb01,
-                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, 0, stream);
             break;
         case GGML_TYPE_Q5_1:
             set_rows_sycl_q<TIn, TIdx, block_q5_1, QK5_1, cpy_blck_f32_q5_1>(
                 src0_d, src1_d, (block_q5_1 *) dst->data, ne00, ne01, ne02, ne03,
                 ne10, ne11, ne12, ne13, nb00, nb01,
-                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, 0, stream);
             break;
         case GGML_TYPE_Q5_0:
             set_rows_sycl_q<TIn, TIdx, block_q5_0, QK5_0, cpy_blck_f32_q5_0>(
                 src0_d, src1_d, (block_q5_0 *) dst->data, ne00, ne01, ne02, ne03,
                 ne10, ne11, ne12, ne13, nb00, nb01,
-                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, 0, stream);
             break;
         case GGML_TYPE_Q4_1:
             set_rows_sycl_q<TIn, TIdx, block_q4_1, QK4_1, cpy_blck_f32_q4_1>(
                 src0_d, src1_d, (block_q4_1 *) dst->data, ne00, ne01, ne02, ne03,
                 ne10, ne11, ne12, ne13, nb00, nb01,
-                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, 0, stream);
             break;
         case GGML_TYPE_Q4_0:
             set_rows_sycl_q<TIn, TIdx, block_q4_0, QK4_0, cpy_blck_f32_q4_0>(
                 src0_d, src1_d, (block_q4_0 *) dst->data, ne00, ne01, ne02, ne03,
                 ne10, ne11, ne12, ne13, nb00, nb01,
-                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, 0, stream);
             break;
         case GGML_TYPE_IQ4_NL:
             set_rows_sycl_q<TIn, TIdx, block_iq4_nl, QK4_NL, cpy_blck_f32_iq4_nl>(
                 src0_d, src1_d, (block_iq4_nl *) dst->data, ne00, ne01, ne02, ne03,
                 ne10, ne11, ne12, ne13, nb00, nb01,
-                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, 0, stream);
             break;
         case GGML_TYPE_MXFP4:
             set_rows_sycl_q<TIn, TIdx, block_mxfp4, QK_MXFP4, cpy_blck_f32_mxfp4>(
                 src0_d, src1_d, (block_mxfp4 *) dst->data, ne00, ne01, ne02, ne03,
                 ne10, ne11, ne12, ne13, nb00, nb01,
-                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, 0, stream);
             break;
         case GGML_TYPE_NVFP4:
             set_rows_sycl_q<TIn, TIdx, block_nvfp4, QK_NVFP4, cpy_blck_f32_nvfp4>(
                 src0_d, src1_d, (block_nvfp4 *) dst->data, ne00, ne01, ne02, ne03,
                 ne10, ne11, ne12, ne13, nb00, nb01,
-                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, 0, stream);
             break;
         case GGML_TYPE_Q2_K:
             set_rows_sycl_qk_host<TIn, TIdx, block_q2_K, QK_K, quantize_row_q2_K_ref>(

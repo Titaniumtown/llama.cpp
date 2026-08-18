@@ -35,7 +35,8 @@ template <int D,
           int type_V,
           bool use_logit_softcap,
           int warp_size,
-          int nthreads>  // D == head size
+          int nthreads,
+          bool KV_REORDERED = false>  // D == head size
 static void flash_attn_ext_vec(const char* __restrict__ Q,
                         const char* __restrict__ K,
                         const char* __restrict__ V,
@@ -108,13 +109,30 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
     constexpr int V_rows_per_thread = type_V == GGML_TYPE_F16 ? 2*cpy_ne : 4;
     constexpr int V_cols_per_iter   = warp_size / nthreads_V;
 
-    constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ, warp_size>();
+    static_assert(!KV_REORDERED || (type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0),
+                  "KV reorder is q8_0-only");
+    // if constexpr keeps the reordered getters (whose static_asserts reject non-q8_0)
+    // uninstantiated on every other type combination
+    constexpr vec_dot_KQ_t vec_dot_KQ = []() constexpr {
+        if constexpr (KV_REORDERED) {
+            return get_vec_dot_KQ_reordered<type_K, D, nthreads_KQ, warp_size>();
+        } else {
+            return get_vec_dot_KQ<type_K, D, nthreads_KQ, warp_size>();
+        }
+    }();
     constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16;
 #ifdef GGML_SYCL_F16
-    constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, sycl::half, V_rows_per_thread>();
+    using dqV_T = sycl::half;
 #else
-    constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, float, V_rows_per_thread>();
+    using dqV_T = float;
 #endif // GGML_SYCL_F16
+    constexpr dequantize_V_t dequantize_V = []() constexpr {
+        if constexpr (KV_REORDERED) {
+            return get_dequantize_V_reordered<type_V, dqV_T, V_rows_per_thread, D>();
+        } else {
+            return get_dequantize_V<type_V, dqV_T, V_rows_per_thread>();
+        }
+    }();
 
     const int ic0 = item_ct1.get_group(2) * ncols;  // Index of the Q/QKV column to work on.
 
@@ -593,7 +611,7 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
 
 
 
-template <int D, int cols_per_block, int type_K, int type_V, bool use_logit_softcap>
+template <int D, int cols_per_block, int type_K, int type_V, bool use_logit_softcap, bool KV_REORDERED = false>
 void ggml_sycl_flash_attn_ext_vec_case_impl(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 
     constexpr int warp_size = WARP_16_SIZE; //better performance than WARP_32_SIZE
@@ -610,7 +628,7 @@ void ggml_sycl_flash_attn_ext_vec_case_impl(ggml_backend_sycl_context & ctx, ggm
             constexpr int nwarps = nthreads_hw / warp_size;
             launch_fattn<D, cols_per_block, 1,
                          flash_attn_ext_vec<D, cols_per_block, type_K, type_V,
-                                            use_logit_softcap, warp_size, nthreads_hw>, warp_size>(
+                                            use_logit_softcap, warp_size, nthreads_hw, KV_REORDERED>, warp_size>(
                 ctx, dst, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false);
             return;
         }
@@ -620,7 +638,7 @@ void ggml_sycl_flash_attn_ext_vec_case_impl(ggml_backend_sycl_context & ctx, ggm
     constexpr int nwarps = nthreads_hw / warp_size;
     launch_fattn<D, cols_per_block, 1,
                  flash_attn_ext_vec<D, cols_per_block, type_K, type_V,
-                                    use_logit_softcap, warp_size, nthreads_hw>, warp_size>(
+                                    use_logit_softcap, warp_size, nthreads_hw, KV_REORDERED>, warp_size>(
         ctx, dst, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false);
 }
 
@@ -632,25 +650,39 @@ void ggml_sycl_flash_attn_ext_vec_case(ggml_backend_sycl_context & ctx, ggml_ten
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
+    // Row-split KV layout: both caches must be registered at exactly this head size.
+    // Only the q8_0/q8_0 combination has reordered kernels; everything else ignores it.
+    bool kv_reordered = false;
+    if constexpr (type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0) {
+        kv_reordered = ggml_sycl_kv_reorder_seg(dst->src[1]) == D &&
+                       ggml_sycl_kv_reorder_seg(dst->src[2]) == D;
+    }
+
+    const auto dispatch = [&](auto cols_tag, auto softcap_tag) {
+        constexpr int  cols_per_block    = decltype(cols_tag)::value;
+        constexpr bool use_logit_softcap = decltype(softcap_tag)::value;
+        if constexpr (type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0) {
+            if (kv_reordered) {
+                ggml_sycl_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap, true>(ctx, dst);
+                return;
+            }
+        }
+        ggml_sycl_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap, false>(ctx, dst);
+    };
+
     if (Q->ne[1] == 1) {
-        constexpr int cols_per_block = 1;
         if (logit_softcap == 0.0f) {
-            constexpr bool use_logit_softcap = false;
-            ggml_sycl_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+            dispatch(std::integral_constant<int, 1>{}, std::false_type{});
         } else {
-            constexpr bool use_logit_softcap = true;
-            ggml_sycl_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+            dispatch(std::integral_constant<int, 1>{}, std::true_type{});
         }
         return;
     }
 
-    constexpr int cols_per_block = 2;
     if (logit_softcap == 0.0f) {
-        constexpr bool use_logit_softcap = false;
-        ggml_sycl_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+        dispatch(std::integral_constant<int, 2>{}, std::false_type{});
     } else {
-        constexpr bool use_logit_softcap = true;
-        ggml_sycl_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+        dispatch(std::integral_constant<int, 2>{}, std::true_type{});
     }
 }
 

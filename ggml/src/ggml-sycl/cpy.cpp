@@ -3,6 +3,7 @@
 #include <float.h>
 #include <vector>
 
+#include "convert.hpp"
 #include "dequantize.hpp"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/presets.hpp"
@@ -757,7 +758,7 @@ static void ggml_sycl_quantize_rows_q(const char * cx, char * cdst, const int64_
                                       const size_t nb00, const size_t nb01, const size_t nb02, const size_t nb03,
                                       const int64_t ne10, const int64_t ne11, const int64_t ne12,
                                       const size_t nb10, const size_t nb11, const size_t nb12, const size_t nb13,
-                                      queue_ptr stream) {
+                                      queue_ptr stream, const int reorder_seg = 0) {
     GGML_ASSERT(ne % qk == 0);
     GGML_ASSERT(ne00 % qk == 0);
 
@@ -799,6 +800,29 @@ static void ggml_sycl_quantize_rows_q(const char * cx, char * cdst, const int64_
             }
         }
 
+        if constexpr (qk == QK8_0) {
+            if (reorder_seg > 0) {
+                // row-split KV layout (see common.hpp): qs plane + half d tail per segment
+                const int64_t blk      = i10 / qk;
+                const int64_t segblk   = reorder_seg / qk;
+                const int64_t g        = blk / segblk;
+                const int64_t jb       = blk - g * segblk;
+                const size_t  segbytes = (size_t) reorder_seg + (size_t) segblk * sizeof(sycl::half);
+                char * segp = cdst + i11 * nb11 + i12 * nb12 + i13 * nb13 + (size_t) g * segbytes;
+                float amax = 0.0f;
+                for (int j = 0; j < qk; j++) {
+                    amax = sycl::fmax(amax, sycl::fabs(xf[j]));
+                }
+                const float d  = amax / 127.0f;
+                const float id = d ? 1.0f / d : 0.0f;
+                int8_t * qs = (int8_t *) segp + jb * qk;
+                for (int j = 0; j < qk; ++j) {
+                    qs[j] = static_cast<int8_t>(sycl::round(xf[j] * id));
+                }
+                ((sycl::half *) (segp + reorder_seg))[jb] = sycl::half(d);
+                return;
+            }
+        }
         quantize_block((const char *) xf, cdst + dst_offset);
     });
 }
@@ -813,11 +837,16 @@ static void ggml_sycl_quantize_rows_sycl(const char * cx, char * cdst, const ggm
     GGML_UNUSED(src1);
 
     switch (src1->type) {
-        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q8_0: {
+            int kvseg = ggml_sycl_kv_reorder_seg(src1);
+            if (kvseg > 0 && (kvseg % QK8_0 != 0 || ne10 % kvseg != 0)) {
+                kvseg = 0;
+            }
             ggml_sycl_quantize_rows_q<SrcScalar, cpy_blck_f32_q8_0, QK8_0>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01,
                                                                             nb02, nb03, ne10, ne11, ne12, nb10, nb11,
-                                                                            nb12, nb13, stream);
+                                                                            nb12, nb13, stream, kvseg);
             break;
+        }
         case GGML_TYPE_Q1_0:
             ggml_sycl_quantize_rows_q<SrcScalar, cpy_blck_f32_q1_0, QK1_0>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01,
                                                                             nb02, nb03, ne10, ne11, ne12, nb10, nb11,
@@ -1413,8 +1442,21 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, co
         ggml_cpy_q4_1_f32_sycl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10,
                                nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32) {
-        ggml_cpy_q8_0_f32_sycl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10,
-                               nb11, nb12, nb13, main_stream);
+        // Registered ("KV reorder") caches store rows as split planes; the AoS walk
+        // below would misread them. This is the K-shift read (cast cache -> f32).
+        const int kvseg = ggml_sycl_kv_reorder_seg(src0);
+        if (kvseg > 0) {
+            GGML_ASSERT(ggml_is_contiguous(src1));
+            if (ggml_is_contiguously_allocated(src0)) {
+                ggml_sycl_q8_0_reordered_to_fp32(src0_ddc, (float *) src1_ddc, ggml_nelements(src0), kvseg, main_stream);
+            } else {
+                ggml_sycl_q8_0_reordered_to_fp32_nc(src0_ddc, (float *) src1_ddc, src0->ne[0], src0->ne[1], src0->ne[2],
+                                                    src0->ne[3], src0->nb[1], src0->nb[2], src0->nb[3], kvseg, main_stream);
+            }
+        } else {
+            ggml_cpy_q8_0_f32_sycl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10,
+                                   nb11, nb12, nb13, main_stream);
+        }
     } else if (src0->type == GGML_TYPE_Q2_0 && src1->type == GGML_TYPE_F32) {
         ggml_cpy_q2_0_f32_sycl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12,
                                nb10, nb11, nb12, nb13, main_stream);
@@ -1437,6 +1479,9 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, co
         ggml_cpy_f32_iq4_nl_sycl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12,
                                  nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_Q8_0) {
+        // Byte-level row copies are layout-agnostic only when both sides agree.
+        GGML_ASSERT(ggml_sycl_kv_reorder_seg(src0) == ggml_sycl_kv_reorder_seg(src1) &&
+                    "q8_0 copy between reordered and plain layouts");
         ggml_cpy_q8_0_q8_0(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_Q5_0 && src1->type == GGML_TYPE_Q5_0) {
         ggml_cpy_q5_0_q5_0(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);

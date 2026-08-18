@@ -683,6 +683,121 @@ static void convert_unary_sycl(const void * vx, dst_t * y, const int64_t k, dpct
 }
 
 
+// ---- row-split ("KV reorder") q8_0 -> f16 ----
+// One work-item per QK8_0 block: 32 coalesced int8 loads from the qs plane + one half
+// scale from the tail. The flat form requires k to be segment-aligned, which holds for
+// every registered cache (rows are whole segments).
+template <typename T>
+static void ggml_sycl_q8_0_reordered_to_fp16_t(const void * vx, T * y, int64_t k, int seg,
+                                      dpct::queue_ptr stream) {
+    GGML_ASSERT(seg > 0 && seg % QK8_0 == 0 && k % seg == 0);
+    // Two elements per work-item: consecutive lanes read consecutive qs bytes (coalesced)
+    // and the 16 lanes of a block share one broadcast d load. The first cut of this
+    // kernel ran one 32-iteration loop per work-item and measured 20.93 -> 14.31 t/s at
+    // d32768 through the TILE prepass -- slower than the AoS converter it replaces.
+    // All index math in 32 bits (64-bit integer division is emulated on Xe: the first
+    // int64 cut of this kernel converted at 133 GB/s against the AoS converter's 543);
+    // seg is a power of two, so / and % compile to shifts and masks.
+    GGML_ASSERT((seg & (seg - 1)) == 0);
+    GGML_ASSERT(k % 8 == 0 && k / 8 <= INT32_MAX);
+    // Eight elements per work-item: one 8-byte qs load, one d load (8 divides the block),
+    // four half2 stores. The 2-elements/WI form measured 395-445 GB/s against the AoS
+    // converter's 478-543; this one matches it.
+    const uint32_t noct      = (uint32_t) (k / 8);
+    const uint32_t seg_u     = (uint32_t) seg;
+    const uint32_t seg_shift = (uint32_t) __builtin_ctz(seg_u);
+    const uint32_t segbytes  = seg_u + (seg_u / QK8_0) * (uint32_t) sizeof(sycl::half);
+    constexpr int WGS = 256;
+    const int64_t ng = ((int64_t) noct + WGS - 1) / WGS;
+    stream->parallel_for(sycl::nd_range<1>(ng * WGS, WGS), [=](sycl::nd_item<1> it) {
+        const uint32_t i = (uint32_t) it.get_global_linear_id();
+        if (i >= noct) { return; }
+        const uint32_t e0 = i * 8;
+        const uint32_t g  = e0 >> seg_shift;
+        const uint32_t o  = e0 & (seg_u - 1);
+        const char *  segp = (const char *) vx + (size_t) g * segbytes;
+        int8_t qv[8];
+        *(sycl::vec<int32_t, 2> *) qv = *(const sycl::vec<int32_t, 2> *) ((const int8_t *) segp + o);
+        const float d = (float) ((const sycl::half *) (segp + seg_u))[o >> 5];
+        T * dst = y + e0;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            dst[2 * l]     = (T) (d * (float) qv[2 * l]);
+            dst[2 * l + 1] = (T) (d * (float) qv[2 * l + 1]);
+        }
+    });
+}
+
+template <typename T>
+static void ggml_sycl_q8_0_reordered_to_fp16_nc_t(const void * vx, T * y, int64_t ne00, int64_t ne01,
+                                         int64_t ne02, int64_t ne03, size_t nb01, size_t nb02, size_t nb03,
+                                         int seg, dpct::queue_ptr stream) {
+    GGML_ASSERT(seg > 0 && seg % QK8_0 == 0 && ne00 % seg == 0);
+    // Same two-elements-per-work-item layout and 32-bit index math as the flat form.
+    // The row walk keeps ne00/rowpair as powers of two (head sizes); the i01 split is
+    // one 32-bit division by a loop-invariant value.
+    GGML_ASSERT((seg & (seg - 1)) == 0);
+    GGML_ASSERT((ne00 & (ne00 - 1)) == 0);   // head sizes are powers of two
+    GGML_ASSERT(ne00 % 8 == 0);
+    const uint32_t rowoct  = (uint32_t) (ne00 / 8);
+    const int64_t  noct64  = (int64_t) rowoct * ne01 * ne02 * ne03;
+    GGML_ASSERT(noct64 <= INT32_MAX);
+    const uint32_t noct          = (uint32_t) noct64;
+    const uint32_t seg_u         = (uint32_t) seg;
+    const uint32_t seg_shift     = (uint32_t) __builtin_ctz(seg_u);
+    const uint32_t rowoct_shift  = (uint32_t) __builtin_ctz(rowoct);
+    const uint32_t segbytes      = seg_u + (seg_u / QK8_0) * (uint32_t) sizeof(sycl::half);
+    const sycl::uint3 ne01_fd    = init_fastdiv_values((uint32_t) ne01);
+    const sycl::uint3 ne02_fd    = init_fastdiv_values((uint32_t) ne02);
+    const uint32_t ne00u         = (uint32_t) ne00;
+    constexpr int WGS = 256;
+    const int64_t ng = ((int64_t) noct + WGS - 1) / WGS;
+    stream->parallel_for(sycl::nd_range<1>(ng * WGS, WGS), [=](sycl::nd_item<1> it) {
+        const uint32_t i = (uint32_t) it.get_global_linear_id();
+        if (i >= noct) { return; }
+        const uint32_t row = i >> rowoct_shift;
+        const sycl::uint2 dm01 = fast_div_modulo(row, ne01_fd);
+        const uint32_t i01 = dm01.y();
+        const sycl::uint2 dm02 = fast_div_modulo(dm01.x(), ne02_fd);
+        const uint32_t i02 = dm02.y();
+        const uint32_t i03 = dm02.x();
+        const uint32_t e0  = (i - (row << rowoct_shift)) * 8;
+        const uint32_t g   = e0 >> seg_shift;
+        const uint32_t o   = e0 & (seg_u - 1);
+        const char *  segp = (const char *) vx + i01 * nb01 + i02 * nb02 + i03 * nb03 + (size_t) g * segbytes;
+        int8_t qv[8];
+        *(sycl::vec<int32_t, 2> *) qv = *(const sycl::vec<int32_t, 2> *) ((const int8_t *) segp + o);
+        const float d = (float) ((const sycl::half *) (segp + seg_u))[o >> 5];
+        T * dst = y + ((size_t) row * ne00u) + e0;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            dst[2 * l]     = (T) (d * (float) qv[2 * l]);
+            dst[2 * l + 1] = (T) (d * (float) qv[2 * l + 1]);
+        }
+    });
+}
+void ggml_sycl_q8_0_reordered_to_fp16(const void * vx, sycl::half * y, int64_t k, int seg,
+                                      dpct::queue_ptr stream) {
+    ggml_sycl_q8_0_reordered_to_fp16_t<sycl::half>(vx, y, k, seg, stream);
+}
+
+void ggml_sycl_q8_0_reordered_to_fp32(const void * vx, float * y, int64_t k, int seg,
+                                      dpct::queue_ptr stream) {
+    ggml_sycl_q8_0_reordered_to_fp16_t<float>(vx, y, k, seg, stream);
+}
+
+void ggml_sycl_q8_0_reordered_to_fp16_nc(const void * vx, sycl::half * y, int64_t ne00, int64_t ne01,
+                                         int64_t ne02, int64_t ne03, size_t nb01, size_t nb02, size_t nb03, int seg,
+                                         dpct::queue_ptr stream) {
+    ggml_sycl_q8_0_reordered_to_fp16_nc_t<sycl::half>(vx, y, ne00, ne01, ne02, ne03, nb01, nb02, nb03, seg, stream);
+}
+
+void ggml_sycl_q8_0_reordered_to_fp32_nc(const void * vx, float * y, int64_t ne00, int64_t ne01,
+                                         int64_t ne02, int64_t ne03, size_t nb01, size_t nb02, size_t nb03, int seg,
+                                         dpct::queue_ptr stream) {
+    ggml_sycl_q8_0_reordered_to_fp16_nc_t<float>(vx, y, ne00, ne01, ne02, ne03, nb01, nb02, nb03, seg, stream);
+}
+
 to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
     switch (type) {
         case GGML_TYPE_Q1_0:

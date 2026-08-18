@@ -97,6 +97,19 @@ void gated_delta_net_sycl(
             k_reg[r]    = k_t[i];
         }
 
+        // v for this token, issued here rather than at its first use. Its address is a
+        // function of t and col alone -- nothing in the iteration computes it -- yet at
+        // the point of use it sits behind C+1 warp reductions, so its global-load latency
+        // is fully exposed on a loop that is already latency-bound. dst never aliases a
+        // src for this op (GATED_DELTA_NET is absent from ggml_op_can_inplace's
+        // whitelist), and v is read-only here, so this is a pure reordering: the values
+        // and the arithmetic are unchanged, bit for bit.
+        float v_reg[C];
+#pragma unroll
+        for (int c = 0; c < C; c++) {
+            v_reg[c] = v_t[col0 + c];
+        }
+
         if constexpr (!KDA) {
             const float g_val = sycl::native::exp(*g_t);
 
@@ -139,7 +152,7 @@ void gated_delta_net_sycl(
 #pragma unroll
             for (int c = 0; c < C; c++) {
                 // delta[col] = (v[col] - g * kv[col]) * beta
-                const float delta_col = (v_t[col0 + c] - g_val * kv_col[c]) * beta_val;
+                const float delta_col = (v_reg[c] - g_val * kv_col[c]) * beta_val;
 
                 // S[i][col] = g * S[i][col] + k[i] * delta[col]
 #pragma unroll
@@ -190,7 +203,7 @@ void gated_delta_net_sycl(
 #pragma unroll
             for (int c = 0; c < C; c++) {
                 // delta[col] = (v[col] - kv[col]) * beta
-                const float delta_col = (v_t[col0 + c] - kv_col[c]) * beta_val;
+                const float delta_col = (v_reg[c] - kv_col[c]) * beta_val;
 
                 // S[i][col] = g[i] * S[i][col] + k[i] * delta[col]
 #pragma unroll

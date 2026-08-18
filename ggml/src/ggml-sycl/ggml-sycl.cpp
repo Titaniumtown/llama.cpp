@@ -2646,6 +2646,52 @@ catch (sycl::exception const &exc) {
 // non-static: fattn-common.hpp marks the FA K/V dequant, which is not a graph node.
 void ggml_sycl_prof_mark_sub(const std::string & name, uint64_t bytes);
 
+// 0 disables the src1 f16 conversion cache, restoring a fresh conversion per matmul.
+static inline bool ggml_sycl_src1_cache_enabled() {
+    static const int e = ggml_sycl_get_env("GGML_SYCL_SRC1_CACHE", 1);
+    return e != 0;
+}
+
+static inline bool src1_f16_overlaps(const ggml_backend_sycl_context & ctx, const void * p, size_t bytes) {
+    const char * a0 = (const char *) p;
+    const char * a1 = a0 + bytes;
+    const char * b0 = (const char *) ctx.src1_f16.key;
+    const char * b1 = b0 + ctx.src1_f16.ne * sizeof(float);
+    return a0 < b1 && b0 < a1;
+}
+
+// Hit only when the same slice was converted earlier in THIS graph and no node between
+// then and now writes over it. The walk is over graph nodes, which is a superset of what
+// executed, so a fused path that skipped nodes cannot hide a write. Bounded because a
+// distant reuse is not worth the scan.
+static sycl::half * src1_f16_lookup(ggml_backend_sycl_context & ctx, const void * key,
+                                    const void * strm, size_t ne) {
+    auto & c = ctx.src1_f16;
+    if (!c.buf || c.key != key || c.stream != strm || c.ne != ne) { return nullptr; }
+    if (ctx.cur_graph == nullptr || c.graph != ctx.cur_graph)     { return nullptr; }
+    if (ctx.cur_node < c.node || ctx.cur_node - c.node > 64)      { return nullptr; }
+    for (int j = c.node + 1; j <= ctx.cur_node; ++j) {
+        const ggml_tensor * n = ctx.cur_graph->nodes[j];
+        if (n->data != nullptr && src1_f16_overlaps(ctx, n->data, ggml_nbytes(n))) {
+            return nullptr;
+        }
+    }
+    return c.buf->get();
+}
+
+static sycl::half * src1_f16_store(ggml_backend_sycl_context & ctx, const void * key,
+                                   const void * strm, size_t ne) {
+    auto & c = ctx.src1_f16;
+    c.buf = std::make_unique<ggml_sycl_pool_alloc<sycl::half>>(ctx.src1_pool());
+    c.buf->alloc(ne);
+    c.graph  = ctx.cur_graph;
+    c.key    = key;
+    c.stream = strm;
+    c.ne     = ne;
+    c.node   = ctx.cur_node;
+    return c.buf->get();
+}
+
 inline void ggml_sycl_op_mul_mat_sycl(
     ggml_backend_sycl_context & ctx,
     const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
@@ -2729,20 +2775,34 @@ inline void ggml_sycl_op_mul_mat_sycl(
                                          : src0_as_f16.get();
 
         ggml_sycl_pool_alloc<sycl::half> src1_as_f16(ctx.pool());
-        if (src1->type != GGML_TYPE_F16) {
-            scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_sycl", dst, /*num_src=*/2,
-                                                 " : converting src1 to fp16");
-            const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src1->type, dst);
-            GGML_ASSERT(to_fp16_sycl != nullptr);
-            size_t ne = src1_ncols*ne10;
-            src1_as_f16.alloc(ne);
-            to_fp16_sycl(src1_ddf_i, src1_as_f16.get(), ne, stream);
-            ggml_sycl_prof_mark_sub("CONVERT/src1/f32->f16",
-                                    ne * (sizeof(float) + sizeof(sycl::half)));
+        const sycl::half * src1_ptr = nullptr;
+        if (src1->type == GGML_TYPE_F16) {
+            src1_ptr = (const sycl::half *) src1->data + src1_padded_row_size;
+        } else {
+            const size_t ne    = src1_ncols * ne10;
+            const bool   cache = ggml_sycl_src1_cache_enabled();
+            sycl::half * hit   = cache ? src1_f16_lookup(ctx, src1_ddf_i, (const void *) stream, ne)
+                                       : nullptr;
+            if (hit != nullptr) {
+                src1_ptr = hit;
+            } else {
+                scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_sycl", dst, /*num_src=*/2,
+                                                     " : converting src1 to fp16");
+                const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src1->type, dst);
+                GGML_ASSERT(to_fp16_sycl != nullptr);
+                sycl::half * out;
+                if (cache) {
+                    out = src1_f16_store(ctx, src1_ddf_i, (const void *) stream, ne);
+                } else {
+                    src1_as_f16.alloc(ne);
+                    out = src1_as_f16.get();
+                }
+                to_fp16_sycl(src1_ddf_i, out, ne, stream);
+                ggml_sycl_prof_mark_sub("CONVERT/src1/f32->f16",
+                                        ne * (sizeof(float) + sizeof(sycl::half)));
+                src1_ptr = out;
+            }
         }
-        const sycl::half *src1_ptr = src1->type == GGML_TYPE_F16
-                ? (const sycl::half *)src1->data + src1_padded_row_size
-                                         : src1_as_f16.get();
 
 #if GGML_SYCL_DNNL
         if (g_ggml_sycl_enable_dnn) {
@@ -5892,11 +5952,16 @@ void ggml_sycl_prof_mark_sub(const std::string & name, uint64_t bytes) {
 
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
+    // A tensor's bytes can be written between graphs (ggml_backend_tensor_set), and buffer
+    // addresses are reused across graphs, so nothing survives the boundary.
+    sycl_ctx->src1_f16_reset();
+    sycl_ctx->cur_graph = cgraph;
     ggml_sycl_op_prof prof;
     prof.begin(sycl_ctx->stream());
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        sycl_ctx->cur_node = i;
         if (ggml_sycl_is_view_or_noop(node)) {
             continue;
         }

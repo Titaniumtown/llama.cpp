@@ -348,6 +348,49 @@ struct ggml_backend_sycl_context {
     std::string name;
     optimize_feature opt_feature;
 
+    // f32->f16 conversion cache for a matmul's src1. Several projections inside one block
+    // read the SAME activation tensor -- Qwen3Next builds wq/wk/wv from one `cur` and
+    // wqkv/wqkv_gate from one `input` -- but ggml_sycl_op_mul_mat_sycl converts src1 into a
+    // per-call pool allocation, so the identical bytes are converted 2-3 times per block.
+    //
+    // Reuse is valid only while nothing has overwritten the source. That is checked against
+    // the GRAPH rather than the executed node sequence, so the fusion paths that advance `i`
+    // past several nodes are covered without each one having to remember to invalidate.
+    struct src1_f16_cache {
+        const ggml_cgraph * graph  = nullptr;
+        const void *        key    = nullptr;  // src1_ddf_i of the cached slice
+        const void *        stream = nullptr;  // separates the multi-device split path
+        size_t              ne     = 0;        // elements converted
+        int                 node   = -1;       // graph node index it was produced at
+        std::unique_ptr<ggml_sycl_pool_alloc<sycl::half>> buf;
+    } src1_f16;
+
+    // set by the graph walker so the matmul op can locate itself in the graph
+    const ggml_cgraph * cur_graph = nullptr;
+    int                 cur_node  = -1;
+
+    // The general device pool is stack-disciplined (it asserts that a free is the top of
+    // the stack), so a buffer held across nodes cannot live there. Give the cache its own
+    // pool -- it is the only allocation in it, so LIFO is trivially satisfied. Mirrors the
+    // existing host_pools / fattn_bufs pattern.
+    std::unique_ptr<ggml_sycl_pool> src1_pools[GGML_SYCL_MAX_DEVICES];
+
+    ggml_sycl_pool & src1_pool(int device) {
+        if (src1_pools[device] == nullptr) {
+            src1_pools[device] = new_pool_for_device(stream(device, 0), device);
+        }
+        return *src1_pools[device];
+    }
+
+    ggml_sycl_pool & src1_pool() { return src1_pool(device); }
+
+    void src1_f16_reset() {
+        src1_f16.buf.reset();
+        src1_f16.graph = nullptr;
+        src1_f16.key   = nullptr;
+        src1_f16.node  = -1;
+    }
+
     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
 
     explicit ggml_backend_sycl_context(int device) :
@@ -355,6 +398,17 @@ struct ggml_backend_sycl_context {
         name(GGML_SYCL_NAME + std::to_string(device)) {
         opt_feature = ggml_sycl_info().devices[device].opt_feature;
     }
+
+    // src1_f16.buf is owned by src1_pools, and members are destroyed in REVERSE declaration
+    // order -- so the pools die first and ggml_sycl_pool_alloc's destructor then calls free()
+    // on a dead pool. Releasing the cache here works regardless of declaration order, because
+    // a destructor body runs before any member is destroyed.
+    //
+    // This is not theoretical: it segfaulted at exit on every process that ran a prefill, and
+    // on no decode-only one -- decode's ne1 == 1 takes mmvq, never converts src1, and so never
+    // populates the cache. The results had already been printed by then, which is exactly what
+    // makes it easy to miss.
+    ~ggml_backend_sycl_context() { src1_f16_reset(); }
 
     queue_ptr stream(int device, int stream) {
         if (qptrs[device][stream] == nullptr) {

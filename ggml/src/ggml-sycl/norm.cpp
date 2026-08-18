@@ -164,7 +164,7 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols,
     const float* mul = nullptr, const int64_t mul_stride_row = 0, const int64_t mul_stride_channel = 0,
     const int64_t mul_stride_sample = 0, const int mul_nrows = 0, const int mul_nchannels = 0, const int mul_nsamples = 0,
     const float* add_b = nullptr, float* add_out = nullptr, sycl::half * mir = nullptr,
-    char * q8_out = nullptr, int q8_kx = 0) {
+    char * q8_out = nullptr, int q8_kx = 0, int q8_row_stride = 0) {
 
     const int nrows = item_ct1.get_group_range(2);
     const int nchannels = item_ct1.get_group_range(1);
@@ -186,6 +186,12 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols,
     if constexpr (do_mirror) {
         // only enabled for a contiguous dst, so dst's own offset and stride index it too
         mir += dst_offset;
+    }
+    if (q8_out != nullptr) {
+        // q8_1 rows are padded to MATRIX_ROW_PADDING, so this stride is NOT dst's -- it is the
+        // one ggml_sycl_op_mul_mat derives from src1_padded_col_size, and the two differ
+        // whenever ne00 is not a multiple of 512.
+        q8_out += (size_t) row * (size_t) q8_row_stride;
     }
 
     if constexpr (do_multiply) {
@@ -493,7 +499,7 @@ static void rms_norm_mul_f32_sycl(const float* x, const float* mul, float* dst, 
         const int mul_nrows, const int mul_nchannels, const int mul_nsamples,
         const float eps, queue_ptr stream, int device,
         const float * add_b = nullptr, float * add_out = nullptr, sycl::half * mir = nullptr,
-        char * q8_out = nullptr, int q8_kx = 0) {
+        char * q8_out = nullptr, int q8_kx = 0, int q8_row_stride = 0) {
     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
     const auto body = [&](auto mirror_tag) {
     constexpr bool MIR = decltype(mirror_tag)::value;
@@ -509,7 +515,7 @@ static void rms_norm_mul_f32_sycl(const float* x, const float* mul, float* dst, 
                         dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
                         eps, item_ct1, nullptr, WARP_SIZE,
                         mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples,
-                        add_b, add_out, mir, q8_out, q8_kx);
+                        add_b, add_out, mir, q8_out, q8_kx, q8_row_stride);
                 });
             });
     }
@@ -528,7 +534,7 @@ static void rms_norm_mul_f32_sycl(const float* x, const float* mul, float* dst, 
                         dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
                         eps, item_ct1, get_pointer(s_sum_acc_ct1), work_group_size,
                         mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples,
-                        add_b, add_out, mir, q8_out, q8_kx);
+                        add_b, add_out, mir, q8_out, q8_kx, q8_row_stride);
                 });
             });
     }
@@ -744,15 +750,23 @@ void ggml_sycl_op_rms_norm(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 // yields exactly zero has to be able to say which condition rejected it.
 static char * norm_q8_emit_target(ggml_backend_sycl_context & ctx, const ggml_tensor * out,
                                   int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
-                                  int64_t d00, const void * strm, const char * site, int * q8_kx) {
+                                  int64_t d00, const void * strm, const char * site, int * q8_kx,
+                                  int * q8_row_stride) {
     static const int emit_q8 = ggml_sycl_get_env("GGML_SYCL_NORM_EMIT_Q8", 1);
     static const int trace   = ggml_sycl_get_env("GGML_SYCL_NORM_EMIT_Q8_TRACE", 0);
-    *q8_kx = 0;
+    *q8_kx         = 0;
+    *q8_row_stride = 0;
     if (emit_q8 != 1) { return nullptr; }
 
     const char * why = nullptr;
     int bs = 0;
-    if (ne01 != 1 || ne02 != 1 || ne03 != 1)  { why = "multi-row"; }
+    if (ne02 != 1 || ne03 != 1)               { why = "multi-plane"; }
+    // Emit only where a consumer could possibly use it. can_use_mul_mat_vec_q requires
+    // src1->ne[1] <= MMVQ_MAX_BATCH_SIZE; wider than that the mat-mul takes the f16 GEMM path,
+    // which never looks up the q8_1 cache, so the emission is pure wasted traffic. Measured:
+    // without this bound a `-d 8192` run emits ne=[5120,512] and ne=[5120,16] during its
+    // prefill and single-token decode goes 26.29 -> 26.23 (3 pairs), turning a win into a loss.
+    else if (ne01 > MMVQ_MAX_BATCH_SIZE)      { why = "gemm-width"; }
     else if (ne00 % QK8_1 != 0)               { why = "ne00%QK8_1"; }
     else if (!ggml_is_contiguous(out))        { why = "noncontig"; }
     else if (d00 != 1)                        { why = "d00!=1"; }
@@ -768,15 +782,17 @@ static char * norm_q8_emit_target(ggml_backend_sycl_context & ctx, const ggml_te
         return nullptr;
     }
 
-    const int64_t padded = GGML_PAD(ne00, MATRIX_ROW_PADDING);
-    const size_t  bytes  = (size_t) padded * sizeof(block_q8_1) / QK8_1;
+    const int64_t padded  = GGML_PAD(ne00, MATRIX_ROW_PADDING);
+    const size_t  rstride = (size_t) padded * sizeof(block_q8_1) / QK8_1;
+    const size_t  bytes   = rstride * (size_t) ne01;
     const size_t  src_ne = (size_t) ggml_nelements(out);
     char * p = ggml_sycl_src1_q8_store_ext(ctx, (const void *) out->data, strm, bytes, src_ne, /*SoA=*/1, out);
     if (trace) {
-        fprintf(stderr, "[NQ8] %s EMIT ne00=%ld bytes=%zu src_ne=%zu key=%p\n", site,
-                (long) ne00, bytes, src_ne, (const void *) out->data);
+        fprintf(stderr, "[NQ8] %s EMIT ne=[%ld,%ld] bytes=%zu src_ne=%zu key=%p\n", site,
+                (long) ne00, (long) ne01, bytes, src_ne, (const void *) out->data);
     }
-    *q8_kx = (int) ne00;
+    *q8_kx         = (int) ne00;
+    *q8_row_stride = (int) rstride;
     return p;
 }
 
@@ -835,14 +851,16 @@ void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor * 
     const int mul_nchannels = mul_src->ne[2];
     const int mul_nsamples  = mul_src->ne[3];
 
-    int    q8_kx  = 0;
+    int    q8_kx         = 0;
+    int    q8_row_stride = 0;
     char * q8_out = norm_q8_emit_target(ctx, mul_tensor, ne00, ne01, ne02, ne03, d00,
-                                        (const void *) main_stream, "fused", &q8_kx);
+                                        (const void *) main_stream, "fused", &q8_kx,
+                                        &q8_row_stride);
 
     rms_norm_mul_f32_sycl(src0_dd, mul_dd, dst_dd, ne00, ne01, ne02, ne03,
         s00, s01, s02, s03, d00, d01, d02, d03,
         mul_s01, mul_s02, mul_s03, mul_nrows, mul_nchannels, mul_nsamples, eps, main_stream, ctx.device,
-        nullptr, nullptr, nullptr, q8_out, q8_kx);
+        nullptr, nullptr, nullptr, q8_out, q8_kx, q8_row_stride);
 }
 
 void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context & ctx, ggml_tensor * rms_norm,
@@ -923,14 +941,16 @@ void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context & ctx, ggml_tenso
                                                    (size_t) ggml_nelements(mul_tensor));
     }
 
-    int    q8_kx  = 0;
+    int    q8_kx         = 0;
+    int    q8_row_stride = 0;
     char * q8_out = norm_q8_emit_target(ctx, mul_tensor, ne00, ne01, ne02, ne03, d00,
-                                        (const void *) main_stream, "fused_add", &q8_kx);
+                                        (const void *) main_stream, "fused_add", &q8_kx,
+                                        &q8_row_stride);
 
     rms_norm_mul_f32_sycl<true>(src0_dd, mul_dd, dst_dd, ne00, ne01, ne02, ne03,
         s00, s01, s02, s03, d00, d01, d02, d03,
         mul_s01, mul_s02, mul_s03, mul_nrows, mul_nchannels, mul_nsamples, eps, main_stream, ctx.device,
-        add_b_dd, add_dd, mir, q8_out, q8_kx);
+        add_b_dd, add_dd, mir, q8_out, q8_kx, q8_row_stride);
 }
 
 void ggml_sycl_op_rms_norm_back(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {

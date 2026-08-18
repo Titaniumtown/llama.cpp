@@ -254,6 +254,39 @@ static __dpct_inline__ float vec_dot_q4_K_q8_1_impl_vmmq(
     return dm4f.x() * sumf_d - dm4f.y() * sumf_m;
 }
 
+// Reorder q4_K vec-dot: reuse the stored q8_1 activation sum (ds.y() = s8) for the min
+// term instead of recomputing dp4a(0x01010101, u) (dot2). s8 is the full q8_1 block sum
+// (== Sum(act) for the sub-block min); the mmvq splits each q8_1 block across QI8_1/2 iqs
+// chunks, so the min MUST be added on exactly one chunk (add_min). Adding it on every
+// chunk overcounts by QI8_1/2 -> garbage. The dot1 (main) term still runs every chunk.
+static __dpct_inline__ float vec_dot_q4_K_q8_1_impl_vmmq_presum(
+    const int *__restrict__ v, const int *__restrict__ u,
+    const uint8_t *__restrict__ sc, const uint8_t *__restrict__ m,
+    const sycl::half2 &dm4, const float *__restrict__ d8,
+    const float *__restrict__ s8, const bool add_min) {
+
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        const int v0i = (v[0] >> (4*i)) & 0x0F0F0F0F;
+        const int v1i = (v[1] >> (4*i)) & 0x0F0F0F0F;
+
+        const int dot1 =
+            dpct::dp4a(v1i, u[2 * i + 1],
+                       dpct::dp4a(v0i, u[2 * i + 0], 0)); // SIMD dot product
+
+        sumf_d += d8[i] * (dot1 * sc[i]);
+        sumf_m += add_min ? (s8[i] * m[i]) : 0.0f;  // Sum(act)*min, added once per block
+    }
+
+    const sycl::float2 dm4f =
+        dm4.convert<float, sycl::rounding_mode::automatic>();
+
+    return dm4f.x() * sumf_d - dm4f.y() * sumf_m;
+}
+
 
 #define VDR_Q5_K_Q8_1_MMVQ 2
 
@@ -288,6 +321,41 @@ static __dpct_inline__ float vec_dot_q5_K_q8_1_impl_vmmq(
         sumf_d += d8[i] * (dot1 * sc[i]);
         sumf_m += d8[i] * (dot2 * m[i]);
 
+    }
+
+    const sycl::float2 dm5f =
+        dm5.convert<float, sycl::rounding_mode::automatic>();
+
+    return dm5f.x() * sumf_d - dm5f.y() * sumf_m;
+}
+
+// Reorder q5_K vec-dot: same presum scheme as q4_K (see above).
+static __dpct_inline__ float vec_dot_q5_K_q8_1_impl_vmmq_presum(
+    const int *__restrict__ vl, const int *__restrict__ vh,
+    const int *__restrict__ u, const uint8_t *__restrict__ sc,
+    const uint8_t *__restrict__ m, const sycl::half2 &dm5,
+    const float *__restrict__ d8, const float *__restrict__ s8, const bool add_min) {
+
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR5_K; ++i) {
+        const int vl0i = (vl[0] >> (4*i)) & 0x0F0F0F0F;
+        const int vl1i = (vl[1] >> (4*i)) & 0x0F0F0F0F;
+
+        const int vh0i = ((vh[0] >> i) << 4) & 0x10101010;
+        const int vh1i = ((vh[1] >> i) << 4) & 0x10101010;
+
+        const int v0i = vl0i | vh0i;
+        const int v1i = vl1i | vh1i;
+
+        const int dot1 =
+            dpct::dp4a(v0i, u[2 * i + 0],
+                       dpct::dp4a(v1i, u[2 * i + 1], 0)); // SIMD dot product
+
+        sumf_d += d8[i] * (dot1 * sc[i]);
+        sumf_m += add_min ? (s8[i] * m[i]) : 0.0f;
     }
 
     const sycl::float2 dm5f =
@@ -522,6 +590,7 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K> {
         int   v[2];
         int   u[2 * QR4_K];
         float d8[QR4_K];
+        float s8[QR4_K];
 
         v[0] = q4[0];
         v[1] = q4[4];
@@ -544,13 +613,15 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K> {
             sycl::half2 ds_values = *(q8_1_ds + bq8_offset + i);
 
             d8[i]                   = ds_values[0];
+            s8[i]                   = ds_values[1];
 
             const int * q8 = (const int *) quant_base_ptr + ((iqs / 2) % 4);
             u[2 * i + 0]   = q8[0];
             u[2 * i + 1]   = q8[4];
         }
 
-        return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, *dms, d8);
+        const bool add_min = ((iqs / 2) % (QI8_1 / 2)) == 0;
+        return vec_dot_q4_K_q8_1_impl_vmmq_presum(v, u, sc, m, *dms, d8, s8, add_min);
     }
 };
 
@@ -578,6 +649,7 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q5_K> {
         int   vh[2];
         int   u[2 * QR5_K];
         float d8[QR5_K];
+        float s8[QR5_K];
 
         vl[0] = ql_ptr[0];
         vl[1] = ql_ptr[4];
@@ -603,13 +675,15 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q5_K> {
             sycl::half2 ds_values = *(q8_1_ds + bq8_offset + i);
 
             d8[i]                   = ds_values[0];
+            s8[i]                   = ds_values[1];
 
             const int * q8 = (const int *) quant_base_ptr + ((iqs / 2) % 4);
             u[2 * i + 0]   = q8[0];
             u[2 * i + 1]   = q8[4];
         }
 
-        return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, *dms, d8);
+        const bool add_min = ((iqs / 2) % (QI8_1 / 2)) == 0;
+        return vec_dot_q5_K_q8_1_impl_vmmq_presum(vl, vh, u, sc, m, *dms, d8, s8, add_min);
     }
 };
 

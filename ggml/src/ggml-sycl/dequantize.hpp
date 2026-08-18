@@ -848,31 +848,69 @@ static void dequantize_block_q4_0_reorder(const void * __restrict__ vx, dst_t * 
 }
 
 // Dequantize Q8_0 from reorder layout: [all qs (k bytes)][all d values]
-// Each thread handles one block of QK8_0 elements.
+//
+// Each work-item takes GGML_SYCL_Q8_0_DEQ_EPT CONTIGUOUS elements: one 16-byte load and wide
+// stores. It replaces a version that gave each work-item a whole QK8_0 block and walked it
+// with a scalar loop, which measured 98 GB/s -- 5x below the generic (non-reorder) q8_0
+// dequant on identical work, for the simplest quant format in the file.
+//
+// Standalone kernel bench on B70, 6144x5120 = the real ssm_out shape, bytes counted as
+// quantized-in + f16-out, best of several runs:
+//
+//     generic  2 elem/item, interleaved layout          183.6 us   524.7 GB/s
+//     reorder 32 elem/item wg=32  sg=32   (previous)    979.5 us    98.4 GB/s
+//     reorder 32 elem/item wg=256 no sg attr            895.0 us   107.6 GB/s
+//     reorder 16 elem/item wg=256, SCALAR stores        406.1 us   237.2 GB/s
+//     reorder 16 elem/item wg=256, int4 + vec8 stores   111.5 us   863.8 GB/s  <- this
+//     (floor: same kernel with no scale load at all)    125.4 us   768.3 GB/s
+//
+// Two things in that table are worth keeping:
+//
+//   * The wide STORES are what matter, not the load. An earlier attempt vectorised the load
+//     (sycl::int4) but left `for (l) y[l] = d * q[l]`, assuming the compiler would merge eight
+//     adjacent 2-byte stores; it does not, and that variant landed at 237 GB/s. It measured as
+//     a no-op end-to-end and was nearly written off as "the access pattern is not the problem".
+//   * The result is at the streaming floor (the no-scale variant is not faster), so there is
+//     nothing further here -- this row is done, and the remaining reorder-dequant prize is in
+//     the other types (q4_K reorder 386.8 GB/s vs generic 515.3 on the same measurement).
+//
+// EPT == 16 keeps the load 16-byte aligned and, since QK8_0 % EPT == 0, keeps a chunk inside
+// one block so it needs exactly one scale.
+#define GGML_SYCL_Q8_0_DEQ_EPT 16
+
 template<typename dst_t>
 static void dequantize_block_q8_0_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t k,
                                   const sycl::nd_item<3> &item_ct1) {
+    constexpr int EPT = GGML_SYCL_Q8_0_DEQ_EPT;
+    static_assert(QK8_0 % EPT == 0, "a chunk must not straddle two q8_0 blocks");
+    static_assert(EPT % 8 == 0,     "the store loop below emits sycl::vec<dst_t, 8>");
 
-    const int64_t i = item_ct1.get_group(2);
-    const int64_t tid = item_ct1.get_local_id(2);
-    const int lane_ib = i * WARP_SIZE + tid;
+    const int64_t gid = (int64_t) item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+                        item_ct1.get_local_id(2);
+    const int64_t e0  = gid * EPT;
 
-    if (lane_ib >= k / QK8_0) {
+    // k is a multiple of QK8_0 and e0 of EPT, so e0 < k implies the whole chunk is in range.
+    if (e0 >= k) {
         return;
     }
 
-    dst_t * y_ptr = yy + lane_ib * QK8_0;
+    const float d = float(*((const sycl::half *) ((const uint8_t *) vx + k) + e0 / QK8_0));
 
-    auto qs = (const int8_t*)vx + lane_ib * QK8_0;
-    auto s_ptr = (const sycl::half*)((const uint8_t*)vx + k) + lane_ib;
+    // One 16-byte load. vx is a device allocation and e0 is a multiple of EPT.
+    const sycl::int4 packed = *(const sycl::int4 *) ((const int8_t *) vx + e0);
+    const int8_t *   q      = (const int8_t *) &packed;
 
-    const float d = float(*s_ptr);
-
+    // dst_t is half or float; e0 % 16 == 0 makes both vec<dst_t, 8> stores naturally aligned.
+    dst_t * y = yy + e0;
 #pragma unroll
-    for (int l = 0; l < QK8_0; ++l) {
-        y_ptr[l] = d * qs[l];
+    for (int j = 0; j < EPT / 8; ++j) {
+        sycl::vec<dst_t, 8> o;
+#pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            o[l] = d * q[8 * j + l];
+        }
+        *(sycl::vec<dst_t, 8> *) (y + 8 * j) = o;
     }
-
 }
 
 template<typename dst_t>

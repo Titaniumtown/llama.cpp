@@ -3661,6 +3661,77 @@ struct test_add_rms_norm : public test_case {
     }
 };
 
+// GGML_OP_ADD + GGML_OP_RMS_NORM + GGML_OP_MUL (fused operation)
+// This is the shape every transformer block ends with: a residual add whose sum is read
+// TWICE -- once by the norm that follows it, once by the next block's residual. The second
+// use is what makes the sum a real output, so a backend that folds the add into the norm
+// must still write it. Consuming the sum again below is therefore the point of the test:
+// a fused kernel that computes the right normed output but forgets the sum fails here.
+struct test_add_rms_norm_mul : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_RMS_NORM_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(type, ne, eps);
+    }
+
+    test_add_rms_norm_mul(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {64, 5, 4, 3}, float eps = 1e-6f)
+        : type(type), ne(ne), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const std::array<int64_t, 4> wne = {ne[0], 1, 1, 1};
+
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor(ctx, type, 4, wne.data());
+
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+        ggml_set_param(b);
+        ggml_set_name(b, "b");
+        ggml_set_param(w);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * sum = ggml_add(ctx, a, b);
+        ggml_set_name(sum, "sum");
+
+        ggml_tensor * normed = ggml_rms_norm(ctx, sum, eps);
+        ggml_set_name(normed, "normed");
+
+        ggml_tensor * scaled = ggml_mul(ctx, normed, w);
+        ggml_set_name(scaled, "scaled");
+
+        // second consumer of the sum -- the residual of the next block
+        ggml_tensor * out = ggml_add(ctx, scaled, sum);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+
+    float grad_eps() override {
+        return 1.0f;
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+};
+
 // GGML_OP_UNARY(RELU) + GGML_OP_SQR (fused operation)
 struct test_relu_sqr : public test_case {
     const ggml_type type;
@@ -8997,6 +9068,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
+            test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, { n, 5, 4, 3 }, eps));
         }
     }
     for (uint32_t n : {1, 511, 1025, 8192, 33*512}) {
@@ -9004,6 +9076,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false, multi_add));
         }
         test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false));
+        test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f));
     }
 
     for (auto multi_add : {false, true}) {

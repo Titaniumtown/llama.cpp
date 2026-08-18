@@ -63,6 +63,14 @@ static constexpr uint32_t ggml_sycl_fattn_tile_get_config_fp16(const int DKQ, co
 
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  2,  64, 2,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 2,  64,  64)
+    // ncols 6 and 12 exist so gqa_ratio 6 can be packed whole (see the ncols2 == 6 path
+    // in launch_fattn_tile_switch_ncols1). nthreads is 192 so nwarps divides ncols
+    // exactly -- 6 warps, cpw 1 for ncols 6 and cpw 2 for ncols 12 -- which is what the
+    // cpw/np static_asserts in flash_attn_tile require. Other fields mirror the
+    // neighbouring power-of-two rows.
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  6, 384, 2,  64,  64)
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 12, 384, 2,  64,  64)
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 24, 384, 2,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  8, 256, 2,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 2,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  64,  64)
@@ -126,6 +134,10 @@ static constexpr uint32_t ggml_sycl_fattn_tile_get_config_fp32(const int DKQ, co
 
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  2, 128, 3,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 3,  32,  64)
+    // see the fp16 table above for why 6 and 12 exist and why nthreads is 192
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  6, 192, 2,  32, 256)
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 12, 192, 2,  32, 128)
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 24, 192, 2,  32,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  8, 256, 2,  32, 256)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 2,  32, 128)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  32,  64)
@@ -1078,8 +1090,51 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_sycl_context & ctx, ggm
 
     constexpr size_t nbytes_shared = 0;
 
+    // ncols2 == 6 is handled up front and deliberately narrowly. The generic chain below
+    // derives ncols1 as cols_per_block/ncols2 for cols_per_block in {32,16,8,4,2}, which
+    // for ncols2 == 6 asks for ncols totals of 30 and 12 -- and 30 has no kernel config,
+    // so merely instantiating that branch is a compile error. Only ncols1 1 and 2 are
+    // ever useful here anyway: this path exists for decode and short speculative
+    // batches, and ncols1 * 6 covers Q->ne[1] up to 12.
+    if constexpr (ncols2 == 6) {
+        if (Q->ne[1] > 2) {
+            // 4 queries x 6 heads in one tile. Speculative decode verifies
+            // spec-draft-n-max + 1 tokens at once (4 in production), and with
+            // ncols1 = 2 that needs two tiles, each re-reading the whole cache.
+            constexpr int cols_per_block = 24;
+            const int nwarps    = ggml_sycl_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+            const int nbatch_fa = ggml_sycl_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+            launch_fattn<DV, cols_per_block/ncols2, ncols2,
+                flash_attn_tile<DKQ, DV, cols_per_block / ncols2, ncols2, use_logit_softcap, warp_size>, warp_size>
+                (ctx, dst, nwarps, nbytes_shared, nbatch_fa, true, true, false);
+            return;
+        }
+        if (Q->ne[1] > 1) {
+            constexpr int cols_per_block = 12;
+            const int nwarps    = ggml_sycl_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+            const int nbatch_fa = ggml_sycl_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+            launch_fattn<DV, cols_per_block/ncols2, ncols2,
+                flash_attn_tile<DKQ, DV, cols_per_block / ncols2, ncols2, use_logit_softcap, warp_size>, warp_size>
+                (ctx, dst, nwarps, nbytes_shared, nbatch_fa, true, true, false);
+            return;
+        }
+        {
+            constexpr int cols_per_block = 6;
+            const int nwarps    = ggml_sycl_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+            const int nbatch_fa = ggml_sycl_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+            launch_fattn<DV, cols_per_block/ncols2, ncols2,
+                flash_attn_tile<DKQ, DV, cols_per_block / ncols2, ncols2, use_logit_softcap, warp_size>, warp_size>
+                (ctx, dst, nwarps, nbytes_shared, nbatch_fa, true, true, false);
+            return;
+        }
+    }
+
     if (DV < 512 && Q->ne[1] < 32) {
-        if constexpr (ncols2 <= 32) {
+        // ncols2 == 6 returns above; exclude it here because 32/6 == 5 would instantiate
+        // an ncols total of 30, which has no kernel config (a compile error even though
+        // the branch is unreachable at runtime). 16/6 and 8/6 give totals of 12 and 6,
+        // both of which are defined.
+        if constexpr (ncols2 <= 32 && ncols2 != 6) {
             if (Q->ne[1] > 16/ncols2) {
                 constexpr int cols_per_block = 32;
                 const int nwarps    = ggml_sycl_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
@@ -1194,6 +1249,19 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_sycl_context & ctx, ggm
             launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap>(ctx, dst);
             return;
         }
+        // gqa_ratio is not always a power of two. This model is 24 heads / 4 KV heads =
+        // 6, which falls past %8 and %4 to %2, so each KV head is split across
+        // ceil(6/2) = 3 tiles and every one of them streams that head's entire cache.
+        // Packing all 6 query heads into one tile reads it once instead of three times.
+        // Scoped to the 256/256 head size this was measured on -- widening it means
+        // instantiating ncols2=6 for every head size and re-running the same A/B.
+        if constexpr (DKQ == 256 && DV == 256) {
+            if (use_gqa_opt && gqa_ratio % 6 == 0) {
+                launch_fattn_tile_switch_ncols1<DKQ, DV, 6, use_logit_softcap>(ctx, dst);
+                return;
+            }
+        }
+
 
         if (use_gqa_opt && gqa_ratio % 4 == 0) {
             launch_fattn_tile_switch_ncols1<DKQ, DV, 4, use_logit_softcap>(ctx, dst);

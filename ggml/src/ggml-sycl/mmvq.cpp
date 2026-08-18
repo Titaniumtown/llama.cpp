@@ -2454,6 +2454,7 @@ static void mul_mat_vec_q5_K_reorder_wide_ncols(const void * __restrict__ vx, co
 template <int ncols_dst>
 static void mul_mat_vec_q6_K_reorder_wide_ncols(const void * __restrict__ vx, const void * __restrict__ vy,
                                                 float * __restrict__ dst, const int ncols, const int nrows,
+                                                const int nrows_compute,
                                                 const int stride_col_y_bytes, const int stride_col_dst,
                                                 const sycl::nd_item<3> & nd_item) {
     using block_type   = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q6_K>;
@@ -2462,6 +2463,24 @@ static void mul_mat_vec_q6_K_reorder_wide_ncols(const void * __restrict__ vx, co
     const int  sg_range = sg.get_group_linear_range();
     const int  row      = nd_item.get_group_linear_id() * sg_range + sg.get_group_linear_id();
     if (row >= nrows) {
+        return;
+    }
+
+    // Rows at or above the limit are not computed, which is the entire point: their weights
+    // are never read, and the weight read is the whole cost of a decode mat-vec. They must
+    // still be WRITTEN. dst is graph scratch, so leaving them alone hands the sampler
+    // whatever the previous graph left there -- stale logits that can and will win an
+    // argmax. -INFINITY is the one value that cannot: it loses every comparison and is
+    // exactly zero after a softmax, so an omitted row is unobservable rather than merely
+    // unlikely. nrows_compute == nrows disables all of this, and is what every caller that
+    // has not opted in passes.
+    if (row >= nrows_compute) {
+        if (sg.leader()) {
+#pragma unroll
+            for (int col = 0; col < ncols_dst; ++col) {
+                dst[col * stride_col_dst + row] = -INFINITY;
+            }
+        }
         return;
     }
 
@@ -2592,7 +2611,7 @@ static void reorder_mul_mat_vec_q5_k_q8_1_sycl_switch_ncols(
 }
 
 static void reorder_mul_mat_vec_q6_k_q8_1_sycl(const void * vx, const void * vy, float * dst, const int ncols,
-                                               const int nrows, dpct::queue_ptr stream) {
+                                               const int nrows, const int nrows_compute, dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
     // Round up to a whole number of subgroup-sized workgroups; out-of-range rows are skipped inside the kernel.
     constexpr size_t num_subgroups = WARP_SIZE;
@@ -2614,7 +2633,7 @@ static void reorder_mul_mat_vec_q6_k_q8_1_sycl(const void * vx, const void * vy,
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                          [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             mul_mat_vec_q6_K_reorder_wide_ncols<1>(vx, vy, dst, ncols, nrows, 0, 0, nd_item);
+                             mul_mat_vec_q6_K_reorder_wide_ncols<1>(vx, vy, dst, ncols, nrows, nrows_compute, 0, 0, nd_item);
                          });
     });
 }
@@ -2622,7 +2641,7 @@ static void reorder_mul_mat_vec_q6_k_q8_1_sycl(const void * vx, const void * vy,
 template <int ncols_dst>
 static void reorder_mul_mat_vec_q6_k_q8_1_sycl_ncols(
         const void * vx, const void * vy, float * dst,
-        const int ncols, const int nrows,
+        const int ncols, const int nrows, const int nrows_compute,
         const int stride_col_y_bytes, const int stride_col_dst,
         dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
@@ -2635,25 +2654,25 @@ static void reorder_mul_mat_vec_q6_k_q8_1_sycl_ncols(
         cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                          [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                              mul_mat_vec_q6_K_reorder_wide_ncols<ncols_dst>(
-                                 vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, nd_item);
+                                 vx, vy, dst, ncols, nrows, nrows_compute, stride_col_y_bytes, stride_col_dst, nd_item);
                          });
     });
 }
 
 static void reorder_mul_mat_vec_q6_k_q8_1_sycl_switch_ncols(
         const void * vx, const void * vy, float * dst,
-        const int ncols, const int nrows, const int ncols_dst,
+        const int ncols, const int nrows, const int nrows_compute, const int ncols_dst,
         const int stride_col_y_bytes, const int stride_col_dst,
         dpct::queue_ptr stream) {
     switch (ncols_dst) {
-        case 1: reorder_mul_mat_vec_q6_k_q8_1_sycl(vx, vy, dst, ncols, nrows, stream); break;
-        case 2: reorder_mul_mat_vec_q6_k_q8_1_sycl_ncols<2>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
-        case 3: reorder_mul_mat_vec_q6_k_q8_1_sycl_ncols<3>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
-        case 4: reorder_mul_mat_vec_q6_k_q8_1_sycl_ncols<4>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
-        case 5: reorder_mul_mat_vec_q6_k_q8_1_sycl_ncols<5>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
-        case 6: reorder_mul_mat_vec_q6_k_q8_1_sycl_ncols<6>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
-        case 7: reorder_mul_mat_vec_q6_k_q8_1_sycl_ncols<7>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
-        case 8: reorder_mul_mat_vec_q6_k_q8_1_sycl_ncols<8>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 1: reorder_mul_mat_vec_q6_k_q8_1_sycl(vx, vy, dst, ncols, nrows, nrows_compute, stream); break;
+        case 2: reorder_mul_mat_vec_q6_k_q8_1_sycl_ncols<2>(vx, vy, dst, ncols, nrows, nrows_compute, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 3: reorder_mul_mat_vec_q6_k_q8_1_sycl_ncols<3>(vx, vy, dst, ncols, nrows, nrows_compute, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 4: reorder_mul_mat_vec_q6_k_q8_1_sycl_ncols<4>(vx, vy, dst, ncols, nrows, nrows_compute, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 5: reorder_mul_mat_vec_q6_k_q8_1_sycl_ncols<5>(vx, vy, dst, ncols, nrows, nrows_compute, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 6: reorder_mul_mat_vec_q6_k_q8_1_sycl_ncols<6>(vx, vy, dst, ncols, nrows, nrows_compute, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 7: reorder_mul_mat_vec_q6_k_q8_1_sycl_ncols<7>(vx, vy, dst, ncols, nrows, nrows_compute, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 8: reorder_mul_mat_vec_q6_k_q8_1_sycl_ncols<8>(vx, vy, dst, ncols, nrows, nrows_compute, stride_col_y_bytes, stride_col_dst, stream); break;
         default: GGML_ABORT("unsupported ncols_dst=%d for Q6_K reorder multi-col MMVQ", ncols_dst);
     }
 }
@@ -2968,6 +2987,25 @@ static void mul_mat_vec_iq4_xs_q8_1_sycl_switch_ncols(
     }
 }
 
+// Translate a graph-level row limit into this device's slice of the output.
+//
+// The limit counts global output rows. Under a tensor split this device owns global rows
+// [row_low, row_high), so a limit falling inside another device's slice must clamp to "all
+// of mine" or "none of mine" rather than being applied verbatim -- applying a global index
+// to a local buffer is how a split turns a speed hint into wrong logits. With no split
+// (row_low == 0) this is just min(limit, row_diff).
+//
+// Returning row_diff means "no limit", which is what an unset op param produces, and is
+// therefore what every op that has not opted in gets.
+static int sycl_mul_mat_row_limit(const ggml_tensor * dst, int64_t row_low, int64_t row_diff) {
+    const int32_t limit = ggml_mul_mat_get_row_limit(dst);
+    if (limit <= 0) {
+        return (int) row_diff;
+    }
+    const int64_t local = limit - row_low;
+    return (int) std::min<int64_t>(std::max<int64_t>(local, (int64_t) 0), row_diff);
+}
+
 void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                                 ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
                                 const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low,
@@ -3220,11 +3258,13 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                         GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q6_k_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
                         reorder_mul_mat_vec_q6_k_q8_1_sycl_switch_ncols(
                             src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
+                            sycl_mul_mat_row_limit(dst, row_low, row_diff),
                             src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
                         return;
                     } else {
                         GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q6_k_q8_1_sycl\n");
-                        reorder_mul_mat_vec_q6_k_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                        reorder_mul_mat_vec_q6_k_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff,
+                                                           sycl_mul_mat_row_limit(dst, row_low, row_diff), stream);
                     }
                 } else if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
                     const int stride_col_y   = src1_padded_col_size / QK8_1;

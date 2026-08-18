@@ -1,6 +1,8 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#include <cstdlib>
+
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
@@ -486,6 +488,62 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, cons
 }
 
 // LLM_GRAPH_TYPE_DECODER_MTP draft head for Qwen3.5/3.6 dense series
+// MTP draft head vocabulary shortlist.
+//
+// A draft step exists only to propose a token that the verify pass then checks against the
+// full head. common_sampler_sample_and_accept_n (common/sampling.cpp) emits the token
+// sampled from the TARGET's logits at every position and uses the draft solely to decide
+// where its loop breaks, drawing exactly one sample per emitted token either way. So the
+// emitted sequence is a function of the target logits and the sampler RNG alone: a worse
+// draft costs speed and cannot change output, greedy or stochastic. That is what makes it
+// safe to compute the draft's logits over a prefix of the vocabulary rather than all of it.
+//
+// A draft step's cost is dominated by reading the LM head once -- 1.043 GB of q6_K for this
+// model against a 21.2 GB iteration -- and there are three of them per iteration at
+// --spec-draft-n-max 3. Restricting the draft to the first K token ids reads K/n_vocab of
+// that. The price is acceptance: a token the drafter would have proposed from outside the
+// shortlist becomes a miss. A *prefix* shortlist is used rather than a frequency-ranked one
+// because the row index then IS the token id, so no index mapping is needed anywhere.
+//
+// Measured on 1,506,648 tokens of this box's actual diet -- C++, Nix, Python, shell and
+// Markdown, i.e. a coding assistant -- tokenized with this model's own tokenizer:
+//
+//     K       coverage   GB saved/iter   ms/token   vs baseline
+//     32768    93.38%       2.72          16.865      -3.11%
+//     65536    97.83%       2.30          16.268      -6.54%
+//     94208    99.79%       1.94          16.157      -7.31%   <- optimum
+//     131072   99.84%       1.48          16.437      -5.56%
+//
+// The curve has an interior maximum because bytes fall linearly in K while coverage
+// saturates. Break-even coverage is 92.2% at K=65536 against 97.8% measured, and the pricing
+// is deliberately worst-case: it charges every miss a full rejection, when a miss on a token
+// the target would have rejected anyway costs nothing.
+//
+// The default is 3/8 of the vocabulary = 93120 here, 1088 rows below the measured optimum on
+// a plateau where everything from 45056 to 139264 beats -5%. That fraction is NOT validated
+// on other vocabularies or corpora; it is safe there only in the sense that a bad K costs
+// throughput and never correctness. LLAMA_MTP_DRAFT_ROW_LIMIT overrides it, 0 disables it.
+static void qwen35_mtp_set_draft_row_limit(ggml_tensor * logits) {
+    // A LoRA-wrapped head is an add, not a mat-mul, and has no row limit to set.
+    if (!logits || logits->op != GGML_OP_MUL_MAT) {
+        return;
+    }
+
+    const int64_t n_vocab = logits->ne[0];
+
+    int64_t k = (n_vocab * 3) / 8;
+    if (const char * env = getenv("LLAMA_MTP_DRAFT_ROW_LIMIT")) {
+        k = atoll(env);
+    } else if (n_vocab < 32768) {
+        // Below this the saving is noise and prefix coverage is at its worst.
+        k = 0;
+    }
+
+    if (k > 0 && k < n_vocab) {
+        ggml_mul_mat_set_row_limit(logits, (int32_t) k);
+    }
+}
+
 llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
     : llm_graph_context(params) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN35 MTP requires n_layer_nextn > 0");
@@ -639,6 +697,8 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
     cur = build_lora_mm(head_w, cur, head_s);
     cb(cur, "result_output", -1);
+
+    qwen35_mtp_set_draft_row_limit(cur);
 
     res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);

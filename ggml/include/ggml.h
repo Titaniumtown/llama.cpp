@@ -1432,6 +1432,21 @@ extern "C" {
 
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
+    // Compute only the first `n` rows of the result; set the remainder to -INFINITY.
+    //
+    // This is a HINT. A backend that does not implement it computes every row exactly, so
+    // ignoring it is always the more-correct behaviour and can never be wrong -- which is
+    // what makes it safe to set unconditionally in a graph that may run anywhere.
+    //
+    // It is meaningful only where the result is a logit vector read by a sampler, because
+    // -INFINITY then means "this token cannot be chosen" and contributes exactly zero after
+    // a softmax. That is a vocabulary shortlist, and it is why the omitted rows are
+    // unobservable rather than merely unlikely.
+    //
+    // n <= 0, or n >= a->ne[0], disables it.
+    GGML_API void    ggml_mul_mat_set_row_limit(struct ggml_tensor * a, int32_t n);
+    GGML_API int32_t ggml_mul_mat_get_row_limit(const struct ggml_tensor * a);
+
     GGML_API void ggml_mul_mat_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);

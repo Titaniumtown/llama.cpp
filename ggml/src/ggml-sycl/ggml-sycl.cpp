@@ -3490,6 +3490,20 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                                     : nullptr;
             if (qhit != nullptr) {
                 dev[i].src1_ddq = qhit;
+                // A hit submits nothing, so without a barrier here the next mark is the
+                // GEMV's and this MUL_MAT row bills every microsecond since the PREVIOUS
+                // op's mark -- all of this call's host setup plus the GPU idle behind it.
+                // That is precisely what mark_gap() exists to prevent, and the miss branch
+                // below has always had it.
+                //
+                // Caching src1 therefore silently split the mat-vecs into two populations
+                // measured on different bases: a first consumer of an activation misses and
+                // is billed for its kernel, every later consumer hits and is billed for its
+                // kernel plus the gap. They are then compared with each other, in this file
+                // and in the patch series' notes, as though the numbers meant the same thing.
+                // `qhit` implies `cacheable`, which already required src1 on-device and
+                // contiguous, so this matches the miss branch's guard exactly.
+                ggml_sycl_prof_mark_gap();
             } else {
             dev[i].src1_ddq = cacheable
                 ? src1_q8_store(ctx, dev[i].src1_ddf, (const void *) stream, ddq_bytes,

@@ -1115,7 +1115,23 @@ void launch_fattn(
             // Raise only. On a short cache this formula asks for fewer blocks than the
             // wave-fill loop already chose, and taking it verbatim throws away parallelism
             // the machine has room for -- measurably so at depth 0.
-            const int chunk = 2*nwarps*warp_size;
+            // 2*nwarps*warp_size per block was "half the useful max", asserted and
+            // never measured. It is load-bearing -- deleting the raise costs 20.8%
+            // at d65536 -- so it is worth being able to sweep rather than re-assert.
+            // Swept: C=1 wins 1.68% at d8192, C=2 wins 1.04% at d65536, tied at
+            // d32768; 2 is the best single constant and is kept.
+            //
+            // Do NOT try to cap this at one wave. blocks_per_wave/ntiles_total is
+            // what the wave-fill loop above already converges to, so that cap makes
+            // the whole raise inert -- measured at d65536 as 18.95 t/s, the exact
+            // value of removing the raise, against 22.82 here. The raise works by
+            // deliberately OVERSUBSCRIBING the machine to hide DRAM latency on the
+            // long KV walk, not by filling it.
+            // Only the env read is static: nwarps is a runtime argument, so caching
+            // the product would pin the first caller's geometry onto every later one.
+            static const int kv_split_chunks =
+                std::max(1, ggml_sycl_get_env("GGML_SYCL_FA_KV_SPLIT_CHUNKS", 2));
+            const int chunk = kv_split_chunks*nwarps*warp_size;
             const int kv_split = std::min(ntiles_KQ, (int) ((K->ne[1] + chunk - 1) / chunk));
             parallel_blocks = std::max(parallel_blocks, kv_split);
         }

@@ -525,43 +525,57 @@ static void l2_norm_f32_sycl(const float *   x,
 // collapsing N launches into 1 removes per-launch overhead. The tensor index is
 // folded into grid dim0; each row's reduction is identical to the single-tensor
 // kernel, so the result is bit-exact.
-#define GGML_SYCL_L2_BATCH_MAX 8
 struct l2_batch_ptrs {
     const float * src[GGML_SYCL_L2_BATCH_MAX];
     float *       dst[GGML_SYCL_L2_BATCH_MAX];
 };
 
+// The batch shares one stride set: the caller only groups tensors whose nb[] all match,
+// so the per-tensor state stays two pointers and the kernel argument block stays small.
+// Strides are mandatory rather than an extra feature -- the GDN q/k norms this exists for
+// read strided views of the fused qkv buffer, never contiguous memory.
+struct l2_batch_strides {
+    int     ne1, ne2;
+    int64_t ss0, ss1, ss2, ss3;
+    int64_t ds0, ds1, ds2, ds3;
+};
+
 template <int warp_size>
-static void l2_norm_f32_batch(l2_batch_ptrs p, const int ncols, const float eps,
+static void l2_norm_f32_batch(l2_batch_ptrs p, l2_batch_strides st, const int ncols, const float eps,
                               const sycl::nd_item<3> & item_ct1) {
     const int t   = item_ct1.get_group(0);  // tensor index
-    const int row = item_ct1.get_group(2);  // flattened row (contiguous: ne1*ne2*ne3)
+    const int r   = item_ct1.get_group(2);  // flattened row over ne1*ne2*ne3
     const int tid = item_ct1.get_local_id(2);
 
-    const float * x   = p.src[t] + (int64_t) row * ncols;
-    float *       dst = p.dst[t] + (int64_t) row * ncols;
+    const int i1 = r % st.ne1;
+    const int i2 = (r / st.ne1) % st.ne2;
+    const int i3 = r / (st.ne1 * st.ne2);
+
+    const float * x   = p.src[t] + i3 * st.ss3 + i2 * st.ss2 + i1 * st.ss1;
+    float *       dst = p.dst[t] + i3 * st.ds3 + i2 * st.ds2 + i1 * st.ds1;
 
     float tmp = 0.0f;
     for (int col = tid; col < ncols; col += warp_size) {
-        const float xi = x[col];
+        const float xi = x[col * st.ss0];
         tmp += xi * xi;
     }
     tmp = block_reduce<block_reduce_method::SUM, warp_size>(tmp, (float *) nullptr, warp_size);
     const float scale = sycl::rsqrt(sycl::fmax(tmp, eps * eps));
     for (int col = tid; col < ncols; col += warp_size) {
-        dst[col] = scale * x[col];
+        dst[col * st.ds0] = scale * x[col * st.ss0];
     }
 }
 
 template <int warp_size>
-static void l2_norm_f32_batch_sycl(l2_batch_ptrs p, const int n_tensors, const int ncols,
-                                   const int nrows_total, const float eps, queue_ptr stream) {
+static void l2_norm_f32_batch_sycl(l2_batch_ptrs p, l2_batch_strides st, const int n_tensors,
+                                   const int ncols, const int nrows_total, const float eps,
+                                   queue_ptr stream) {
     const dpct::dim3 blocks_num(nrows_total, 1, n_tensors);
     const dpct::dim3 block_dims(warp_size, 1, 1);
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<3>(blocks_num * block_dims, block_dims),
             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(warp_size)]] {
-                l2_norm_f32_batch<warp_size>(p, ncols, eps, item_ct1);
+                l2_norm_f32_batch<warp_size>(p, st, ncols, eps, item_ct1);
             });
     });
 }
@@ -991,5 +1005,14 @@ void ggml_sycl_l2_norm_batch(ggml_backend_sycl_context & ctx, ggml_tensor ** nod
         p.src[t] = (const float *) nodes[t]->src[0]->data;
         p.dst[t] = (float *) nodes[t]->data;
     }
-    l2_norm_f32_batch_sycl<WARP_SIZE>(p, count, ncols, nrows_total, eps, ctx.stream());
+
+    const ggml_tensor * d0 = nodes[0];
+    const size_t        ts = ggml_type_size(GGML_TYPE_F32);
+    l2_batch_strides    st{};
+    st.ne1 = (int) s0->ne[1];
+    st.ne2 = (int) s0->ne[2];
+    st.ss0 = s0->nb[0] / ts; st.ss1 = s0->nb[1] / ts; st.ss2 = s0->nb[2] / ts; st.ss3 = s0->nb[3] / ts;
+    st.ds0 = d0->nb[0] / ts; st.ds1 = d0->nb[1] / ts; st.ds2 = d0->nb[2] / ts; st.ds3 = d0->nb[3] / ts;
+
+    l2_norm_f32_batch_sycl<WARP_SIZE>(p, st, count, ncols, nrows_total, eps, ctx.stream());
 }

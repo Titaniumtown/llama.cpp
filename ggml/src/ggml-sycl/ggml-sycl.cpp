@@ -5859,6 +5859,14 @@ struct ggml_sycl_op_prof {
         if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0]) {
             return ggml_nbytes(node->src[0]);
         }
+        // View-like nodes are never launched, so a fused span that steps over one must not
+        // be charged its bytes -- doing so inflates that row's GB/s by the full aliased
+        // tensor.
+        if (node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
+            node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE ||
+            node->op == GGML_OP_NONE || ggml_is_empty(node)) {
+            return 0;
+        }
         uint64_t b = ggml_nbytes(node);
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             if (node->src[j]) {
@@ -6065,22 +6073,54 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             i += 2;
             continue;
         }
-        // batch consecutive independent same-shape contiguous F32 L2_NORM siblings
-        // (GDN q/k norms) into one launch -- decode is launch-bound. Single device.
+        // Batch consecutive independent same-shape F32 L2_NORM siblings (the GDN q/k
+        // norms) into one launch -- at 128 columns each launch is ~94% ramp. Two things
+        // this scan must get right, both of which the first version got wrong:
+        //
+        //  - View-like nodes are NOT launches. ggml_build_forward_expand orders by
+        //    dependency DFS, so the graph reads view(q), l2norm(q), view(k), l2norm(k):
+        //    the norms are adjacent in *dispatch* but two apart in cgraph indices. A scan
+        //    that breaks on the first non-L2_NORM node therefore never batches anything.
+        //  - The sources are strided views of the fused qkv buffer, never contiguous, so
+        //    requiring ggml_is_contiguous rejects the exact tensors this exists for.
         if (node->op == GGML_OP_L2_NORM && ggml_sycl_info().device_count == 1 &&
             node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F32 &&
-            node->src[0]->ne[0] < 1024 &&
-            ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node)) {
-            ggml_tensor * batch[8];  // must match GGML_SYCL_L2_BATCH_MAX in norm.cpp
+            node->src[0]->ne[0] < 1024) {
+            ggml_tensor * batch[GGML_SYCL_L2_BATCH_MAX];
             int           count = 0;
+            int           last  = i;
             float         eps0;
             memcpy(&eps0, node->op_params, sizeof(float));
-            for (int j = i; j < cgraph->n_nodes && count < 8; ++j) {
+
+            // Conservative aliasing test: the batched norms all run concurrently in one
+            // kernel, so none may read what another writes, and none may write where
+            // another writes.
+            auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+                const char * ab = (const char *) a->data;
+                const char * bb = (const char *) b->data;
+                return ab < bb + ggml_nbytes(b) && bb < ab + ggml_nbytes(a);
+            };
+
+            for (int j = i; j < cgraph->n_nodes && count < GGML_SYCL_L2_BATCH_MAX; ++j) {
                 ggml_tensor * nj = cgraph->nodes[j];
-                if (nj->op != GGML_OP_L2_NORM || (nj->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
-                    nj->type != GGML_TYPE_F32 || nj->src[0]->type != GGML_TYPE_F32 ||
-                    !ggml_is_contiguous(nj->src[0]) || !ggml_is_contiguous(nj) ||
-                    !ggml_are_same_shape(nj, node)) {
+                if (ggml_is_empty(nj) || nj->op == GGML_OP_RESHAPE || nj->op == GGML_OP_TRANSPOSE ||
+                    nj->op == GGML_OP_VIEW || nj->op == GGML_OP_PERMUTE || nj->op == GGML_OP_NONE ||
+                    (nj->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;  // not a launch; cannot break a run of adjacent norms
+                }
+                if (nj->op != GGML_OP_L2_NORM || nj->type != GGML_TYPE_F32 ||
+                    nj->src[0]->type != GGML_TYPE_F32 || !ggml_are_same_shape(nj, node) ||
+                    !ggml_are_same_shape(nj->src[0], node->src[0])) {
+                    break;
+                }
+                bool same_nb = true;  // one stride set is shared by the whole batch
+                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                    if (nj->nb[d] != node->nb[d] || nj->src[0]->nb[d] != node->src[0]->nb[d]) {
+                        same_nb = false;
+                        break;
+                    }
+                }
+                if (!same_nb) {
                     break;
                 }
                 float epsj;
@@ -6088,19 +6128,23 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 if (epsj != eps0) {
                     break;
                 }
-                bool indep = true;  // must not read an earlier batched node's output
+                bool indep = true;
                 for (int k = 0; k < count; ++k) {
-                    if (nj->src[0] == batch[k]) { indep = false; break; }
+                    if (overlaps(nj->src[0], batch[k]) || overlaps(nj, batch[k])) {
+                        indep = false;
+                        break;
+                    }
                 }
                 if (!indep) {
                     break;
                 }
                 batch[count++] = nj;
+                last           = j;
             }
             if (count >= 2) {
                 ggml_sycl_l2_norm_batch(*sycl_ctx, batch, count);
-                prof.mark(node, cgraph, i, count);
-                i += count - 1;
+                prof.mark(node, cgraph, i, last - i + 1);
+                i = last;
                 continue;
             }
         }

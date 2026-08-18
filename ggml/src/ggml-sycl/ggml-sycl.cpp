@@ -7359,7 +7359,26 @@ ggml_backend_reg_t ggml_backend_sycl_reg() {
             ggml_backend_sycl_reg_context * ctx = new ggml_backend_sycl_reg_context;
             const int min_batch_size = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
 
-            for (int i = 0; i < ggml_sycl_info().device_count; i++) {
+            // Registering a backend must not abort the process when the host has no
+            // SYCL device. dpct::dev_mgr's constructor calls sycl::select_device,
+            // which throws "No device of requested type available"; this runs from
+            // ggml_backend_registry()'s constructor by way of llama_backend_init(),
+            // so the exception escapes as a terminate() and takes the process with
+            // it. That kills CPU-only tools -- llama-quantize and the gguf utilities
+            // never touch a device -- on any machine without a GPU, including a nix
+            // build sandbox, which has no /dev/dri.
+            //
+            // Register zero devices instead. Callers already handle a backend that
+            // exposes none, which is exactly what a GPU-less host should look like.
+            int device_count = 0;
+            try {
+                device_count = ggml_sycl_info().device_count;
+            } catch (const std::exception & e) {
+                GGML_LOG_INFO("%s: no SYCL device available (%s); registering 0 devices\n", __func__, e.what());
+                device_count = 0;
+            }
+
+            for (int i = 0; i < device_count; i++) {
                 ggml_backend_sycl_device_context * dev_ctx = new ggml_backend_sycl_device_context;
                 dev_ctx->device = i;
                 dev_ctx->name = GGML_SYCL_NAME + std::to_string(i);

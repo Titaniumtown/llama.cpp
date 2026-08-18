@@ -42,6 +42,31 @@ static void concat_T_dim0(const T *x, const T *y, T *dst,
   }
 }
 
+// Linear-grid variant of concat_T_dim0.
+//
+// concat_T_dim0 maps one work-item to one element of the *first* dimension and puts the
+// remaining dimensions in the grid, so a dim-0 concat with a short first dimension wastes
+// nearly the whole launch: the GDN conv_input concat is ne=[4, 10240, 1, 1], which gives
+// gridDim=(1, 10240, 1) x 256 work-items, i.e. 2.62M work-items of which 40960 (1.6%) do
+// any work. Flattening the iteration over dst keeps every lane busy and turns the op back
+// into the ~160 KB copy it actually is.
+template <typename T>
+static void concat_T_dim0_flat(const T * x, const T * y, T * dst,
+                               const int64_t ne0, const int64_t ne00, const int64_t nelem,
+                               const sycl::nd_item<1> & item_ct1) {
+  const int64_t i = item_ct1.get_global_linear_id();
+  if (i >= nelem) {
+    return;
+  }
+  const int64_t row = i / ne0;
+  const int64_t col = i - row * ne0;
+  if (col < ne00) {  // src0
+    dst[i] = x[row * ne00 + col];
+  } else {           // src1
+    dst[i] = y[row * (ne0 - ne00) + (col - ne00)];
+  }
+}
+
 template <typename T>
 static void concat_T_dim1(const T *x, const T *y, T *dst,
                             const int ne0, const int ne01,
@@ -97,11 +122,20 @@ static void concat_T_sycl(const T *x, const T *y, T *dst,
   int num_blocks = (ne0 + SYCL_CONCAT_BLOCK_SIZE - 1) / SYCL_CONCAT_BLOCK_SIZE;
   sycl::range<3> gridDim(ne2, ne1, num_blocks);
   switch (dim) {
-  case 0:
-      stream->parallel_for(sycl::nd_range<3>(gridDim * sycl::range<3>(1, 1, SYCL_CONCAT_BLOCK_SIZE),
-                                          sycl::range<3>(1, 1, SYCL_CONCAT_BLOCK_SIZE)),
-                        [=](sycl::nd_item<3> item_ct1) { concat_T_dim0<T>(x, y, dst, ne0, ne00, item_ct1); });
+  case 0: {
+      // one work-item per dst element, so a short first dimension does not idle the launch
+      const int64_t nelem = (int64_t) ne0 * ne1 * ne2;
+      const int64_t nwg    = (nelem + SYCL_CONCAT_BLOCK_SIZE - 1) / SYCL_CONCAT_BLOCK_SIZE;
+      const int64_t ne0_l  = ne0;
+      const int64_t ne00_l = ne00;
+      stream->parallel_for(
+          sycl::nd_range<1>(sycl::range<1>(nwg * SYCL_CONCAT_BLOCK_SIZE),
+                            sycl::range<1>(SYCL_CONCAT_BLOCK_SIZE)),
+          [=](sycl::nd_item<1> item_ct1) {
+              concat_T_dim0_flat<T>(x, y, dst, ne0_l, ne00_l, nelem, item_ct1);
+          });
       break;
+  }
   case 1:
       stream->parallel_for(sycl::nd_range<3>(gridDim * sycl::range<3>(1, 1, SYCL_CONCAT_BLOCK_SIZE),
                                           sycl::range<3>(1, 1, SYCL_CONCAT_BLOCK_SIZE)),

@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <array>
+#include <map>
+#include <string>
 #include <assert.h>
 #include <atomic>
 #include <cinttypes>
@@ -5649,8 +5651,113 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
     return skip;
 }
 
+// Device-side per-op profiler, enabled with GGML_SYCL_PROF=1.
+//
+// A host-side timer around each op has to synchronise per node, which inflates the
+// small ops disproportionately and mismeasures exactly what we want to know. Instead
+// this submits a barrier after every submission into the in-order queue and reads the
+// device timestamps once, after the graph has drained: consecutive barrier end-stamps
+// bracket one op's real GPU execution. The only synchronisation is the one flush per
+// graph, and it happens after all the work is already queued.
+//
+// Costs nothing when disabled - the queue is then built without the profiling property
+// and every hook below is a predictable branch on a cached flag.
+struct ggml_sycl_op_prof {
+    static bool enabled() {
+        static const bool on = [] {
+            const bool e = getenv("GGML_SYCL_PROF") != nullptr;
+            if (e) {
+                atexit(&ggml_sycl_op_prof::dump);
+            }
+            return e;
+        }();
+        return on;
+    }
+
+    struct entry {
+        std::string name;
+        sycl::event ev;
+    };
+
+    std::vector<entry> marks;
+    sycl::queue *      q = nullptr;
+
+    void begin(sycl::queue * queue) {
+        if (!enabled()) {
+            return;
+        }
+        q = queue;
+        marks.clear();
+        marks.push_back({ std::string(), q->ext_oneapi_submit_barrier() });
+    }
+
+    void mark(const ggml_tensor * node) {
+        if (!enabled() || q == nullptr) {
+            return;
+        }
+        std::string key = ggml_op_name(node->op);
+        // matmul cost is dominated by the weight type, so keep them apart
+        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0]) {
+            key += "/";
+            key += ggml_type_name(node->src[0]->type);
+        }
+        marks.push_back({ std::move(key), q->ext_oneapi_submit_barrier() });
+    }
+
+    // Totals are accumulated across every graph and dumped once at exit.
+    static std::map<std::string, std::pair<uint64_t, uint64_t>> & totals() {
+        static std::map<std::string, std::pair<uint64_t, uint64_t>> t;
+        return t;
+    }
+
+    void flush() {
+        if (!enabled() || q == nullptr || marks.size() < 2) {
+            return;
+        }
+        q->wait();
+        auto & t = totals();
+        for (size_t i = 1; i < marks.size(); i++) {
+            const uint64_t prev =
+                marks[i - 1].ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+            const uint64_t cur =
+                marks[i].ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+            auto & slot = t[marks[i].name];
+            slot.first  += cur > prev ? cur - prev : 0;
+            slot.second += 1;
+        }
+        marks.clear();
+    }
+
+    static void dump() {
+        auto & t = totals();
+        if (t.empty()) {
+            return;
+        }
+        uint64_t grand = 0;
+        for (const auto & kv : t) {
+            grand += kv.second.first;
+        }
+        std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> v(t.begin(), t.end());
+        std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) {
+            return a.second.first > b.second.first;
+        });
+        fprintf(stderr, "\n=== SYCL device-time profile (total %.2f ms over all graphs) ===\n",
+                grand / 1e6);
+        fprintf(stderr, "%-28s %12s %10s %12s %8s\n", "op", "gpu_ms", "calls", "us/call", "share");
+        for (const auto & kv : v) {
+            fprintf(stderr, "%-28s %12.3f %10llu %12.2f %7.2f%%\n", kv.first.c_str(),
+                    kv.second.first / 1e6, (unsigned long long) kv.second.second,
+                    kv.second.first / 1e3 / (double) kv.second.second,
+                    grand ? 100.0 * kv.second.first / grand : 0.0);
+        }
+        fflush(stderr);
+    }
+};
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
+    ggml_sycl_op_prof prof;
+    prof.begin(sycl_ctx->stream());
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -5663,6 +5770,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
         if (nodes_to_skip != 0) {
+            prof.mark(node);
             i += nodes_to_skip;
             continue;
         }
@@ -5755,6 +5863,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
             if (count >= 2) {
                 ggml_sycl_l2_norm_batch(*sycl_ctx, batch, count);
+                prof.mark(node);
                 i += count - 1;
                 continue;
             }
@@ -5770,7 +5879,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+        prof.mark(node);
     }
+    prof.flush();
 }
 
 #ifdef GGML_SYCL_GRAPH

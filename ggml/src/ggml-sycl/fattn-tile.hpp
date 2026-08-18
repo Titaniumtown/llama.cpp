@@ -75,6 +75,8 @@ static constexpr uint32_t ggml_sycl_fattn_tile_get_config_fp16(const int DKQ, co
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  6, 192, 2,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 12, 384, 2,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 24, 384, 2,  64,  64)
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 30, 480, 2,  64,  64)
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 48, 384, 2,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  8, 256, 2,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 2,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  64,  64)
@@ -1101,6 +1103,31 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_sycl_context & ctx, ggm
     // ever useful here anyway: this path exists for decode and short speculative
     // batches, and ncols1 * 6 covers Q->ne[1] up to 12.
     if constexpr (ncols2 == 6) {
+        // A tile re-reads the whole KV cache, so a decode step costs the NUMBER OF TILES,
+        // not the number of queries. ncols1 == 4 puts an MTP verify of 5 tokens into two
+        // tiles -- the second a quarter full -- and production sits one query past that
+        // cliff. 30 = 5 queries x 6 heads is the exact fit and, at 480 threads, keeps
+        // cpw == 2 so per-thread register pressure matches the 24-wide tile.
+        // GGML_SYCL_FA_TILE_WIDE selects the width to try: 0 off, 30, or 48.
+        static const int tile_wide = ggml_sycl_get_env("GGML_SYCL_FA_TILE_WIDE", 30);
+        if (tile_wide == 30 && Q->ne[1] > 4 && Q->ne[1] <= 5) {
+            constexpr int cols_per_block = 30;
+            const int nwarps    = ggml_sycl_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+            const int nbatch_fa = ggml_sycl_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+            launch_fattn<DV, cols_per_block/ncols2, ncols2,
+                flash_attn_tile<DKQ, DV, cols_per_block / ncols2, ncols2, use_logit_softcap, warp_size>, warp_size>
+                (ctx, dst, nwarps, nbytes_shared, nbatch_fa, true, true, false);
+            return;
+        }
+        if (tile_wide == 48 && Q->ne[1] > 4 && Q->ne[1] <= 8) {
+            constexpr int cols_per_block = 48;
+            const int nwarps    = ggml_sycl_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+            const int nbatch_fa = ggml_sycl_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+            launch_fattn<DV, cols_per_block/ncols2, ncols2,
+                flash_attn_tile<DKQ, DV, cols_per_block / ncols2, ncols2, use_logit_softcap, warp_size>, warp_size>
+                (ctx, dst, nwarps, nbytes_shared, nbatch_fa, true, true, false);
+            return;
+        }
         if (Q->ne[1] > 2) {
             // 4 queries x 6 heads in one tile. Speculative decode verifies
             // spec-draft-n-max + 1 tokens at once (4 in production), and with

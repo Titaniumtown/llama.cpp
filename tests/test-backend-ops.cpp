@@ -9179,6 +9179,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
 
+    // Narrow-output quantised mat-vec: the shape a gated-delta-net's alpha/beta heads
+    // produce (5120x48), which the generic loops below never reach. They use k=256 and
+    // k=1024, so a row spans at most one block-wave and any K-split collapses to 1 --
+    // leaving the narrow-split path in mmvq.cpp with no coverage at all. These need
+    // k>=2048 to have waves to split, n in 2..8 to select the multi-column reorder
+    // kernel, and bs/nr of 1 so the weight is eligible for reorder in the first place.
+    // m=1 and m=47 are the ones that bite: neither divides the rows-per-group, so most
+    // subgroups in the group are inactive and must still reach the reduction barrier.
+    for (int n : { 2, 5 }) {
+        for (int m : { 1, 47, 48, 1024 }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, n, 5120, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,   48, n, 2048, {1, 1}, {1, 1}));
+        // wide control: same kernel family, too many rows to split
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 5120, n, 5120, {1, 1}, {1, 1}));
+    }
+
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 1*256, { 1,  1}, {1, 1}));

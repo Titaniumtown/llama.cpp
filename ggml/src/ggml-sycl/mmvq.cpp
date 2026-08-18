@@ -1900,6 +1900,172 @@ static void mul_mat_vec_q4_K_reorder_wide_ncols(const void * __restrict__ vx, co
     }
 }
 
+
+// One subgroup per output row is all the parallelism this kernel has, and for a narrow
+// projection that is ruinous. The GDN alpha/beta heads are 5120x48: 48 subgroups in 2
+// work-groups, each walking its row in 5 SERIAL dependent DRAM round-trips with nothing
+// else resident to hide them. Measured 11.58 us to move 138 KB -- 0.23 us of traffic at
+// this card's 599 GB/s wall, a 50x latency gap, and 2.09% of decode device time spent
+// almost entirely waiting.
+//
+// So hand each row to SPLIT subgroups that interleave whole block-waves, and reduce their
+// partials through SLM. This is the mirror image of the split-K experiment recorded as
+// hypothesis 5 in 0055, which was a monotone LOSS -- and the reason it lost says exactly
+// when to use it: there nrows was 5120..17408, already far more subgroups than the device
+// can hold, so splitting only paid the reduction more often. The launcher engages this
+// ONLY when nrows is too small to fill the device; wide shapes keep the kernel above,
+// unchanged.
+template <int ncols_dst, int SPLIT>
+static void mul_mat_vec_q4_K_reorder_wide_ncols_split(const void * __restrict__ vx, const void * __restrict__ vy,
+                                                      float * __restrict__ dst, const int ncols, const int nrows,
+                                                      const int stride_col_y_bytes, const int stride_col_dst,
+                                                      float * __restrict__ slm,
+                                                      const sycl::nd_item<3> & nd_item) {
+    using q4_k_block = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q4_K>;
+
+    const auto sg       = nd_item.get_sub_group();
+    const int  sg_range = sg.get_group_linear_range();
+    const int  sg_id    = sg.get_group_linear_id();
+
+    const int rows_per_group = sg_range / SPLIT;
+    const int row_local      = sg_id / SPLIT;
+    const int part           = sg_id % SPLIT;
+    const int row            = nd_item.get_group_linear_id() * rows_per_group + row_local;
+
+    // No early return anywhere in this kernel: every subgroup must reach the barrier.
+    const bool active = row < nrows && row_local < rows_per_group;
+
+    const int blocks_per_row  = ncols / QK_K;
+    const int nblocks         = nrows * blocks_per_row;
+    const int lane            = sg.get_local_linear_id();
+    const int blocks_per_wave = WARP_SIZE / 8;
+    const int lb              = lane / 8;
+    const int c               = lane % 8;
+    const int g               = c >> 1;
+    const int half            = c & 1;
+    const int uoff            = half ? 4 : 0;
+
+    const uint8_t * base = static_cast<const uint8_t *>(vx);
+
+    float partial[ncols_dst] = { 0.0f };
+
+    if (active) {
+        // interleave by whole block-waves, so each subgroup keeps the 8-lane/128-byte
+        // coalescing of the unsplit kernel exactly
+        for (int blk = lb + part * blocks_per_wave; blk < blocks_per_row; blk += SPLIT * blocks_per_wave) {
+        const int  ibx     = row * blocks_per_row + blk;
+        const auto ibx_off = q4_k_block::get_block_offset(ibx, nblocks);
+        const auto d_off   = q4_k_block::get_d_offset(nrows, ncols, ibx);
+
+        const uint8_t *     qs     = base + ibx_off.first;
+        const uint16_t *    scales = reinterpret_cast<const uint16_t *>(base + d_off.first);
+        const sycl::half2 * dms    = reinterpret_cast<const sycl::half2 *>(base + d_off.second);
+
+        // weight quad + scales/dm: loaded ONCE, reused across every column
+        const sycl::int4 vq = *(reinterpret_cast<const sycl::int4 *>(qs) + c);
+        uint16_t  aux[2];
+        const int j = g;
+        if (j < 2) {
+            aux[0] = scales[j + 0] & 0x3f3f;
+            aux[1] = scales[j + 2] & 0x3f3f;
+        } else {
+            aux[0] = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
+            aux[1] = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j - 0] & 0xc0c0) >> 2);
+        }
+        const uint8_t *    sc   = reinterpret_cast<const uint8_t *>(aux);
+        const uint8_t *    m    = sc + 2;
+        const sycl::float2 dm4f = (*dms).convert<float, sycl::rounding_mode::automatic>();
+
+        const int gq8 = blk * (QK_K / QK8_1) + 2 * g;
+
+#pragma unroll
+        for (int col = 0; col < ncols_dst; ++col) {
+            const char *        vy_j = static_cast<const char *>(vy) + col * stride_col_y_bytes;
+            const int8_t *      vy8  = reinterpret_cast<const int8_t *>(vy_j);
+            const sycl::half2 * vyds = reinterpret_cast<const sycl::half2 *>(vy_j + ncols);
+            const sycl::half2   ds0  = vyds[gq8 + 0];
+            const sycl::half2   ds1  = vyds[gq8 + 1];
+            const sycl::int4    u0   = *reinterpret_cast<const sycl::int4 *>(reinterpret_cast<const int *>(vy8 + (gq8 + 0) * QK8_1) + uoff);
+            const sycl::int4    u1   = *reinterpret_cast<const sycl::int4 *>(reinterpret_cast<const int *>(vy8 + (gq8 + 1) * QK8_1) + uoff);
+
+            partial[col] += q4k_wide_dot(vq, sc, m, dm4f, half, u0, u1, ds0[0], ds1[0], ds0[1], ds1[1]);
+        }
+        }
+    }
+
+#pragma unroll
+    for (int col = 0; col < ncols_dst; ++col) {
+        const float sum = sycl::reduce_over_group(sg, partial[col], std::plus<>());
+        if (sg.leader()) {
+            slm[sg_id * ncols_dst + col] = sum;
+        }
+    }
+
+    nd_item.barrier(sycl::access::fence_space::local_space);
+
+    if (part == 0 && active) {
+#pragma unroll
+        for (int col = 0; col < ncols_dst; ++col) {
+            float total = 0.0f;
+#pragma unroll
+            for (int pt = 0; pt < SPLIT; ++pt) {
+                total += slm[(row_local * SPLIT + pt) * ncols_dst + col];
+            }
+            if (sg.leader()) {
+                dst[col * stride_col_dst + row] = total;
+            }
+        }
+    }
+}
+
+// Pick the split for a shape. Engages only below `target` subgroups, i.e. only when the
+// row count alone cannot fill the device, and never hands out more parts than a row has
+// block-waves. GGML_SYCL_MMVQ_SPLIT_TARGET=0 disables it outright (the A/B control);
+// GGML_SYCL_MMVQ_SPLIT=N forces one value for sweeps.
+static inline int ggml_sycl_mmvq_split(const int ncols, const int nrows) {
+    static const int forced = ggml_sycl_get_env("GGML_SYCL_MMVQ_SPLIT", 0);
+    static const int target = ggml_sycl_get_env("GGML_SYCL_MMVQ_SPLIT_TARGET", 2048);
+
+    const int waves_per_row = ceil_div(ncols / QK_K, WARP_SIZE / 8);
+
+    int split = forced;
+    if (split <= 0) {
+        split = 1;
+        if (target > 0 && nrows > 0 && nrows < target) {
+            const int want = ceil_div(target, nrows);
+            split = want >= 8 ? 8 : (want >= 4 ? 4 : (want >= 2 ? 2 : 1));
+        }
+    }
+    while (split > 1 && split > waves_per_row) {
+        split /= 2;
+    }
+    return split;
+}
+
+template <int ncols_dst, int SPLIT>
+static void reorder_mul_mat_vec_q4_k_q8_1_sycl_ncols_split(
+        const void * vx, const void * vy, float * dst,
+        const int ncols, const int nrows,
+        const int stride_col_y_bytes, const int stride_col_dst,
+        dpct::queue_ptr stream) {
+    constexpr size_t num_subgroups  = WARP_SIZE;
+    constexpr int    rows_per_group = (int) num_subgroups / SPLIT;
+
+    const int block_num_y = ceil_div(nrows, rows_per_group);
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
+
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> slm(sycl::range<1>(num_subgroups * ncols_dst), cgh);
+        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_q4_K_reorder_wide_ncols_split<ncols_dst, SPLIT>(
+                                 vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst,
+                                 get_pointer(slm), nd_item);
+                         });
+    });
+}
+
 template <int ncols_dst>
 static void reorder_mul_mat_vec_q4_k_q8_1_sycl_ncols(
         const void * vx, const void * vy, float * dst,
@@ -1909,6 +2075,21 @@ static void reorder_mul_mat_vec_q4_k_q8_1_sycl_ncols(
     GGML_ASSERT(ncols % QK_K == 0);
 
     constexpr size_t num_subgroups = WARP_SIZE;
+
+    switch (ggml_sycl_mmvq_split(ncols, nrows)) {
+        case 2:
+            reorder_mul_mat_vec_q4_k_q8_1_sycl_ncols_split<ncols_dst, 2>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
+            return;
+        case 4:
+            reorder_mul_mat_vec_q4_k_q8_1_sycl_ncols_split<ncols_dst, 4>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
+            return;
+        case 8:
+            reorder_mul_mat_vec_q4_k_q8_1_sycl_ncols_split<ncols_dst, 8>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
+            return;
+        default:
+            break;
+    }
+
     const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);

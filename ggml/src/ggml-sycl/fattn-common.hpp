@@ -1093,9 +1093,16 @@ void launch_fattn(
 
         // Single-token decode is latency-bound on the long KV walk; the wave-fill heuristic
         // under-provisions KV-split. Split into two nthreads-chunks per block (half the useful max).
-        if (ncols == 1) {
+        // The test is on ncols1, not ncols1*ncols2: one token per tile is what makes this
+        // latency-bound, and how many heads are packed alongside it does not change that.
+        // ncols2 is 6 on this model, so testing the product disabled this entirely.
+        if (ncols1 == 1) {
+            // Raise only. On a short cache this formula asks for fewer blocks than the
+            // wave-fill loop already chose, and taking it verbatim throws away parallelism
+            // the machine has room for -- measurably so at depth 0.
             const int chunk = 2*nwarps*warp_size;
-            parallel_blocks = std::min(ntiles_KQ, (int) ((K->ne[1] + chunk - 1) / chunk));
+            const int kv_split = std::min(ntiles_KQ, (int) ((K->ne[1] + chunk - 1) / chunk));
+            parallel_blocks = std::max(parallel_blocks, kv_split);
         }
 
         blocks_num.x = ntiles_x;

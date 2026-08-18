@@ -5986,27 +5986,83 @@ struct ggml_sycl_op_prof {
         return v;
     }
 
-    // One submission may cover a fused span; charge it every byte the span moves.
+    // Bytes a fused span actually moves: its external inputs and its live outputs. An
+    // intermediate is produced AND consumed inside the span, so it never reaches memory --
+    // charging it twice (once as a dst, once as the next node's src) is what made
+    // SSM_CONV+SILU report 368 GB/s while moving 183, i.e. "70% of the wall" for a kernel
+    // that was at 35% and had a 2.19x sitting in it.
+    static uint64_t span_bytes(const ggml_cgraph * cgraph, int i, int span) {
+        const int end = (i + span < cgraph->n_nodes) ? i + span : cgraph->n_nodes;
+        auto produced_in_span = [&](const ggml_tensor * t) {
+            for (int j = i; j < end; j++) {
+                if (cgraph->nodes[j] == t) return true;
+            }
+            return false;
+        };
+        auto consumed_after = [&](const ggml_tensor * t, int from) {
+            for (int j = from; j < end; j++) {
+                for (int s = 0; s < GGML_MAX_SRC; s++) {
+                    if (cgraph->nodes[j]->src[s] == t) return true;
+                }
+            }
+            return false;
+        };
+        // A span's head output is not automatically an intermediate. ADD+RMS_NORM+MUL
+        // deliberately materialises the residual sum because a LATER block consumes it
+        // (see ggml_sycl_op_rms_norm_fused_add), so it is both fed onward in registers and
+        // written to DRAM. Dropping it would under-count that row by a whole tensor and
+        // report 357 GB/s for a kernel doing 476 -- inventing a gap where there is none,
+        // which is the same class of error this patch removes.
+        auto consumed_outside = [&](const ggml_tensor * t) {
+            for (int j = end; j < cgraph->n_nodes; j++) {
+                for (int s = 0; s < GGML_MAX_SRC; s++) {
+                    if (cgraph->nodes[j]->src[s] == t) return true;
+                }
+            }
+            return false;
+        };
+        uint64_t bytes = 0;
+        for (int j = i; j < end; j++) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            // MUL_MAT keeps charging only its weight, so the GEMM rows stay the
+            // weight-streaming intensity their shape suffix promises.
+            if ((n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) && n->src[0]) {
+                bytes += ggml_nbytes(n->src[0]);
+                continue;
+            }
+            if (n->op == GGML_OP_RESHAPE || n->op == GGML_OP_TRANSPOSE ||
+                n->op == GGML_OP_VIEW || n->op == GGML_OP_PERMUTE ||
+                n->op == GGML_OP_NONE || ggml_is_empty(n)) {
+                continue;
+            }
+            if (!consumed_after(n, j + 1) || consumed_outside(n)) {
+                bytes += ggml_nbytes(n);
+            }
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                if (n->src[s] && !produced_in_span(n->src[s])) {
+                    bytes += ggml_nbytes(n->src[s]);
+                }
+            }
+        }
+        return bytes;
+    }
+
     void mark(const ggml_tensor * node, const ggml_cgraph * cgraph = nullptr, int i = 0, int span = 0) {
         if (!enabled() || q == nullptr) {
             return;
         }
-        uint64_t bytes = 0;
-        if (cgraph && span > 0) {
-            for (int j = i; j < i + span && j < cgraph->n_nodes; j++) {
-                bytes += node_bytes(cgraph->nodes[j]);
-            }
-        } else {
-            bytes = node_bytes(node);
-        }
-        // A fused span is charged every node's bytes but named only after its head, so a
-        // gate/up+GLU dispatch shows up as MUL_MAT/<gate shape> moving ~2x that weight.
-        // That reads as a double-counting bug in the profiler and is not one; say so in
-        // the key instead, and keep fused and unfused dispatches of the same head op in
-        // separate rows, because they are not the same work.
+        const uint64_t bytes = (cgraph && span > 0) ? span_bytes(cgraph, i, span) : node_bytes(node);
+        // Name a span by what it fuses, not by how many nodes it covers. "+2" merged two
+        // unrelated 3-node spans -- ADD+RMS_NORM+MUL and ADD+SILU+MUL -- into one row whose
+        // rate is an average of two different kernels, which is unreadable either way.
         std::string key = node_key(node);
         if (cgraph && span > 1) {
-            key += "+" + std::to_string(span - 1);
+            for (int j = i + 1; j < i + span && j < cgraph->n_nodes; j++) {
+                const ggml_tensor * n = cgraph->nodes[j];
+                key += "+";
+                key += (n->op == GGML_OP_UNARY) ? ggml_unary_op_name(ggml_get_unary_op(n))
+                                                : ggml_op_name(n->op);
+            }
         }
         marks.push_back({ std::move(key), bytes, q->ext_oneapi_submit_barrier() });
     }

@@ -4662,6 +4662,16 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     ggml_tensor src1_folded = *src1_in;
     ggml_tensor dst_folded  = *dst_in;
     const bool folded = fold_env && ggml_sycl_fold_ne2_columns(src0, src1_folded, dst_folded);
+    // Re-point the copy's own src[1] at the folded operand. Downstream code is not required
+    // to use the src1 handed to it -- should_reorder_tensor() ignores its src1 parameter
+    // entirely and re-derives it as dst->src[1] -- and a struct copy carries the ORIGINAL
+    // pointer, so without this the fold is invisible to exactly those consumers. That cost
+    // 48 of 65 blocks their weight reorder: the gate requires src1->ne[2]==1, ssm_out's
+    // src1 arrives as [6144,1,5,1], the gate saw the unfolded tensor and refused, and the
+    // refusal is permanent because reorder is a one-time sticky decision on the weight.
+    if (folded) {
+        dst_folded.src[1] = &src1_folded;
+    }
     const ggml_tensor * src1 = folded ? &src1_folded : src1_in;
     ggml_tensor *       dst  = folded ? &dst_folded  : dst_in;
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
@@ -5968,12 +5978,6 @@ struct ggml_sycl_op_prof {
         static const bool v = ggml_sycl_get_env("GGML_SYCL_PROF_NAMES", 0) != 0;
         return v;
     }
-
-    // One submission may cover a fused span; charge it every byte the span moves.
-    void mark(const ggml_tensor * node, const ggml_cgraph * cgraph = nullptr, int i = 0, int span = 0) {
-        if (!enabled() || q == nullptr) {
-            return;
-        }
 
     // One submission may cover a fused span; charge it every byte the span moves.
     void mark(const ggml_tensor * node, const ggml_cgraph * cgraph = nullptr, int i = 0, int span = 0) {

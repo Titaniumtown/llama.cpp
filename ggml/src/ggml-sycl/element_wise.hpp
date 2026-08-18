@@ -132,4 +132,7 @@ void ggml_sycl_arange(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 void ggml_sycl_op_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
 void ggml_sycl_fused_unary_mul(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
 
+void ggml_sycl_fused_add_unary_mul(ggml_backend_sycl_context & ctx, ggml_tensor * add_node,
+                                   ggml_tensor * unary_node, ggml_tensor * mul_node);
+
 #endif // GGML_SYCL_ELEMENTWISE_HPP

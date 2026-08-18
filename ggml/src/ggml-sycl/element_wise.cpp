@@ -1057,6 +1057,26 @@ static void fused_unary_mul_sycl(const T * a, const T * b, T * dst, const int64_
         });
 }
 
+// Fused ADD(bias) + UNARY + MUL(scale) with per-ne0 broadcast of bias and scale:
+//   dst[i] = op(a[i] + bias[i % ne0]) * scale[i % ne0]
+// bias and scale are ne0-length vectors broadcast over the outer dims. This is the
+// delta-net alpha-gate softplus(alpha + dt) * a_coeff. Once n_tokens>1 (MTP verify)
+// makes the operands broadcast, the same-shape unary+mul path stops firing, so this
+// recovers that fusion and additionally folds in the standalone bias add.
+template <typename T, typename Op>
+static void fused_add_unary_mul_sycl(const T * a, const T * bias, const T * scale, T * dst,
+                                     const int64_t k, const int ne0, queue_ptr stream, Op op) {
+    const uint32_t num_blocks = ceil_div((uint32_t) k, SYCL_GLU_BLOCK_SIZE);
+    stream->parallel_for(
+        sycl::nd_range<1>(num_blocks * sycl::range<1>(SYCL_GLU_BLOCK_SIZE), sycl::range<1>(SYCL_GLU_BLOCK_SIZE)),
+        [=](sycl::nd_item<1> item_ct1) {
+            SYCL_GLOBAL_ID_LOOP(k, item_ct1) {
+                const int h = (int) (i % ne0);
+                dst[i] = op((T) (a[i] + bias[h])) * scale[h];
+            }
+        });
+}
+
 static inline void ggml_sycl_op_fused_unary_mul(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
     const ggml_tensor * unary_src = unary_node->src[0];
     const ggml_tensor * other_src = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
@@ -1095,6 +1115,33 @@ static inline void ggml_sycl_op_fused_unary_mul(ggml_backend_sycl_context & ctx,
         }
         default:
             GGML_ABORT("fused unary+mul: unsupported type");
+    }
+}
+
+static inline void ggml_sycl_op_fused_add_unary_mul(ggml_backend_sycl_context & ctx, ggml_tensor * add_node,
+                                                    ggml_tensor * unary_node, ggml_tensor * mul_node) {
+    const ggml_tensor * a     = add_node->src[0];
+    const ggml_tensor * bias  = add_node->src[1];
+    const ggml_tensor * scale = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
+
+    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(mul_node));
+    GGML_ASSERT(bias->ne[0] == a->ne[0] && scale->ne[0] == a->ne[0]);
+
+    const int64_t       k      = ggml_nelements(mul_node);
+    const int           ne0    = (int) a->ne[0];
+    queue_ptr           stream = ctx.stream();
+    const ggml_unary_op uop    = ggml_get_unary_op(unary_node);
+
+    GGML_ASSERT(mul_node->type == GGML_TYPE_F32);
+    const float * pa = (const float *) a->data;
+    const float * pb = (const float *) bias->data;
+    const float * ps = (const float *) scale->data;
+    float *       d  = (float *) mul_node->data;
+    switch (uop) {
+        case GGML_UNARY_OP_SILU:     fused_add_unary_mul_sycl<float>(pa, pb, ps, d, k, ne0, stream, [](auto x) { return op_silu(x); }); break;
+        case GGML_UNARY_OP_SIGMOID:  fused_add_unary_mul_sycl<float>(pa, pb, ps, d, k, ne0, stream, [](auto x) { return op_sigmoid(x); }); break;
+        case GGML_UNARY_OP_SOFTPLUS: fused_add_unary_mul_sycl<float>(pa, pb, ps, d, k, ne0, stream, [](auto x) { return op_softplus(x); }); break;
+        default: GGML_ABORT("fused add+unary+mul: unsupported unary op");
     }
 }
 
@@ -1350,6 +1397,12 @@ void ggml_sycl_swiglu(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 void ggml_sycl_fused_unary_mul(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
     scope_op_debug_print scope_dbg_print(__func__, mul_node, /*num_src=*/2);
     ggml_sycl_op_fused_unary_mul(ctx, unary_node, mul_node);
+}
+
+void ggml_sycl_fused_add_unary_mul(ggml_backend_sycl_context & ctx, ggml_tensor * add_node,
+                                   ggml_tensor * unary_node, ggml_tensor * mul_node) {
+    scope_op_debug_print scope_dbg_print(__func__, mul_node, /*num_src=*/3);
+    ggml_sycl_op_fused_add_unary_mul(ctx, add_node, unary_node, mul_node);
 }
 
 void ggml_sycl_swiglu_oai(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {

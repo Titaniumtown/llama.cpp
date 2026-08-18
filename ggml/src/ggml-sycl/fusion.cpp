@@ -248,5 +248,46 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
         return true;
     }
 
+    // add(bias) + unary + mul(scale): the delta-net alpha-gate softplus(alpha+dt)*a.
+    // Linear chain, but bias and scale are ne0 vectors broadcast over the outer dims,
+    // which stops the same-shape unary+mul fusion firing once n_tokens>1 (MTP verify).
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_UNARY &&
+        ops.begin()[2] == GGML_OP_MUL && unary_ops.size() == 1 &&
+        (unary_ops.begin()[0] == GGML_UNARY_OP_SILU || unary_ops.begin()[0] == GGML_UNARY_OP_SIGMOID ||
+         unary_ops.begin()[0] == GGML_UNARY_OP_SOFTPLUS)) {
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
+            return false;
+        }
+        const ggml_tensor * add   = cgraph->nodes[node_idx];
+        const ggml_tensor * unary = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * mul   = cgraph->nodes[node_idx + 2];
+
+        if (ggml_get_unary_op(unary) != unary_ops.begin()[0]) {
+            return false;
+        }
+        // strict linear chain: unary consumes add, mul consumes unary
+        if (unary->src[0] != add || (mul->src[0] != unary && mul->src[1] != unary)) {
+            return false;
+        }
+        const ggml_tensor * a     = add->src[0];
+        const ggml_tensor * bias  = add->src[1];
+        const ggml_tensor * scale = (mul->src[0] == unary) ? mul->src[1] : mul->src[0];
+        if (a->type != GGML_TYPE_F32 || bias->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 ||
+            mul->type != GGML_TYPE_F32) {
+            return false;
+        }
+        // full activation contiguous, output same shape; bias/scale are ne0 vectors
+        // broadcast over the outer dims (a single contiguous row each)
+        if (!ggml_is_contiguous(a) || !ggml_is_contiguous(mul) || !ggml_are_same_shape(a, mul)) {
+            return false;
+        }
+        if (bias->ne[0] != a->ne[0] || scale->ne[0] != a->ne[0] ||
+            ggml_nrows(bias) != 1 || ggml_nrows(scale) != 1 ||
+            !ggml_is_contiguous(bias) || !ggml_is_contiguous(scale)) {
+            return false;
+        }
+        return true;
+    }
+
     return false;
 }

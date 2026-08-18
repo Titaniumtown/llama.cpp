@@ -964,6 +964,13 @@ void launch_fattn(
             nb12 = K->ne[1] * nb11;
             nb13 = K->ne[2] * nb12;
         }
+        // This pass re-converts the ENTIRE K history on every FA call, and it is not a graph
+        // node, so before this mark existed its cost appeared in no profiler row -- the FA
+        // row showed only the attention kernel. Bytes are what it streams: quantized in,
+        // f16 out. The f16 is then re-read by the FA kernel, so carrying a quantized KV
+        // cache through an f16-only kernel costs this row plus that extra read.
+        ggml_sycl_prof_mark_sub(std::string("FA-KV-DEQUANT/K/") + ggml_type_name(K->type) + "->f16",
+                                ggml_nbytes(K) + ggml_nelements(K) * sizeof(sycl::half));
         K_data = (char *) K_f16.ptr;
     }
 
@@ -998,6 +1005,8 @@ void launch_fattn(
                 nb22 = V->ne[1] * nb21;
                 nb23 = V->ne[2] * nb22;
             }
+            ggml_sycl_prof_mark_sub(std::string("FA-KV-DEQUANT/V/") + ggml_type_name(V->type) + "->f16",
+                                    ggml_nbytes(V) + ggml_nelements(V) * sizeof(sycl::half));
             V_data = (char *) V_f16.ptr;
         }
     }

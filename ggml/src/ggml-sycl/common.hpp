@@ -672,6 +672,11 @@ bool gpu_has_xmx(sycl::device &dev);
 
 int ggml_sycl_get_env(const char *env_name, int default_val);
 
+// Attribute a device-side pass that is NOT a graph node to its own profiler row
+// (GGML_SYCL_PROF=1). No-op when profiling is off. Without this, work submitted inside an
+// op -- notably launch_fattn's K/V dequant -- is invisible: it shows up in no row at all.
+void ggml_sycl_prof_mark_sub(const std::string & name, uint64_t bytes);
+
 template <int N, class T> std::string debug_get_array_str(const std::string & prefix, const T array[N]) {
     if (LIKELY(!g_ggml_sycl_debug)) {
         return "";

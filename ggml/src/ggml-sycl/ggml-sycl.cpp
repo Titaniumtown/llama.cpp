@@ -2643,7 +2643,8 @@ catch (sycl::exception const &exc) {
 // ggml node be split into its sub-submissions -- for a quantized matmul the weight dequant
 // pass and the GEMM are separate kernels, and only the split says which one to attack.
 // A no-op unless GGML_SYCL_PROF=1; defined next to the profiler further down.
-static void ggml_sycl_prof_mark_sub(const std::string & name, uint64_t bytes);
+// non-static: fattn-common.hpp marks the FA K/V dequant, which is not a graph node.
+void ggml_sycl_prof_mark_sub(const std::string & name, uint64_t bytes);
 
 inline void ggml_sycl_op_mul_mat_sycl(
     ggml_backend_sycl_context & ctx,
@@ -5883,7 +5884,7 @@ struct ggml_sycl_op_prof {
     }
 };
 
-static void ggml_sycl_prof_mark_sub(const std::string & name, uint64_t bytes) {
+void ggml_sycl_prof_mark_sub(const std::string & name, uint64_t bytes) {
     if (ggml_sycl_op_prof * a = ggml_sycl_op_prof::active()) {
         a->mark_named(name, bytes);
     }

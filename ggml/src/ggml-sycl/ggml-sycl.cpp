@@ -2842,7 +2842,7 @@ static sycl::half * src1_f16_lookup(ggml_backend_sycl_context & ctx, const void 
 }
 
 static sycl::half * src1_f16_store(ggml_backend_sycl_context & ctx, const void * key,
-                                   const void * strm, size_t ne) {
+                                   const void * strm, size_t ne, int node = -1) {
     auto & c = ctx.src1_f16;
     c.buf = std::make_unique<ggml_sycl_pool_alloc<sycl::half>>(ctx.src1_pool());
     c.buf->alloc(ne);
@@ -2850,7 +2850,7 @@ static sycl::half * src1_f16_store(ggml_backend_sycl_context & ctx, const void *
     c.key    = key;
     c.stream = strm;
     c.ne     = ne;
-    c.node   = ctx.cur_node;
+    c.node   = node < 0 ? ctx.cur_node : node;
     return c.buf->get();
 }
 
@@ -4899,8 +4899,20 @@ sycl::half * ggml_sycl_f16_mirror_for_next_matmul(ggml_backend_sycl_context & ct
     if (dst == nullptr || dst->type != GGML_TYPE_F32 || dst->data == nullptr)  { return nullptr; }
 
     const ggml_cgraph * g = ctx.cur_graph;
-    if (g == nullptr || ctx.cur_node + 1 >= g->n_nodes) { return nullptr; }
-    ggml_tensor * nxt = g->nodes[ctx.cur_node + 1];
+    if (g == nullptr) { return nullptr; }
+
+    // A fused span executes at the index of its HEAD, but the tensor it produces belongs to
+    // its LAST node. That matters because the cache's write scan starts just after the
+    // stored index: registering at the head would put the span's own tail -- the node whose
+    // declared output is precisely this tensor -- inside the scan, so it would read as an
+    // intervening write and every lookup would miss. Find the producer instead. Bounded,
+    // because a span is a handful of nodes and an unbounded walk is not worth it.
+    int prod = -1;
+    for (int j = ctx.cur_node; j < g->n_nodes && j - ctx.cur_node <= 8; ++j) {
+        if (g->nodes[j] == dst) { prod = j; break; }
+    }
+    if (prod < 0 || prod + 1 >= g->n_nodes) { return nullptr; }
+    ggml_tensor * nxt = g->nodes[prod + 1];
     if (nxt->op != GGML_OP_MUL_MAT || nxt->src[1] != dst) { return nullptr; }
 
     // Only the f16 GEMM path converts src1. The mat-vec paths quantize to q8_1 or read f32
@@ -4912,7 +4924,7 @@ sycl::half * ggml_sycl_f16_mirror_for_next_matmul(ggml_backend_sycl_context & ct
 
     // The lookup re-validates: same graph, bounded node distance, and no node between here
     // and the consumer writing over the f32 source. Storing cannot make a stale hit possible.
-    return src1_f16_store(ctx, dst->data, (const void *) ctx.stream(), ne);
+    return src1_f16_store(ctx, dst->data, (const void *) ctx.stream(), ne, prod);
 }
 
 // Read once, not per dispatch: this sits in the mul_mat hot path. 0 disables the short-row

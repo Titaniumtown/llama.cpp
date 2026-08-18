@@ -1,3 +1,5 @@
+#include <type_traits>
+
 #include "norm.hpp"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/presets.hpp"
@@ -152,14 +154,14 @@ static void group_norm_f32(const float* x, float* dst, const int group_size, con
 // then keeps it rather than re-reading it from DRAM through a second kernel launch.
 // add_b/add_out are required to be the same shape and contiguity as x, so all three share
 // x's strides and no second stride set is needed.
-template <bool do_multiply = false, bool do_add = false>
+template <bool do_multiply = false, bool do_add = false, bool do_mirror = false>
 static void rms_norm_f32(const float* x, float* dst, const int ncols,
     const int64_t src_stride_col, const int64_t src_stride_row, const int64_t src_stride_channel, const int64_t src_stride_sample,
     const int64_t dst_stride_col, const int64_t dst_stride_row, const int64_t dst_stride_channel, const int64_t dst_stride_sample,
     const float eps, const sycl::nd_item<3>& item_ct1, float* s_sum, int block_size,
     const float* mul = nullptr, const int64_t mul_stride_row = 0, const int64_t mul_stride_channel = 0,
     const int64_t mul_stride_sample = 0, const int mul_nrows = 0, const int mul_nchannels = 0, const int mul_nsamples = 0,
-    const float* add_b = nullptr, float* add_out = nullptr) {
+    const float* add_b = nullptr, float* add_out = nullptr, sycl::half * mir = nullptr) {
 
     const int nrows = item_ct1.get_group_range(2);
     const int nchannels = item_ct1.get_group_range(1);
@@ -178,6 +180,10 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols,
 
     x   += src_offset;
     dst += dst_offset;
+    if constexpr (do_mirror) {
+        // only enabled for a contiguous dst, so dst's own offset and stride index it too
+        mir += dst_offset;
+    }
 
     if constexpr (do_multiply) {
         const int mul_row     = row     % mul_nrows;
@@ -235,10 +241,15 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols,
         } else {
             xi = x[col * src_stride_col];
         }
+        float v;
         if constexpr (do_multiply) {
-            dst[col * dst_stride_col] = scale * xi * mul[col];
+            v = scale * xi * mul[col];
         } else {
-            dst[col * dst_stride_col] = scale * xi;
+            v = scale * xi;
+        }
+        dst[col * dst_stride_col] = v;
+        if constexpr (do_mirror) {
+            mir[col * dst_stride_col] = static_cast<sycl::half>(v);
         }
     }
 }
@@ -421,8 +432,10 @@ static void rms_norm_mul_f32_sycl(const float* x, const float* mul, float* dst, 
         const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
         const int mul_nrows, const int mul_nchannels, const int mul_nsamples,
         const float eps, queue_ptr stream, int device,
-        const float * add_b = nullptr, float * add_out = nullptr) {
+        const float * add_b = nullptr, float * add_out = nullptr, sycl::half * mir = nullptr) {
     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
+    const auto body = [&](auto mirror_tag) {
+    constexpr bool MIR = decltype(mirror_tag)::value;
     if (ncols < 1024) {
         const sycl::range<3> block_dims(1, 1, WARP_SIZE);
         stream->submit([&](sycl::handler& cgh) {
@@ -430,12 +443,12 @@ static void rms_norm_mul_f32_sycl(const float* x, const float* mul, float* dst, 
                 sycl::nd_range<3>(global_dims * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1)
                 [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                    rms_norm_f32<true, do_add>(x, dst, ncols,
+                    rms_norm_f32<true, do_add, MIR>(x, dst, ncols,
                         src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
                         dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
                         eps, item_ct1, nullptr, WARP_SIZE,
                         mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples,
-                        add_b, add_out);
+                        add_b, add_out, mir);
                 });
             });
     }
@@ -449,15 +462,17 @@ static void rms_norm_mul_f32_sycl(const float* x, const float* mul, float* dst, 
                 sycl::nd_range<3>(global_dims * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1)
                 [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                    rms_norm_f32<true, do_add>(x, dst, ncols,
+                    rms_norm_f32<true, do_add, MIR>(x, dst, ncols,
                         src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
                         dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
                         eps, item_ct1, get_pointer(s_sum_acc_ct1), work_group_size,
                         mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples,
-                        add_b, add_out);
+                        add_b, add_out, mir);
                 });
             });
     }
+    };
+    if (mir != nullptr) { body(std::true_type{}); } else { body(std::false_type{}); }
 }
 
 template<int warp_size>
@@ -792,10 +807,19 @@ void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context & ctx, ggml_tenso
     const int mul_nchannels = mul_src->ne[2];
     const int mul_nsamples  = mul_src->ne[3];
 
+    // The span's output is the next f16 GEMM's activation in every transformer block here.
+    // Emit its f16 copy from the register rather than letting that GEMM re-read the whole
+    // tensor to make one. Contiguity is what lets the mirror share dst's own indexing.
+    sycl::half * mir = nullptr;
+    if (ggml_is_contiguous(mul_tensor)) {
+        mir = ggml_sycl_f16_mirror_for_next_matmul(ctx, mul_tensor,
+                                                   (size_t) ggml_nelements(mul_tensor));
+    }
+
     rms_norm_mul_f32_sycl<true>(src0_dd, mul_dd, dst_dd, ne00, ne01, ne02, ne03,
         s00, s01, s02, s03, d00, d01, d02, d03,
         mul_s01, mul_s02, mul_s03, mul_nrows, mul_nchannels, mul_nsamples, eps, main_stream, ctx.device,
-        add_b_dd, add_dd);
+        add_b_dd, add_dd, mir);
 }
 
 void ggml_sycl_op_rms_norm_back(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {

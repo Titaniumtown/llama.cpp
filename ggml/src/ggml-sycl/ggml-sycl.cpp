@@ -3017,8 +3017,10 @@ inline void ggml_sycl_op_mul_mat_sycl(
                     out = src1_as_f16.get();
                 }
                 to_fp16_sycl(src1_ddf_i, out, ne, stream);
-                ggml_sycl_prof_mark_sub("CONVERT/src1/f32->f16",
-                                        ne * (sizeof(float) + sizeof(sycl::half)));
+                char ckey[64];
+                snprintf(ckey, sizeof(ckey), "CONVERT/src1/f32->f16/%ldx%ld", (long) ne10,
+                         (long) src1_ncols);
+                ggml_sycl_prof_mark_sub(ckey, ne * (sizeof(float) + sizeof(sycl::half)));
                 src1_ptr = out;
             }
         }
@@ -4883,6 +4885,34 @@ static bool can_use_dequantize_mul_mat_vec(const ggml_tensor * src0, const ggml_
 static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     return ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
            src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+}
+
+// 0 disables the producer-side f16 mirror, restoring the standalone conversion pass.
+static inline bool ggml_sycl_f16_mirror_enabled() {
+    static const int e = ggml_sycl_get_env("GGML_SYCL_F16_MIRROR", 1);
+    return e != 0;
+}
+
+sycl::half * ggml_sycl_f16_mirror_for_next_matmul(ggml_backend_sycl_context & ctx,
+                                                  const ggml_tensor * dst, size_t ne) {
+    if (!ggml_sycl_f16_mirror_enabled() || !ggml_sycl_src1_cache_enabled()) { return nullptr; }
+    if (dst == nullptr || dst->type != GGML_TYPE_F32 || dst->data == nullptr)  { return nullptr; }
+
+    const ggml_cgraph * g = ctx.cur_graph;
+    if (g == nullptr || ctx.cur_node + 1 >= g->n_nodes) { return nullptr; }
+    ggml_tensor * nxt = g->nodes[ctx.cur_node + 1];
+    if (nxt->op != GGML_OP_MUL_MAT || nxt->src[1] != dst) { return nullptr; }
+
+    // Only the f16 GEMM path converts src1. The mat-vec paths quantize to q8_1 or read f32
+    // directly, so a mirror written for them is pure extra traffic -- which is exactly the
+    // decode case, where ne[1] is 1..a few and this must stay silent.
+    if (nxt->src[1]->ne[1] <= 1) { return nullptr; }
+    if (can_use_dequantize_mul_mat_vec(nxt->src[0], nxt->src[1], nxt)) { return nullptr; }
+    if (can_use_mul_mat_vec_q(nxt->src[0], nxt->src[1], nxt))          { return nullptr; }
+
+    // The lookup re-validates: same graph, bounded node distance, and no node between here
+    // and the consumer writing over the f32 source. Storing cannot make a stale hit possible.
+    return src1_f16_store(ctx, dst->data, (const void *) ctx.stream(), ne);
 }
 
 // Read once, not per dispatch: this sits in the mul_mat hot path. 0 disables the short-row

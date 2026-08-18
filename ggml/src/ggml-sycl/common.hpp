@@ -884,6 +884,15 @@ static constexpr int ggml_sycl_get_max_cpy_bytes() {
     return 16;
 }
 
+// If the node after `dst` is a mul_mat that will convert `dst` to f16 as its src1, hand back a
+// buffer for the producing kernel to write that f16 copy into while the value is still in a
+// register, and register it in the src1 conversion cache so the mul_mat finds it. Returns
+// nullptr when the conversion would not happen (mat-vec paths, f16 dst, cache disabled), so a
+// caller can template the extra store away entirely. Defined in ggml-sycl.cpp, where the
+// cache and the mul_mat path predicates live.
+sycl::half * ggml_sycl_f16_mirror_for_next_matmul(ggml_backend_sycl_context & ctx,
+                                                  const ggml_tensor * dst, size_t ne);
+
 // Aligned memory transfers of 8/16 bytes can be faster than 2 transfers with 4 bytes.
 template <int nbytes, int alignment = 0>
 static __dpct_inline__ void ggml_sycl_memcpy_1(void * dst, const void * src) {

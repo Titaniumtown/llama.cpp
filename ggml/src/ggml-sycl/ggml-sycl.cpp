@@ -2805,7 +2805,8 @@ catch (sycl::exception const &exc) {
 // A no-op unless GGML_SYCL_PROF=1; defined next to the profiler further down.
 // non-static: fattn-common.hpp marks the FA K/V dequant, which is not a graph node.
 void ggml_sycl_prof_mark_sub(const std::string & name, uint64_t bytes);
-void ggml_sycl_prof_mark_gap();
+// `weight` only names the row; passing nullptr keeps the single aggregate row.
+void ggml_sycl_prof_mark_gap(const ggml_tensor * weight = nullptr);
 
 // 0 disables the src1 f16 conversion cache, restoring a fresh conversion per matmul.
 static inline bool ggml_sycl_src1_cache_enabled() {
@@ -3503,7 +3504,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                 // and in the patch series' notes, as though the numbers meant the same thing.
                 // `qhit` implies `cacheable`, which already required src1 on-device and
                 // contiguous, so this matches the miss branch's guard exactly.
-                ggml_sycl_prof_mark_gap();
+                ggml_sycl_prof_mark_gap(src0);
             } else {
             dev[i].src1_ddq = cacheable
                 ? src1_q8_store(ctx, dev[i].src1_ddf, (const void *) stream, ddq_bytes,
@@ -3513,7 +3514,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
             if (src1_on_device && src1_is_contiguous) {
                 // Bracket the submit so the row below measures this kernel and not the
                 // host setup that preceded it -- see ggml_sycl_prof_mark_gap().
-                ggml_sycl_prof_mark_gap();
+                ggml_sycl_prof_mark_gap(src0);
                 scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
                                                      /*num_src=*/2, " : converting src1 to Q8_1");
                 try {
@@ -6568,9 +6569,20 @@ void ggml_sycl_prof_mark_sub(const std::string & name, uint64_t bytes) {
 // microsecond since the previous barrier -- including GPU idle while the host was
 // still setting the call up. For a sub-mark whose kernel is large that bias is
 // noise; for one whose real work is sub-microsecond it is the entire row.
-void ggml_sycl_prof_mark_gap() {
+void ggml_sycl_prof_mark_gap(const ggml_tensor * weight) {
     if (ggml_sycl_op_prof * a = ggml_sycl_op_prof::active()) {
-        a->mark_named("HOST/gpu-idle+setup", 0);
+        // This row is 531 marks/iteration but 65% of its time sits in ~2.7 of them, and one
+        // aggregate name cannot say which. It is raised only from ggml_sycl_op_mul_mat, so a
+        // stall here is that op's *setup* -- pool alloc, reorder eligibility, q8_1 cache
+        // lookup -- and every one of those is per-weight. Split by weight and a rare stall
+        // names its tensor, keyed with the same role_of() the MUL_MAT rows use so the two
+        // tables join. Gated on the existing names flag: with it off the row is unchanged,
+        // so profiles recorded before this patch stay directly comparable.
+        if (weight && ggml_sycl_op_prof::name_keys()) {
+            a->mark_named("HOST/gpu-idle+setup/" + ggml_sycl_op_prof::role_of(weight->name), 0);
+        } else {
+            a->mark_named("HOST/gpu-idle+setup", 0);
+        }
     }
 }
 

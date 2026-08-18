@@ -74,6 +74,9 @@ void gated_delta_net_sycl(
     static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
     static_assert(S_v % C == 0, "S_v must be a multiple of the column block C");
     constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
+    // The attn store below parks column c in lane c, so a column past the warp would be
+    // dropped silently rather than caught -- the values are uniform, so nothing faults.
+    static_assert(C <= warp_size, "attn store parks column c in lane c");
     float         s_shard[C][rows_per_lane];
 #pragma unroll
     for (int c = 0; c < C; c++) {
@@ -88,6 +91,7 @@ void gated_delta_net_sycl(
     // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
 
     for (int t = 0; t < n_tokens; t++) {
+        float out_lane = 0.0f;
         const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
         const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
         const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
@@ -177,9 +181,10 @@ void gated_delta_net_sycl(
                     s_shard[c][r] = g_val * s_shard[c][r] + k_reg[r] * delta_col;
                 }
 
-                if (lane == 0) {
-                    attn_data[col0 + c] = (g_val * qs_col[c] + delta_col * kq) * scale;
-                }
+                // Park this column's result in the lane that will store it. Every input
+                // here is warp-uniform (all three reductions broadcast; v/g/beta are
+                // uniform loads), so lane c already holds column c's value -- no shuffle.
+                out_lane = (lane == c) ? (g_val * qs_col[c] + delta_col * kq) * scale : out_lane;
             }
         } else {
             // g is per-row on this path, so it is hoisted with q/k. exp() is pure, so
@@ -228,10 +233,17 @@ void gated_delta_net_sycl(
                     s_shard[c][r] = g_reg[r] * s_shard[c][r] + k_reg[r] * delta_col;
                 }
 
-                if (lane == 0) {
-                    attn_data[col0 + c] = (qs_col[c] + delta_col * kq) * scale;
-                }
+                out_lane = (lane == c) ? (qs_col[c] + delta_col * kq) * scale : out_lane;
             }
+        }
+
+        // One store instruction, lanes 0..C-1 active on consecutive addresses: the
+        // hardware coalesces it into a single transaction. The wide-store variants that
+        // preceded this built the same C values *in one lane* and each cost a spill --
+        // C results have to stay live across the s_shard update loop. This keeps every
+        // value dying in its own iteration and holds exactly one extra register.
+        if (lane < C) {
+            attn_data[col0 + lane] = out_lane;
         }
 
         attn_data += S_v * H;

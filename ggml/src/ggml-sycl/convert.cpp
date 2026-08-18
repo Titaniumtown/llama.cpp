@@ -642,7 +642,12 @@ static void dequantize_block_nc_sycl(const void *    vx,
                              dequantize_block_nc<qk, qr, dequantize_kernel>(vx, y, ne00, ne01, ne02, s01, s02, s03);
                          });
 }
-template <typename src_t, typename dst_t>
+// `w` contiguous elements per work-item. With w == 1 this is the original one-element-per-item
+// grid-stride loop, whose successive iterations are a whole global range apart -- so each item
+// issues one narrow load and one narrow store, and nothing can merge them. Giving an item a
+// contiguous run instead lets the compiler widen the accesses, while a subgroup still covers a
+// contiguous span so coalescing is unchanged. No sycl::vec, so bf16 needs no special case.
+template <typename src_t, typename dst_t, int w>
 static void convert_unary_nc(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t ne00, const int64_t ne01,
                           const int64_t ne02, const int64_t s01, const int64_t s02, const int64_t s03,
                           const sycl::nd_item<3> & item_ct1) {
@@ -659,10 +664,49 @@ static void convert_unary_nc(const void * __restrict__ vx, dst_t * __restrict__ 
     const int64_t ix = i03 * s03 + i02 * s02 + i01 * s01;
     const int64_t iy = ((i03 * ne02 + i02) * ne01 + i01) * ne00;
 
+    const int64_t stride = work_group_size * item_ct1.get_group_range(2) * w;
+
+    for (int64_t base = global_id * w; base < ne00; base += stride) {
+        if (base + w <= ne00) {
 #pragma unroll
-    for (int64_t i00 = global_id; i00 < ne00; i00 += work_group_size * item_ct1.get_group_range(2)) {
-        y[iy + i00] = static_cast<dst_t>(x[ix + i00]);
+            for (int j = 0; j < w; ++j) {
+                y[iy + base + j] = static_cast<dst_t>(x[ix + base + j]);
+            }
+        } else {
+            // ragged tail: only the last item of the last group can land here
+            for (int64_t i00 = base; i00 < ne00; ++i00) {
+                y[iy + i00] = static_cast<dst_t>(x[ix + i00]);
+            }
+        }
     }
+}
+
+// Elements per work-item for the unary convert. 1 is the historical kernel, which gives an
+// item a single element and so cannot use a wide access. Measured CONVERT rate on this
+// model, prefill at ub 2048: w=1 340 GB/s, w=2 450, w=4 347, w=8 323 -- so the peak is at 2
+// and it is not monotone, which is why this is a swept knob and not a derived constant.
+static inline int convert_unary_w() {
+    static const int v = [] {
+        const int w = ggml_sycl_get_env("GGML_SYCL_CONVERT_W", 2);
+        return (w == 1 || w == 2 || w == 4 || w == 8) ? w : 2;
+    }();
+    return v;
+}
+
+template <typename src_t, typename dst_t, int w>
+static void convert_unary_nc_launch(const void * __restrict__ vx, dst_t * __restrict__ y,
+                                    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+                                    const int64_t s01, const int64_t s02, const int64_t s03, dpct::queue_ptr queue) {
+    sycl::range<3> global_size(ne02 * ne03, ne01, ceil_div(ne00, SYCL_DEQUANTIZE_BLOCK_SIZE * (int64_t) w));
+
+    // decrease global range when it exceeds the max int
+    // TODO: Downsample logic is separated from the kernel, a rewrite is desirable
+    int64_t        downsized_workgroup = downsample_sycl_global_range(global_size[0], SYCL_DEQUANTIZE_BLOCK_SIZE);
+    sycl::range<3> workgroup_size(1, 1, downsized_workgroup);
+
+    queue->parallel_for(sycl::nd_range<3>(global_size * workgroup_size, workgroup_size), [=](sycl::nd_item<3> item_ct1) {
+        convert_unary_nc<src_t, dst_t, w>(vx, y, ne00, ne01, ne02, s01, s02, s03, item_ct1);
+    });
 }
 
 template <typename src_t, typename dst_t>
@@ -671,16 +715,23 @@ static void convert_unary_nc_sycl(const void * __restrict__ vx, dst_t * __restri
                                   const int64_t s01, const int64_t s02, const int64_t s03, dpct::queue_ptr queue) {
     dpct::has_capability_or_fail(queue->get_device(), { sycl::aspect::fp16 });
 
-    sycl::range<3> global_size(ne02 * ne03, ne01, ceil_div(ne00, SYCL_DEQUANTIZE_BLOCK_SIZE));
+    // A wide access has to be aligned to its own width, and every row start must be too, so
+    // the row strides are part of the condition and not just the row length. Anything that
+    // fails it keeps the one-element-per-item kernel, which has no alignment requirement.
+    const int w = convert_unary_w();
+    const bool aligned = (ne00 % w == 0) && (s01 % w == 0) && (s02 % w == 0) && (s03 % w == 0) &&
+                         (reinterpret_cast<uintptr_t>(vx) % (w * sizeof(src_t)) == 0) &&
+                         (reinterpret_cast<uintptr_t>(y) % (w * sizeof(dst_t)) == 0);
 
-    // decrease global range when it exceeds the max int
-    // TODO: Downsample logic is separated from the kernel, a rewrite is desirable
-    int64_t        downsized_workgroup = downsample_sycl_global_range(global_size[0], SYCL_DEQUANTIZE_BLOCK_SIZE);
-    sycl::range<3> workgroup_size(1, 1, downsized_workgroup);
-
-    queue->parallel_for(sycl::nd_range<3>(global_size * workgroup_size, workgroup_size), [=](sycl::nd_item<3> item_ct1) {
-        convert_unary_nc<src_t>(vx, y, ne00, ne01, ne02, s01, s02, s03, item_ct1);
-    });
+    if (aligned) {
+        switch (w) {
+            case 2: convert_unary_nc_launch<src_t, dst_t, 2>(vx, y, ne00, ne01, ne02, ne03, s01, s02, s03, queue); return;
+            case 4: convert_unary_nc_launch<src_t, dst_t, 4>(vx, y, ne00, ne01, ne02, ne03, s01, s02, s03, queue); return;
+            case 8: convert_unary_nc_launch<src_t, dst_t, 8>(vx, y, ne00, ne01, ne02, ne03, s01, s02, s03, queue); return;
+            default: break;
+        }
+    }
+    convert_unary_nc_launch<src_t, dst_t, 1>(vx, y, ne00, ne01, ne02, ne03, s01, s02, s03, queue);
 }
 
 template <typename src_t, typename dst_t>

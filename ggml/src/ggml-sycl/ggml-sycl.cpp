@@ -6600,6 +6600,18 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
+        // Close the span before this node dispatches anything. A mark's duration is
+        // marks[i].end - marks[i-1].end, and prof.mark(node) is raised *after*
+        // ggml_sycl_compute_forward, so without this every node's row silently absorbs
+        // the host gap that preceded it. That is not uniform: an op that happens to
+        // raise a sub-mark (a mat-vec quantizing its src1) already has the gap
+        // intercepted, and an op following a long kernel has no gap because the host
+        // ran ahead during it -- so the same kernel measures fast or slow depending on
+        // what ran before it. `ffn_up` (after the 98 us `ffn_gate`) fitted the
+        // cost model to -2.4 us while `attn_gate` (after a ~6 us conv) sat +15.0 us
+        // above it, which reads as a 38% kernel defect and is not one.
+        prof.mark_named("HOST/pre-node", 0);
+
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
         if (nodes_to_skip != 0) {
             prof.mark(node, cgraph, i, nodes_to_skip + 1);

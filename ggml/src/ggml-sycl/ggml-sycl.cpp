@@ -3272,6 +3272,13 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                               << ", line:" << __LINE__ << std::endl;
                     std::exit(1);
                 }
+                // The f16 twin of this conversion has had its own row since the profiler was
+                // written; this one never did, so its cost was folded into whichever MUL_MAT
+                // triggered it. That is a large thing to hide: it is the single most-called
+                // operation in decode, ahead of every mat-vec.
+                ggml_sycl_prof_mark_sub("QUANTIZE/src1/f32->q8_1",
+                                        (uint64_t) nrows1 * ne10 * sizeof(float)
+                                            + (uint64_t) nrows1 * src1_padded_col_size * q8_1_ts / q8_1_bs);
             }
         }
 

@@ -6407,6 +6407,21 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 return src0_type == GGML_TYPE_F32;
             }
         case GGML_OP_CONCAT:
+            // ggml_sycl_op_concat() ends its type switch in GGML_ASSERT(false), so a type
+            // it does not implement aborts the process instead of falling back to CPU.
+            // test-backend-ops exercises CONCAT over the quantised types and dies here.
+            switch (op->type) {
+                case GGML_TYPE_F32:
+                case GGML_TYPE_F16:
+                case GGML_TYPE_BF16:
+                case GGML_TYPE_I32:
+                case GGML_TYPE_I16:
+                case GGML_TYPE_I64:
+                case GGML_TYPE_I8:
+                    return true;
+                default:
+                    return false;
+            }
         case GGML_OP_DUP:
         case GGML_OP_ARGMAX:
         case GGML_OP_NONE:

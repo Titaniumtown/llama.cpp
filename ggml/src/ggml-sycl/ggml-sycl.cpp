@@ -5386,6 +5386,15 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         use_dequantize_mul_mat_vec = use_dequantize_mul_mat_vec && use;
     }
 
+    // A row-limited mat-mul MUST take the MMVQ path: it is the only implementation that
+    // honors ggml_mul_mat_get_row_limit (compute the first n rows, -INFINITY the tail).
+    // Without this, an ncols==1 call on an already-reordered tensor prefers the ESIMD/DMMV
+    // branch above and silently computes every row -- which is exactly how the MTP draft
+    // head read the full 1.043 GB LM head per draft step while the shortlist was "on".
+    if (use_mul_mat_vec_q && ggml_mul_mat_get_row_limit(dst) > 0) {
+        use_dequantize_mul_mat_vec = false;
+    }
+
     if (!split && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1) {
         // TODO: Refactor and cleanup of mul mat dispatching.
         if (src0->ne[3] == 1 && src1->ne[3] == 1) {

@@ -3416,6 +3416,11 @@ static void mul_mat_vec_iq4_xs_q8_1_sycl_switch_ncols(
 // therefore what every op that has not opted in gets.
 static int sycl_mul_mat_row_limit(const ggml_tensor * dst, int64_t row_low, int64_t row_diff) {
     const int32_t limit = ggml_mul_mat_get_row_limit(dst);
+    static const bool rl_trace = getenv("LLAMA_MTP_RL_TRACE") != nullptr;
+    if (rl_trace && dst->ne[0] > 200000) {
+        fprintf(stderr, "[RLGET] dst=%p op=%d ne0=%lld limit=%d row_low=%lld\n",
+                (void *) dst, (int) dst->op, (long long) dst->ne[0], (int) limit, (long long) row_low);
+    }
     if (limit <= 0) {
         return (int) row_diff;
     }

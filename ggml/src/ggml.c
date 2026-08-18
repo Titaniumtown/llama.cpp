@@ -3297,13 +3297,15 @@ void ggml_mul_mat_set_row_limit(
         int32_t              n) {
     GGML_ASSERT(a->op == GGML_OP_MUL_MAT);
 
-    // Slot 0 is ggml_mul_mat_set_prec. Out-of-range collapses to 0 = "no limit" so a caller
-    // cannot express a limit that would silently drop rows the consumer still reads.
+    // Slot 0 is ggml_mul_mat_set_prec; slot 1 is the GGML_HINT_SRC0_IS_HADAMARD tag (they
+    // collided when both lived in slot 1: a hinted mat-mul read back as "row limit 1" and a
+    // limited one as "not hadamard", each silently). Out-of-range collapses to 0 = "no limit"
+    // so a caller cannot express a limit that would silently drop rows the consumer reads.
     if (n < 0 || n >= a->ne[0]) {
         n = 0;
     }
 
-    ggml_set_op_params_i32(a, 1, n);
+    ggml_set_op_params_i32(a, 2, n);
 }
 
 int32_t ggml_mul_mat_get_row_limit(const struct ggml_tensor * a) {
@@ -3311,7 +3313,7 @@ int32_t ggml_mul_mat_get_row_limit(const struct ggml_tensor * a) {
         return 0;
     }
 
-    return ggml_get_op_params_i32(a, 1);
+    return ggml_get_op_params_i32(a, 2);
 }
 
 void ggml_mul_mat_set_prec(

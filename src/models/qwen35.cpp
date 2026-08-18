@@ -524,12 +524,26 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, cons
 // on other vocabularies or corpora; it is safe there only in the sense that a bad K costs
 // throughput and never correctness. LLAMA_MTP_DRAFT_ROW_LIMIT overrides it, 0 disables it.
 static void qwen35_mtp_set_draft_row_limit(ggml_tensor * logits) {
-    // A LoRA-wrapped head is an add, not a mat-mul, and has no row limit to set.
-    if (!logits || logits->op != GGML_OP_MUL_MAT) {
+    // The head mat-mul may be wrapped: build_lora_mm returns ggml_mul(mm, w_s) when the
+    // quant ships per-tensor head scales (output_s / shared_head_head_s), and a LoRA
+    // adds on top of that. Descend through the elementwise wrappers to the MUL_MAT.
+    // The -INFINITY tail the row-limited kernel writes survives MUL/SCALE unchanged
+    // (the dequant scale is a positive scalar), so the limit composes with the wrap.
+    //
+    // This used to test `logits` itself and silently no-op on any wrapped head: on the
+    // current production quant (which carries head scales) every draft step read the
+    // full 1.043 GB q6_K head -- 396 full-size head reads per 256 served tokens, 8.3%
+    // of GPU time, with the shortlist code shipped and believed active. A LoRA add is
+    // still left unlimited: its low-rank contribution is dense over the tail rows.
+    ggml_tensor * mm = logits;
+    while (mm != nullptr && mm->op != GGML_OP_MUL_MAT) {
+        mm = (mm->op == GGML_OP_MUL || mm->op == GGML_OP_SCALE) ? mm->src[0] : nullptr;
+    }
+    if (mm == nullptr) {
         return;
     }
 
-    const int64_t n_vocab = logits->ne[0];
+    const int64_t n_vocab = mm->ne[0];
 
     int64_t k = (n_vocab * 3) / 8;
     if (const char * env = getenv("LLAMA_MTP_DRAFT_ROW_LIMIT")) {
@@ -540,7 +554,12 @@ static void qwen35_mtp_set_draft_row_limit(ggml_tensor * logits) {
     }
 
     if (k > 0 && k < n_vocab) {
-        ggml_mul_mat_set_row_limit(logits, (int32_t) k);
+        ggml_mul_mat_set_row_limit(mm, (int32_t) k);
+        if (getenv("LLAMA_MTP_RL_TRACE")) {
+            fprintf(stderr, "[RLSET] mm=%p op=%d ne0=%lld k=%lld readback=%d\n",
+                    (void *) mm, (int) mm->op, (long long) n_vocab, (long long) k,
+                    (int) ggml_mul_mat_get_row_limit(mm));
+        }
     }
 }
 

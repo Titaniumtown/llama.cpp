@@ -6168,7 +6168,17 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 
-        if (node->op == GGML_OP_MUL_MAT && ggml_sycl_mul_mat_glu_mmvq_fused(*sycl_ctx, cgraph, i)) {
+        // Folding the gate weight and the SwiGLU into the up projection's mat-vec is a win
+        // at ONE column and a loss at two or more: the fused kernel carries partial_up and
+        // partial_gate plus a second weight quad per work-item, and past a single column
+        // that costs more than the launch and the activation re-quantisation it saves.
+        // GGML_SYCL_FUSE_GLU is therefore the largest ncols_dst to fuse at, not a flag --
+        // 0 still disables it outright and 8 restores the previous always-fuse behaviour,
+        // which keeps the multi-column fused kernel reachable for re-testing on other parts.
+        static const int fuse_glu_max_ncols = ggml_sycl_get_env("GGML_SYCL_FUSE_GLU", 1);
+        if (node->op == GGML_OP_MUL_MAT && i + 2 < cgraph->n_nodes &&
+            cgraph->nodes[i + 2]->op == GGML_OP_GLU && cgraph->nodes[i + 2]->ne[1] <= fuse_glu_max_ncols &&
+            ggml_sycl_mul_mat_glu_mmvq_fused(*sycl_ctx, cgraph, i)) {
             prof.mark(node, cgraph, i, 3);
             i += 2;
             continue;

@@ -2230,11 +2230,19 @@ static void mul_mat_vec_q4_K_reorder_wide_ncols_split(const void * __restrict__ 
 
 // Pick the split for a shape. Engages only below `target` subgroups, i.e. only when the
 // row count alone cannot fill the device, and never hands out more parts than a row has
-// block-waves. GGML_SYCL_MMVQ_SPLIT_TARGET=0 disables it outright (the A/B control);
-// GGML_SYCL_MMVQ_SPLIT=N forces one value for sweeps.
-static inline int ggml_sycl_mmvq_split(const int ncols, const int nrows) {
-    static const int forced = ggml_sycl_get_env("GGML_SYCL_MMVQ_SPLIT", 0);
-    static const int target = ggml_sycl_get_env("GGML_SYCL_MMVQ_SPLIT_TARGET", 2048);
+// block-waves. The default target is width-aware, from the 3-arm target sweep on the
+// B70 (Qwen3.8, gate-q4k file): batch-1 (ncols_dst==1) wanted 16384 -- ffn_down
+// (K=17408) runs 532.7 -> 557.0 GB/s at split4 and tg64 gained +0.5% with ±0.00
+// spreads -- while ncols_dst>=2 wanted 8192 (npl4 S_TG 89.27 -> 89.96; 16384 regressed
+// it to 88.91: the SLM/barrier reduce scales with ncols_dst, so wider columns tolerate
+// less split). Short-K rows (20-24 blocks) barely move either way; long-K rows carry
+// the win. GGML_SYCL_MMVQ_SPLIT_TARGET=0 disables outright (the A/B control), >0
+// overrides both widths; GGML_SYCL_MMVQ_SPLIT=N forces one value for sweeps.
+static inline int ggml_sycl_mmvq_split(const int ncols, const int nrows, const int ncols_dst) {
+    static const int forced     = ggml_sycl_get_env("GGML_SYCL_MMVQ_SPLIT", 0);
+    static const int target_env = ggml_sycl_get_env("GGML_SYCL_MMVQ_SPLIT_TARGET", -1);
+
+    const int target = target_env >= 0 ? target_env : (ncols_dst == 1 ? 16384 : 8192);
 
     const int waves_per_row = ceil_div(ncols / QK_K, WARP_SIZE / 8);
 
@@ -2286,7 +2294,7 @@ static void reorder_mul_mat_vec_q4_k_q8_1_sycl_ncols(
 
     constexpr size_t num_subgroups = WARP_SIZE;
 
-    switch (ggml_sycl_mmvq_split(ncols, nrows)) {
+    switch (ggml_sycl_mmvq_split(ncols, nrows, ncols_dst)) {
         case 2:
             reorder_mul_mat_vec_q4_k_q8_1_sycl_ncols_split<ncols_dst, 2>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
             return;
@@ -2529,9 +2537,23 @@ static void mul_mat_vec_q5_K_reorder_wide_ncols(const void * __restrict__ vx, co
                                                 const int stride_col_y_bytes, const int stride_col_dst,
                                                 const sycl::nd_item<3> & nd_item);
 
+template <int ncols_dst, int SPLIT>
+static void reorder_mul_mat_vec_q5_k_q8_1_sycl_ncols_split(
+        const void * vx, const void * vy, float * dst,
+        const int ncols, const int nrows,
+        const int stride_col_y_bytes, const int stride_col_dst,
+        dpct::queue_ptr stream);
+
 static void reorder_mul_mat_vec_q5_k_q8_1_sycl(const void * vx, const void * vy, float * dst, const int ncols,
                                                const int nrows, dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
+
+    switch (ggml_sycl_mmvq_split(ncols, nrows, 1)) {
+        case 2: reorder_mul_mat_vec_q5_k_q8_1_sycl_ncols_split<1, 2>(vx, vy, dst, ncols, nrows, 0, 0, stream); return;
+        case 4: reorder_mul_mat_vec_q5_k_q8_1_sycl_ncols_split<1, 4>(vx, vy, dst, ncols, nrows, 0, 0, stream); return;
+        case 8: reorder_mul_mat_vec_q5_k_q8_1_sycl_ncols_split<1, 8>(vx, vy, dst, ncols, nrows, 0, 0, stream); return;
+        default: break;
+    }
 
     constexpr size_t num_subgroups = WARP_SIZE;
     const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
@@ -2673,6 +2695,159 @@ static void mul_mat_vec_q5_K_reorder_wide_ncols(const void * __restrict__ vx, co
     }
 }
 
+// K-split twin of the wide kernel above, structured like the q4_K split pair:
+// SPLIT subgroups share one row, interleaved by whole block-waves so each
+// subgroup keeps the 8-lane/128-byte coalescing of the unsplit kernel exactly,
+// then reduce through SLM. Exists for medium-N shapes (attn_gate 6144, ssm_out
+// / ffn_down 5120 rows): row count alone leaves too few in-flight loads to
+// hide latency there -- measured 434-461 GB/s against ffn_up's 560 at n=1,
+// and rows-per-WG packing (GGML_SYCL_MMV_NSG sweep) moved nothing, so the
+// deficit is per-row read streams, which splitting doubles.
+template <int ncols_dst, int SPLIT>
+static void mul_mat_vec_q5_K_reorder_wide_ncols_split(const void * __restrict__ vx, const void * __restrict__ vy,
+                                                      float * __restrict__ dst, const int ncols, const int nrows,
+                                                      const int stride_col_y_bytes, const int stride_col_dst,
+                                                      float * __restrict__ slm,
+                                                      const sycl::nd_item<3> & nd_item) {
+    using block_type   = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q5_K>;
+    using block_traits = typename block_type::traits;
+
+    const auto sg       = nd_item.get_sub_group();
+    const int  sg_range = sg.get_group_linear_range();
+    const int  sg_id    = sg.get_group_linear_id();
+
+    const int rows_per_group = sg_range / SPLIT;
+    const int row_local      = sg_id / SPLIT;
+    const int part           = sg_id % SPLIT;
+    const int row            = nd_item.get_group_linear_id() * rows_per_group + row_local;
+
+    // No early return anywhere in this kernel: every subgroup must reach the barrier.
+    const bool active = row < nrows;
+
+    const int lane            = sg.get_local_linear_id();
+    const int blocks_per_wave = WARP_SIZE / 8;
+    const int lb              = lane / 8;
+    const int c               = lane % 8;
+    const int g               = c >> 1;
+    const int half            = c & 1;
+    const int uoff            = half ? 4 : 0;
+
+    const int blocks_per_row = ncols / block_traits::qk;
+    const int nblocks        = nrows * blocks_per_row;
+
+    const uint8_t * vbq = static_cast<const uint8_t *>(vx);
+
+    float partial[ncols_dst] = { 0.0f };
+    if (active) {
+        for (int blk = lb + part * blocks_per_wave; blk < blocks_per_row; blk += SPLIT * blocks_per_wave) {
+            const int  ibx       = row * blocks_per_row + blk;
+            const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
+            const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+            const int  iby       = blk * block_type::block_to_q8_1_ratio();
+
+            const uint8_t *     qs      = vbq + bx_offset.first;
+            const uint8_t *     qh_base = vbq + bx_offset.second;
+            const uint16_t *    scales  = reinterpret_cast<const uint16_t *>(vbq + d_offset.first);
+            const sycl::half2 * dms     = reinterpret_cast<const sycl::half2 *>(vbq + d_offset.second);
+
+            const sycl::int4 vq  = *(reinterpret_cast<const sycl::int4 *>(qs) + c);
+            const sycl::int4 qh4 = *(reinterpret_cast<const sycl::int4 *>(qh_base) + half);
+
+            uint16_t  aux[2];
+            const int jsc = g;
+            if (jsc < 2) {
+                aux[0] = scales[jsc + 0] & 0x3f3f;
+                aux[1] = scales[jsc + 2] & 0x3f3f;
+            } else {
+                aux[0] = ((scales[jsc + 2] >> 0) & 0x0f0f) | ((scales[jsc - 2] & 0xc0c0) >> 2);
+                aux[1] = ((scales[jsc + 2] >> 4) & 0x0f0f) | ((scales[jsc - 0] & 0xc0c0) >> 2);
+            }
+            const uint8_t *    sc   = reinterpret_cast<const uint8_t *>(aux);
+            const uint8_t *    m    = sc + 2;
+            const sycl::float2 dm5f = (*dms).convert<float, sycl::rounding_mode::automatic>();
+
+            int v_lo[4], v_hi[4];
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                v_lo[p] = ((vq[p] >> 0) & 0x0F0F0F0F) | (((qh4[p] >> (2 * g + 0)) << 4) & 0x10101010);
+                v_hi[p] = ((vq[p] >> 4) & 0x0F0F0F0F) | (((qh4[p] >> (2 * g + 1)) << 4) & 0x10101010);
+            }
+
+            const int gq8 = iby + 2 * g;
+
+#pragma unroll
+            for (int col = 0; col < ncols_dst; ++col) {
+                const char *        vy_j = static_cast<const char *>(vy) + col * stride_col_y_bytes;
+                const int8_t *      vy8  = reinterpret_cast<const int8_t *>(vy_j);
+                const sycl::half2 * vyds = reinterpret_cast<const sycl::half2 *>(vy_j + ncols);
+                const sycl::float2  ds0  = vyds[gq8 + 0].convert<float, sycl::rounding_mode::automatic>();
+                const sycl::float2  ds1  = vyds[gq8 + 1].convert<float, sycl::rounding_mode::automatic>();
+                const sycl::int4    u0   = *reinterpret_cast<const sycl::int4 *>(reinterpret_cast<const int *>(vy8 + (gq8 + 0) * QK8_1) + uoff);
+                const sycl::int4    u1   = *reinterpret_cast<const sycl::int4 *>(reinterpret_cast<const int *>(vy8 + (gq8 + 1) * QK8_1) + uoff);
+
+                int dot0 = 0;
+                int dot1 = 0;
+#pragma unroll
+                for (int p = 0; p < 4; ++p) {
+                    dot0 = dpct::dp4a(v_lo[p], u0[p], dot0);
+                    dot1 = dpct::dp4a(v_hi[p], u1[p], dot1);
+                }
+                const float sumf_d = ds0.x() * (float) (dot0 * sc[0]) + ds1.x() * (float) (dot1 * sc[1]);
+                const float sumf_m = (half == 0) ? (ds0.y() * m[0] + ds1.y() * m[1]) : 0.0f;
+                partial[col] += dm5f.x() * sumf_d - dm5f.y() * sumf_m;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int col = 0; col < ncols_dst; ++col) {
+        const float sum = sycl::reduce_over_group(sg, partial[col], std::plus<>());
+        if (sg.leader()) {
+            slm[sg_id * ncols_dst + col] = sum;
+        }
+    }
+
+    nd_item.barrier(sycl::access::fence_space::local_space);
+
+    if (part == 0 && active) {
+#pragma unroll
+        for (int col = 0; col < ncols_dst; ++col) {
+            float total = 0.0f;
+#pragma unroll
+            for (int pt = 0; pt < SPLIT; ++pt) {
+                total += slm[(row_local * SPLIT + pt) * ncols_dst + col];
+            }
+            if (sg.leader()) {
+                dst[col * stride_col_dst + row] = total;
+            }
+        }
+    }
+}
+
+template <int ncols_dst, int SPLIT>
+static void reorder_mul_mat_vec_q5_k_q8_1_sycl_ncols_split(
+        const void * vx, const void * vy, float * dst,
+        const int ncols, const int nrows,
+        const int stride_col_y_bytes, const int stride_col_dst,
+        dpct::queue_ptr stream) {
+    constexpr size_t num_subgroups  = WARP_SIZE;
+    constexpr int    rows_per_group = (int) num_subgroups / SPLIT;
+
+    const int block_num_y = ceil_div(nrows, rows_per_group);
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
+
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> slm(sycl::range<1>(num_subgroups * ncols_dst), cgh);
+        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_q5_K_reorder_wide_ncols_split<ncols_dst, SPLIT>(
+                                 vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst,
+                                 get_pointer(slm), nd_item);
+                         });
+    });
+}
+
 // Wide multi-column Q6_K reorder MMVQ (MTP verify). Hoists the weight load +
 // 6-bit decode (vl|vh, int8 scales, d; Q6_K is symmetric, no min) out of the
 // per-column loop. Math is identical to vec_dot_q6_K_q8_1_impl_mmvq_scalar.
@@ -2802,6 +2977,20 @@ static void reorder_mul_mat_vec_q5_k_q8_1_sycl_ncols(
         const int stride_col_y_bytes, const int stride_col_dst,
         dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
+
+    switch (ggml_sycl_mmvq_split(ncols, nrows, ncols_dst)) {
+        case 2:
+            reorder_mul_mat_vec_q5_k_q8_1_sycl_ncols_split<ncols_dst, 2>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
+            return;
+        case 4:
+            reorder_mul_mat_vec_q5_k_q8_1_sycl_ncols_split<ncols_dst, 4>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
+            return;
+        case 8:
+            reorder_mul_mat_vec_q5_k_q8_1_sycl_ncols_split<ncols_dst, 8>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
+            return;
+        default:
+            break;
+    }
 
     constexpr size_t num_subgroups = WARP_SIZE;
     const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);

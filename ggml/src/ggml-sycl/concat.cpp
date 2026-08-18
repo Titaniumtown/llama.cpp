@@ -150,6 +150,44 @@ static void concat_T_sycl(const T *x, const T *y, T *dst,
   }
 }
 
+// Flat form of the non-contiguous kernel, for a dst whose innermost dimension is
+// shorter than a sub-group. The row-per-work-group form below pads its block up to
+// WARP_SIZE and launches one work-group per (i1,i2,i3), which at ne0 = 7 means
+// ne1*ne2*ne3 work-groups that each idle 9 of their 16 lanes. This is the same fix
+// concat_T_dim0_flat already carries on the contiguous side.
+template <typename T>
+static void concat_T_non_cont_flat(const char * src0, const char * src1, char * dst,
+                                   const int64_t ne00, const int64_t ne01, const int64_t ne02,
+                                   const int64_t ne03, const uint64_t nb00, const uint64_t nb01,
+                                   const uint64_t nb02, const uint64_t nb03, const uint64_t nb10,
+                                   const uint64_t nb11, const uint64_t nb12, const uint64_t nb13,
+                                   const int64_t ne0, const int64_t ne1, const int64_t ne2,
+                                   const uint64_t nb0, const uint64_t nb1, const uint64_t nb2,
+                                   const uint64_t nb3, const int64_t o0, const int64_t o1,
+                                   const int64_t o2, const int64_t o3, const int64_t nelem,
+                                   const sycl::nd_item<1> & item_ct1) {
+  const int64_t idx = item_ct1.get_global_linear_id();
+  if (idx >= nelem) {
+    return;
+  }
+
+  const int64_t r0 = idx / ne0;
+  const int64_t i0 = idx - r0 * ne0;
+  const int64_t r1 = r0 / ne1;
+  const int64_t i1 = r0 - r1 * ne1;
+  const int64_t i3 = r1 / ne2;
+  const int64_t i2 = r1 - i3 * ne2;
+
+  const T * x;
+  if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+    x = (const T *) (src0 + i3 * nb03 + i2 * nb02 + i1 * nb01 + i0 * nb00);
+  } else {
+    x = (const T *) (src1 + (i3 - o3) * nb13 + (i2 - o2) * nb12 + (i1 - o1) * nb11 + (i0 - o0) * nb10);
+  }
+
+  *(T *) (dst + i3 * nb3 + i2 * nb2 + i1 * nb1 + i0 * nb0) = *x;
+}
+
 // non-contiguous kernel (slow)
 template<typename T>
 static void concat_T_sycl_non_cont(
@@ -161,6 +199,31 @@ static void concat_T_sycl_non_cont(
     int64_t ne2, int64_t ne3, uint64_t nb0, uint64_t nb1, uint64_t nb2,
     uint64_t nb3, int32_t dim) {
   sycl::range<3> gridDim(ne3, ne2, ne1);
+
+  // A row shorter than a sub-group cannot fill even one, so the per-row form below
+  // wastes (WARP_SIZE - ne0) lanes in every work-group and launches one work-group
+  // per row. The GDN/Mamba conv window hits this on every layer of every recurrent
+  // model: ggml_concat(conv_state, ggml_transpose(x), 0) is non-contiguous by
+  // construction -- ggml_transpose sets nb[0] = nb[1] -- and its ne0 is
+  // (d_conv - 1) + n_tokens, i.e. 7 for d_conv 4 at an MTP verify width of 4.
+  if (ne0 < WARP_SIZE) {
+      const int64_t nelem = ne0 * ne1 * ne2 * ne3;
+      const int64_t nwg   = (nelem + SYCL_CONCAT_BLOCK_SIZE - 1) / SYCL_CONCAT_BLOCK_SIZE;
+
+      int64_t o[4] = { 0, 0, 0, 0 };
+      o[dim]       = dim == 0 ? ne00 : (dim == 1 ? ne01 : (dim == 2 ? ne02 : ne03));
+      const int64_t o0 = o[0], o1 = o[1], o2 = o[2], o3 = o[3];
+
+      stream->parallel_for(
+          sycl::nd_range<1>(sycl::range<1>(nwg * SYCL_CONCAT_BLOCK_SIZE),
+                            sycl::range<1>(SYCL_CONCAT_BLOCK_SIZE)),
+          [=](sycl::nd_item<1> item_ct1) {
+              concat_T_non_cont_flat<T>(src0, src1, dst, ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03,
+                                        nb10, nb11, nb12, nb13, ne0, ne1, ne2, nb0, nb1, nb2, nb3,
+                                        o0, o1, o2, o3, nelem, item_ct1);
+          });
+      return;
+  }
 
   // Avoid oversubscribing device when there is not enough elements along the innermost dim to
   // fill a full SYCL_CONCAT_BLOCK_SIZE. For larger # of elements, the full SYCL_CONCAT_BLOCK_SIZE

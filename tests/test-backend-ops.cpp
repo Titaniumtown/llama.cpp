@@ -9750,6 +9750,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // dim-0 concat whose dst row is shorter than a sub-group. The block above cannot
+    // reach this: at {11,12,13,14} + 7 the dim-0 dst row is 18 wide, so every short-row
+    // case it covers is dim 1..3. This is the recurrent conv-window shape --
+    // ggml_concat(conv_state, ggml_transpose(x), 0) with ne0 = (d_conv - 1) + n_tokens,
+    // built by mamba, plamo2, kimi-linear, lfm2, arwkv7 and the delta-net models --
+    // which is both dim 0 and narrow, and is non-contiguous by construction.
+    for (int v : { 0, 1, 2, 3 }) {
+        test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 512, 1, 1}, 4, 0, v));
+        test_cases.emplace_back(new test_concat(GGML_TYPE_F16, {3, 512, 1, 1}, 4, 0, v));
+    }
+
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
         for (int v : { 0, 4, 8, 12 }) {
             for (int dim : { 0, 1, 2, 3, }) {

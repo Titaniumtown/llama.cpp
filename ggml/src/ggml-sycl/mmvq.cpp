@@ -2521,10 +2521,24 @@ static void mul_mat_vec_q6_K_reorder_wide_ncols(const void * __restrict__ vx, co
             const sycl::int4    u1   = *(reinterpret_cast<const sycl::int4 *>(q8p + (bq8 + 2) * QK8_1) + uoff_i4);
             const float         d80  = (*(q8ds + bq8 + 0))[0];
             const float         d81  = (*(q8ds + bq8 + 2))[0];
+            // dp4a carries its own accumulator, and sc0/sc1/d80/d81/d are all invariant
+            // across p -- so chain the four dp4a's in int32 and apply the scales once,
+            // exactly the transformation `q4k_wide_dot` already documents for Q4_K and
+            // that Q6_K never got. Passing 0 as the accumulator and discarding it cost,
+            // per block per column, 8 int multiplies by sc, 8 int->float converts, 12
+            // float multiplies and 8 float adds; this pays 2, 2, 3 and 2 for the same 8
+            // dp4a. The int sums are exact (|acc| <= 4*4*32*127 = 65024, times |sc| <= 127
+            // is 8.3e6, inside both int32 and float's exact-integer range), so the only
+            // numerical change is float summation order, and in the direction of fewer
+            // roundings.
+            int acc0 = 0;
+            int acc1 = 0;
 #pragma unroll
             for (int p = 0; p < 4; ++p) {
-                partial[col] += d * (d80 * (dpct::dp4a(vi0[p], u0[p], 0) * sc0) + d81 * (dpct::dp4a(vi1[p], u1[p], 0) * sc1));
+                acc0 = dpct::dp4a(vi0[p], u0[p], acc0);
+                acc1 = dpct::dp4a(vi1[p], u1[p], acc1);
             }
+            partial[col] += d * (d80 * (float) (acc0 * sc0) + d81 * (float) (acc1 * sc1));
         }
     }
 

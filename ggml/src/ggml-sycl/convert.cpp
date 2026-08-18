@@ -223,6 +223,16 @@ static inline int q4k_deq_n() {
     return v;
 }
 
+// Elements per thread in the q6_K reorder dequant. 8 measured best (620 GB/s) against the
+// previous shape's 434-465, with 4 within noise of it; see the table on the kernel.
+static inline int q6k_deq_m() {
+    static const int v = [] {
+        const int m = ggml_sycl_get_env("GGML_SYCL_Q6K_DEQ_M", 8);
+        return (m == 2 || m == 4 || m == 8 || m == 16) ? m : 8;
+    }();
+    return v;
+}
+
 static inline bool q4k_deq_slm() {
     static const bool v = ggml_sycl_get_env("GGML_SYCL_Q4K_DEQ_SLM", 1) != 0;
     return v;
@@ -375,9 +385,22 @@ static void dequantize_row_q6_K_sycl_reorder(const void * vx, dst_t * y, const i
 
     dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
 
-    stream->parallel_for(
-        sycl::nd_range<3>(sycl::range<3>(1, 1, nb) * sycl::range<3>(1, 1, 64), sycl::range<3>(1, 1, 64)),
-        [=](sycl::nd_item<3> item_ct1) { dequantize_block_q6_K_reorder(vx, y, item_ct1, nb); });
+    const auto launch = [&]<int m>() {
+        constexpr int    per_ip = 32 / m;
+        constexpr size_t wg     = 256;
+        const int64_t    chunks = nb * 2 * per_ip;
+        const int64_t    ngroup = (chunks + wg - 1) / wg;
+        stream->parallel_for(sycl::nd_range<1>(sycl::range<1>(ngroup * wg), sycl::range<1>(wg)),
+                             [=](sycl::nd_item<1> item_ct1) {
+                                 dequantize_block_q6_K_reorder<dst_t, m>(vx, y, item_ct1, nb);
+                             });
+    };
+    switch (q6k_deq_m()) {
+        case 2:  launch.template operator()<2>();  break;
+        case 4:  launch.template operator()<4>();  break;
+        case 16: launch.template operator()<16>(); break;
+        default: launch.template operator()<8>();  break;
+    }
 }
 
 template <typename dst_t>

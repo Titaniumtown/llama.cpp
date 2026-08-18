@@ -1388,14 +1388,38 @@ static void dequantize_block_q6_K(const void * __restrict__ vx, dst_t * __restri
 #endif
 }
 
-template <typename dst_t>
+// Each thread owns `m` CONSECUTIVE elements of each of the four output runs, so each run is
+// one wide store instead of m scalar 2-byte stores 64 B apart. Standalone bench, real
+// 17408x5120 shape, three runs:
+//
+//     shipped: 64 thr/blk, one block/group, 4 scalar stores  1481 / 579 / 541 us  170/434/465 GB/s
+//     m=1  wg=256  scalar stores                             2082 / 1600 / 1549   121/157/162
+//     m=2  wg=256  vec2  (4B)                                 555 / 554 / 554      453/454/454
+//     m=4  wg=256  vec4  (8B)                                 408 / 408 / 409      616/616/615
+//     m=8  wg=256  vec8  (16B)                                406 / 406 / 405      620/619/620  <-
+//     m=16 wg=256  vec16 (32B)                                744 / 745 / 745      338/337/338
+//
+// m=1 is the control that matters: the same re-indexing with SCALAR stores is worse than the
+// kernel it replaces, so none of the win is the work-group reshape -- it is the store width,
+// and the reshape only exists to make wide stores expressible. As with q4_K in 0060, the
+// scalar rows swing (541 to 1481) while every vec row repeats to under 1%.
+//
+// m divides 16 and il0 is a multiple of m, so a chunk never crosses a scale boundary and the
+// four scale bytes are loaded once per chunk rather than once per element.
+template <typename dst_t, int m>
 static void dequantize_block_q6_K_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy,
-                                          const sycl::nd_item<3> & item_ct1, int64_t n_blocks) {
-    const int64_t ib = item_ct1.get_group(2);
+                                          const sycl::nd_item<1> & item_ct1, int64_t n_blocks) {
+    constexpr int per_ip = 32 / m;
 
-    const int64_t tid = item_ct1.get_local_id(2);
-    const int64_t ip  = tid / 32;       // ip is 0 or 1
-    const int64_t il  = tid - 32 * ip;  // 0...32
+    const int64_t c = item_ct1.get_global_id(0);
+    if (c >= n_blocks * 2 * per_ip) {
+        return;
+    }
+
+    const int64_t ib  = c / (2 * per_ip);
+    const int64_t rem = c - ib * (2 * per_ip);
+    const int64_t ip  = rem / per_ip;             // ip is 0 or 1
+    const int64_t il  = (rem - ip * per_ip) * m;  // 0...32, a multiple of m
     const int64_t is  = 8 * ip + il / 16;
 
     const uint8_t *   base_ptr           = static_cast<const uint8_t *>(vx);
@@ -1410,14 +1434,32 @@ static void dequantize_block_q6_K_reorder(const void * __restrict__ vx, dst_t * 
 
     dst_t * y = yy + ib * QK_K + 128 * ip + il;
 
-    const uint8_t * ql = ql_ptr + 64 * ip + il;
-    const uint8_t   qh = *(qh_ptr + 32 * ip + il);
-    const int8_t *  sc = reinterpret_cast<const int8_t *>(scales_ptr + is);
+    const uint8_t * ql_lo = ql_ptr + 64 * ip + il;
+    const uint8_t * ql_hi = ql_lo + 32;
+    const uint8_t * qh_p  = qh_ptr + 32 * ip + il;
+    const int8_t *  sc    = reinterpret_cast<const int8_t *>(scales_ptr + is);
 
-    y[0]  = *d * sc[0] * ((int8_t) ((ql[0] & 0xF) | (((qh >> 0) & 3) << 4)) - 32);
-    y[32] = *d * sc[2] * ((int8_t) ((ql[32] & 0xF) | (((qh >> 2) & 3) << 4)) - 32);
-    y[64] = *d * sc[4] * ((int8_t) ((ql[0] >> 4) | (((qh >> 4) & 3) << 4)) - 32);
-    y[96] = *d * sc[6] * ((int8_t) ((ql[32] >> 4) | (((qh >> 6) & 3) << 4)) - 32);
+    const sycl::vec<uint8_t, m> l0 = *reinterpret_cast<const sycl::vec<uint8_t, m> *>(ql_lo);
+    const sycl::vec<uint8_t, m> l1 = *reinterpret_cast<const sycl::vec<uint8_t, m> *>(ql_hi);
+    const sycl::vec<uint8_t, m> hq = *reinterpret_cast<const sycl::vec<uint8_t, m> *>(qh_p);
+
+    // Expression and operand types kept character-identical to the scalar version this
+    // replaces, so the result is bit-exact: only the store width changes. Hoisting
+    // *d * sc[k] into a float local instead would promote the product out of half and
+    // perturb the last ulp -- enough to flip a token at a near-tie. The compiler hoists
+    // the loop-invariant product on its own, so writing it per element costs nothing.
+    sycl::vec<dst_t, m> o0, o1, o2, o3;
+#pragma unroll
+    for (int l = 0; l < m; ++l) {
+        o0[l] = *d * sc[0] * ((int8_t) ((l0[l] & 0xF) | (((hq[l] >> 0) & 3) << 4)) - 32);
+        o1[l] = *d * sc[2] * ((int8_t) ((l1[l] & 0xF) | (((hq[l] >> 2) & 3) << 4)) - 32);
+        o2[l] = *d * sc[4] * ((int8_t) ((l0[l] >> 4)  | (((hq[l] >> 4) & 3) << 4)) - 32);
+        o3[l] = *d * sc[6] * ((int8_t) ((l1[l] >> 4)  | (((hq[l] >> 6) & 3) << 4)) - 32);
+    }
+    *reinterpret_cast<sycl::vec<dst_t, m> *>(y +  0) = o0;
+    *reinterpret_cast<sycl::vec<dst_t, m> *>(y + 32) = o1;
+    *reinterpret_cast<sycl::vec<dst_t, m> *>(y + 64) = o2;
+    *reinterpret_cast<sycl::vec<dst_t, m> *>(y + 96) = o3;
 }
 
 template<typename dst_t>

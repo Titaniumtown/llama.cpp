@@ -783,6 +783,7 @@ static void flash_attn_combine_results(const float * __restrict__ VKQ_parts,
                                        const sycl::float2 * __restrict__ VKQ_meta,
                                        float * __restrict__ dst,
                                        const int parallel_blocks,
+                                       const int unroll,
                                        uint8_t * dpct_local) {
     // Dimension 0: threadIdx.x
     // Dimension 1: blockIdx.x
@@ -821,7 +822,36 @@ static void flash_attn_combine_results(const float * __restrict__ VKQ_parts,
 
     float VKQ_numerator   = 0.0f;
     float VKQ_denominator = 0.0f;
-    for (int l = 0; l < parallel_blocks; ++l) {
+
+    // parallel_blocks is a RUNTIME bound, so this loop is not unrolled, and one
+    // accumulator makes every iteration depend on the last -- about one load in
+    // flight per thread. That is what limits this kernel, not occupancy: on a
+    // standalone replica at production's shape (170 partials, D=256, 24 heads),
+    // four independent accumulators are worth 3.16x (104.20 -> 33.00 us, 40.1 ->
+    // 126.6 GB/s) while widening the grid 16x on its own is worth 2.71x and
+    // widening it WITHOUT unrolling was measured in-tree as nothing at all.
+    //
+    // Same terms, same order within each of the four chains; only the association
+    // across chains changes. GGML_SYCL_FA_COMBINE_UNROLL=1 restores the original
+    // single-chain loop exactly, which is how the two are A/B'd in one binary.
+    int l = 0;
+    if (unroll >= 4) {
+        float n0 = 0.0f, n1 = 0.0f, n2 = 0.0f, n3 = 0.0f;
+        float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+        for (; l + 4 <= parallel_blocks; l += 4) {
+            const float s0 = sycl::native::exp(meta[l+0].x() - kqmax);
+            const float s1 = sycl::native::exp(meta[l+1].x() - kqmax);
+            const float s2 = sycl::native::exp(meta[l+2].x() - kqmax);
+            const float s3 = sycl::native::exp(meta[l+3].x() - kqmax);
+            n0 += s0 * VKQ_parts[(l+0)*D + tid];  d0 += s0 * meta[l+0].y();
+            n1 += s1 * VKQ_parts[(l+1)*D + tid];  d1 += s1 * meta[l+1].y();
+            n2 += s2 * VKQ_parts[(l+2)*D + tid];  d2 += s2 * meta[l+2].y();
+            n3 += s3 * VKQ_parts[(l+3)*D + tid];  d3 += s3 * meta[l+3].y();
+        }
+        VKQ_numerator   = (n0 + n1) + (n2 + n3);
+        VKQ_denominator = (d0 + d1) + (d2 + d3);
+    }
+    for (; l < parallel_blocks; ++l) {
         const float KQ_max_scale = sycl::native::exp(meta[l].x() - kqmax);
 
         VKQ_numerator   += KQ_max_scale * VKQ_parts[l*D + tid];
@@ -1235,6 +1265,11 @@ void launch_fattn(
             });
         }
     } else if (parallel_blocks > 1) {
+        // Read once, but copied into a NON-static local before the lambda captures it:
+        // a `static const` whose initializer is a runtime call is not constant-initialized,
+        // and SYCL rejects referencing one from device code.
+        static const int combine_unroll_env = ggml_sycl_get_env("GGML_SYCL_FA_COMBINE_UNROLL", 4);
+        const int        combine_unroll     = combine_unroll_env;
         const dpct::dim3 block_dim_combine(DV, 1, 1);
         const dpct::dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
         const size_t     nbytes_shared_combine = parallel_blocks * sizeof(sycl::float2);
@@ -1250,6 +1285,7 @@ void launch_fattn(
                                  GGML_UNUSED(item_ct1);
                                  flash_attn_combine_results<DV>(
                                      dst_tmp_ptr_ct0, dst_tmp_meta_ptr_ct1, KQV_data_ct2, parallel_blocks,
+                                     combine_unroll,
                                      dpct_local_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
                              });
         });

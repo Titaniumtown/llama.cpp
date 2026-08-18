@@ -376,6 +376,19 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
             const int k = item_ct1.get_local_id(1) * warp_size + k0 +
                           (nthreads_V == warp_size ? 0 : item_ct1.get_local_id(2) / nthreads_V);
 
+            // Attention-gated V (sparse V): skip dequant+accumulate for KV positions whose
+            // softmax weight is below numerical significance -- no quality impact at this eps,
+            // and at long context most positions are negligible. Softmax max/sum already
+            // cover all positions, so the denominator stays exact.
+            bool skip_v = true;
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                skip_v = skip_v && ((float) KQ[j*nthreads + k] < 1e-6f);
+            }
+            if (skip_v) {
+                continue;
+            }
+
 #ifdef GGML_SYCL_F16
             sycl::half2 KQ_k[ncols];
 #pragma unroll

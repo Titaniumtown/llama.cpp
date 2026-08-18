@@ -3034,7 +3034,35 @@ inline void ggml_sycl_op_mul_mat_sycl(
                     while (L > 0 && src1->name[L - 1] >= '0' && src1->name[L - 1] <= '9') { L--; }
                     if (L > 0 && src1->name[L - 1] == '-') { L--; }
                     if (L > 0) {
-                        snprintf(ckey + cn, sizeof(ckey) - (size_t) cn, "<-%.*s", (int) L, src1->name);
+                        cn += snprintf(ckey + cn, sizeof(ckey) - (size_t) cn, "<-%.*s", (int) L,
+                                       src1->name);
+                    }
+                    // ...and the OP that wrote it, which is the actionable half: the tensor
+                    // name says which activation, the op name says which backend function
+                    // would have to emit the f16 copy for it. That mapping has been inferred
+                    // wrong twice in this series, each time visible only as a patch that
+                    // collected nothing.
+                    //
+                    // Resolve views through view_src and then match by tensor IDENTITY.
+                    // Matching on the data pointer instead looks equivalent and is not:
+                    // ggml's allocator reuses buffers, so a pointer match names whichever
+                    // unrelated node last occupied that address. The first cut of this did
+                    // exactly that and confidently reported `attn_norm` written by an ADD
+                    // and `attn_gated` by a ROPE.
+                    if (cn > 0 && (size_t) cn < sizeof(ckey) && ctx.cur_graph != nullptr) {
+                        const ggml_tensor * base = src1;
+                        while (base->view_src != nullptr) { base = base->view_src; }
+                        const char * pop = "?";
+                        for (int j = ctx.cur_node; j >= 0 && ctx.cur_node - j <= 32; --j) {
+                            const ggml_tensor * n = ctx.cur_graph->nodes[j];
+                            if (n == base || n == src1) {
+                                pop = (n->op == GGML_OP_UNARY)
+                                          ? ggml_unary_op_name(ggml_get_unary_op(n))
+                                          : ggml_op_name(n->op);
+                                break;
+                            }
+                        }
+                        snprintf(ckey + cn, sizeof(ckey) - (size_t) cn, "[%s]", pop);
                     }
                 }
                 ggml_sycl_prof_mark_sub(ckey, ne * (sizeof(float) + sizeof(sycl::half)));

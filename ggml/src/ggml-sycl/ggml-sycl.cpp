@@ -6581,6 +6581,10 @@ void ggml_sycl_prof_mark_sub(const std::string & name, uint64_t bytes) {
     }
 }
 
+bool ggml_sycl_prof_names() {
+    return ggml_sycl_op_prof::name_keys();
+}
+
 // Close the span BEFORE a sub-marked submit. A mark's duration is
 // marks[i].end - marks[i-1].end, so on an in-order queue a sub-mark bills every
 // microsecond since the previous barrier -- including GPU idle while the host was

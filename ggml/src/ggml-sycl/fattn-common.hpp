@@ -924,6 +924,17 @@ void launch_fattn(
     const int id  = ggml_sycl_get_device();
     const int nsm = ggml_sycl_info().devices[id].nsm;
 
+    // FLASH_ATTN_EXT is one profiler row over THREE launches -- the mask->KV_max scan, the
+    // attention kernel, and the combine -- so nothing could say where its time goes, and it
+    // is the only decode row measurably off the memory wall (84% against the mat-muls'
+    // 89-100%). Split it. Each mark closes the span since the previous one, so a
+    // "FA/host-setup" mark before each submit keeps the host gap out of the kernel's row,
+    // for the same reason ggml_sycl_prof_mark_gap exists.
+    //
+    // Gated on GGML_SYCL_PROF_NAMES: with it off none of these fire and FLASH_ATTN_EXT is
+    // exactly the row every earlier profile in this series recorded.
+    const bool fa_prof = ggml_sycl_prof_names();
+
     ggml_sycl_fattn_alloc        K_f16(fbuf.K);
     ggml_sycl_fattn_alloc        V_f16(fbuf.V);
     ggml_sycl_pool_alloc<int>    KV_max(pool);
@@ -1032,6 +1043,7 @@ void launch_fattn(
         KV_max.alloc(ne_KV_max);
         {
             dpct::has_capability_or_fail(main_stream->get_device(), { sycl::aspect::fp16 });
+            if (fa_prof) { ggml_sycl_prof_mark_sub("FA/host-setup", 0); }
 
             main_stream->submit([&](sycl::handler & cgh) {
                 sycl::local_accessor<int, 1> buf_iw_acc_ct1(sycl::range<1>(warp_size), cgh);
@@ -1049,6 +1061,9 @@ void launch_fattn(
             });
         }
         SYCL_CHECK(0);
+        // Reads the mask to find the last unmasked KV tile per query tile, so FA can skip
+        // the rest. Bytes are the mask it scans.
+        if (fa_prof) { ggml_sycl_prof_mark_sub("FA-KV-MAX", ggml_nbytes(mask)); }
     }
 
     const dpct::dim3 block_dim(warp_size, nwarps, 1);
@@ -1169,6 +1184,7 @@ void launch_fattn(
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
+    if (fa_prof) { ggml_sycl_prof_mark_sub("FA/host-setup", 0); }
     lauch_kernel<fattn_kernel, warp_size>(
         blocks_num, block_dim, main_stream, (unsigned int) nbytes_shared, (const char *) Q->data, K_data, V_data,
         mask ? ((const char *) mask->data) : nullptr, sinks ? ((const char *) sinks->data) : nullptr, KV_max.ptr,
@@ -1178,6 +1194,22 @@ void launch_fattn(
         mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0,
         mask ? mask->nb[3] : 0);
     SYCL_CHECK(0);
+    // The attention kernel itself. Bytes are the K/V it streams (post-conversion, so the
+    // f16 sizes when a quantized cache was converted above) plus whatever it writes:
+    // parallel_blocks partials when the KV is split, else the output directly.
+    const size_t fa_part_bytes = (!stream_k && parallel_blocks > 1)
+        ? (size_t) parallel_blocks * ggml_nelements(KQV) * sizeof(float) : 0;
+    if (fa_prof) {
+        const size_t kb = (need_f16_K && K->type != GGML_TYPE_F16)
+            ? ggml_nelements(K) * sizeof(sycl::half) : ggml_nbytes(K);
+        const size_t vb = (need_f16_V && V->type != GGML_TYPE_F16)
+            ? ggml_nelements(V) * sizeof(sycl::half) : ggml_nbytes(V);
+        ggml_sycl_prof_mark_sub("FA-KERNEL",
+                                kb + vb + (fa_part_bytes ? fa_part_bytes : ggml_nbytes(KQV)));
+    }
+
+    const bool fa_combined = stream_k ? (ntiles_total % blocks_num.x != 0) : (parallel_blocks > 1);
+    if (fa_prof && fa_combined) { ggml_sycl_prof_mark_sub("FA/host-setup", 0); }
 
     if (stream_k) {
         if (ntiles_total % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
@@ -1223,4 +1255,9 @@ void launch_fattn(
         });
     }
     SYCL_CHECK(0);
+    // Reduces the per-block partials into the output. It has never had a row of its own,
+    // and it is the part of FA whose cost scales with parallel_blocks rather than with KV.
+    if (fa_prof && fa_combined) {
+        ggml_sycl_prof_mark_sub("FA-COMBINE", fa_part_bytes + ggml_nbytes(KQV));
+    }
 }

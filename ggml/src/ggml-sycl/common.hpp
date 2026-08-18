@@ -771,6 +771,10 @@ int ggml_sycl_get_env(const char *env_name, int default_val);
 // op -- notably launch_fattn's K/V dequant -- is invisible: it shows up in no row at all.
 void ggml_sycl_prof_mark_sub(const std::string & name, uint64_t bytes);
 
+// GGML_SYCL_PROF_NAMES. A sub-mark that SPLITS an existing row gates on this, so a
+// profile taken without it stays directly comparable to every one recorded before.
+bool ggml_sycl_prof_names();
+
 template <int N, class T> std::string debug_get_array_str(const std::string & prefix, const T array[N]) {
     if (LIKELY(!g_ggml_sycl_debug)) {
         return "";

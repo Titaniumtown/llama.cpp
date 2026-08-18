@@ -10,8 +10,11 @@
 #include "fattn-tile.hpp"
 #include "convert.hpp"
 
-// set minimum query length to treat as prefill (32)
-#define GGML_SYCL_FA_ONEDNN_MIN_Q 32
+// Minimum query length treated as prefill. 32 is the historical default and is kept, but
+// it was never measured: production's MTP verify pass runs n_q = 1 + draft (5 with
+// --spec-draft-n-max 4), which lands below it and therefore never reaches the fused-XMX
+// SDPA. GGML_SYCL_FA_ONEDNN_MIN_Q makes the crossover measurable on one binary.
+#define GGML_SYCL_FA_ONEDNN_MIN_Q_DEFAULT 32
 
 bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst) {
 #if !GGML_SYCL_DNNL
@@ -89,8 +92,10 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst) {
     if (K->ne[2] == 0 || Q->ne[2] % K->ne[2] != 0) {
         return false;
     }
-    // Prefill only.
-    if (Q->ne[1] < GGML_SYCL_FA_ONEDNN_MIN_Q) {
+    // Prefill only (see GGML_SYCL_FA_ONEDNN_MIN_Q above).
+    static const int min_q = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_MIN_Q",
+                                               GGML_SYCL_FA_ONEDNN_MIN_Q_DEFAULT);
+    if (Q->ne[1] < min_q) {
         return false;
     }
     return true;

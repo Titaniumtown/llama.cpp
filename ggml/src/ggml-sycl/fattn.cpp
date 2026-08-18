@@ -292,11 +292,20 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
         fa_call_seq++;
         int64_t cur_nkv = K_dbg->ne[1];
         int Dk = (int)K_dbg->ne[0];
-        const char * kname = "TILE";
+        // Every enum value must be named here. NONE fell through to the "TILE"
+        // initialiser, so a declined dispatch was reported as a TILE one and this
+        // diagnostic could not answer the question it exists for: which path ran.
+        // A switch with no default also makes -Wswitch catch the next enum value
+        // added upstream, which an if-chain silently mislabels.
         best_fattn_kernel k = ggml_sycl_get_best_fattn_kernel(ctx.device, dst);
-        if (k == BEST_FATTN_KERNEL_MKL)  kname = "MKL";
-        if (k == BEST_FATTN_KERNEL_ONEDNN)  kname = "ONEDNN";
-        if (k == BEST_FATTN_KERNEL_VEC)  kname = "VEC";
+        const char * kname = "?";
+        switch (k) {
+            case BEST_FATTN_KERNEL_NONE:   kname = "NONE";   break;
+            case BEST_FATTN_KERNEL_VEC:    kname = "VEC";    break;
+            case BEST_FATTN_KERNEL_ONEDNN: kname = "ONEDNN"; break;
+            case BEST_FATTN_KERNEL_TILE:   kname = "TILE";   break;
+            case BEST_FATTN_KERNEL_MKL:    kname = "MKL";    break;
+        }
         int64_t delta = 0;
         if (Dk == 256) {
             delta = cur_nkv - last_nkv_d256;
@@ -305,9 +314,12 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
             delta = cur_nkv - last_nkv_d512;
             last_nkv_d512 = cur_nkv;
         }
-        GGML_LOG_INFO("[FA-DISP] #%d %s D=%d n_kv=%lld delta=%lld "
+        // n_q is Q->ne[1]: the quantity BEST_FATTN_KERNEL_ONEDNN is gated on, so the line
+        // has to carry it for the log to explain its own verdict.
+        GGML_LOG_INFO("[FA-DISP] #%d %s D=%d n_q=%lld n_kv=%lld delta=%lld "
                 "V_ne1=%lld\n",
                 fa_call_seq, kname, Dk,
+                (long long)dst->src[0]->ne[1],
                 (long long)cur_nkv, (long long)delta,
                 (long long)V_dbg->ne[1]);
     }

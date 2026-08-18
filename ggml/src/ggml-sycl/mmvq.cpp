@@ -2391,12 +2391,21 @@ static void reorder_mul_mat_vec_q6_k_q8_1_sycl(const void * vx, const void * vy,
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
-
+    // Decode (n=1) ran the scalar generic kernel while ncols_dst >= 2 already got the
+    // 128-bit wide loader defined above. At one column there is no column loop left for
+    // the wide path to lose on, so it is simply the better loader here. Measured on Arc
+    // Pro B70, test-backend-ops m=4096 k=14336 n=1, 4 paired interleaved rounds:
+    // generic 88.82 us -> wide 85.50 us (-3.74%, per-config spread <0.4%). End-to-end
+    // paired against the previous build, 3 rounds: tg64 d0 26.52 -> 26.69 t/s (+0.65%),
+    // d65536 15.95 -> 15.99 (+0.27%), 6/6 round-deltas positive. Correctness: 11/11
+    // q6_K MUL_MAT cases against the CPU reference.
+    // q4_K (+0.39%) and q5_K (+0.89%) were measured the same way and got WORSE, so they
+    // keep the generic kernel -- this is q6_K-only on purpose.
+    // ncols_dst == 1 makes both strides dead (col == 0), so passing 0/0 is safe.
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                          [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K>>(vx, vy, dst, ncols, nrows,
-                                                                                           nd_item);
+                             mul_mat_vec_q6_K_reorder_wide_ncols<1>(vx, vy, dst, ncols, nrows, 0, 0, nd_item);
                          });
     });
 }

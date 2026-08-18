@@ -2534,21 +2534,36 @@ static void top_k_f32_sycl(
     // and 1.8 GB/s against the card's 598 GB/s measured wall.
     //
     // Split the row across independent work-groups instead. What the scan is short of is
-    // memory requests in flight, not bandwidth or per-request latency, so the number of
-    // groups is the lever; each emits its partition's top-k and a second launch merges
-    // those nsplit*k candidates. 32 lanes per group rather than 128 is deliberate on both
-    // counts: it keeps the serial tid-0 merge at 32*k insertions instead of 128*k, and the
-    // SLM footprint at 8 KB instead of 32 KB -- the latter alone capped the old kernel at
-    // two resident groups per Xe-core.
-    constexpr int split_block = 32;
+    // memory requests in flight, not bandwidth or per-request latency, so lanes in flight
+    // is the lever; each group emits its partition's top-k and a second launch merges
+    // those nsplit*k candidates.
+    //
+    // us/run at ncols = 200000, swept with both of these as env knobs (max_splits chosen
+    // per column; k=10 and k=65000 both prefer 128, k=1 prefers 256 by ~0.5 us):
+    //
+    //   split_block |     16 |     32 |     64 |    128
+    //   ------------|--------|--------|--------|-------
+    //   k=10        | 246.20 | 185.24 | 144.96 | 127.24
+    //   k=1         |  16.91 |  15.89 |  15.47 |  21.63
+    //
+    // 32 was chosen when the merge was serial over block_size*k candidates, which made a
+    // wide group expensive. The sorted-list break removed that, so the only thing left
+    // scaling with group width is parallelism, and the widest group wins by 1.46x at the
+    // shape production runs. k=1 pays 6 us for it, which is 0.05% of a decode step and
+    // not worth a second code path.
+    //
+    // The cost of 128 lanes is (128+1)*k*8 bytes of SLM: 10 KB at k=10, but 33 KB at the
+    // k=32 ceiling, which would leave one resident group per Xe-core. Revisit if a model
+    // ever samples with k that large.
+    constexpr int split_block = 128;
     constexpr int max_splits  = 128;
     constexpr int min_cols    = 8192;
 
     int nsplit = 1;
     if (ncols >= min_cols) {
-        // >= split_block*32 columns per partition, so a partition never has fewer than
-        // k <= 32 elements and no pass can be padded with -FLT_MAX sentinels.
-        const int64_t want = ncols / (split_block * 32);
+        // A partition is then always >= split_block = 128 columns, hence always more than
+        // the k <= 32 ceiling, so no pass is ever padded with -FLT_MAX sentinels.
+        const int64_t want = ncols / split_block;
         nsplit = (int) (want > max_splits ? max_splits : want);
     }
 

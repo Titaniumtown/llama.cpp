@@ -348,6 +348,15 @@ struct ggml_backend_sycl_context {
     std::string name;
     optimize_feature opt_feature;
 
+    // Set while dispatching a mat-vec whose per-row epilogue has been folded in:
+    //     out[row] = softplus(dot(row) + bias[row]) * scale[row]
+    // This is the GDN decay chain (ssm_alpha -> +ssm_dt -> softplus -> *ssm_a). Its
+    // three ggml nodes move 48 floats and cost a full dispatch each; the mat-vec that
+    // produces their input already has the value in a register at the store.
+    const ggml_tensor * mmvq_dsa_out   = nullptr;
+    const ggml_tensor * mmvq_dsa_bias  = nullptr;
+    const ggml_tensor * mmvq_dsa_scale = nullptr;
+
     // f32->f16 conversion cache for a matmul's src1. Several projections inside one block
     // read the SAME activation tensor -- Qwen3Next builds wq/wk/wv from one `cur` and
     // wqkv/wqkv_gate from one `input` -- but ggml_sycl_op_mul_mat_sycl converts src1 into a

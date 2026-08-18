@@ -161,6 +161,72 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
                                                    cgraph->nodes[node_idx + 2]);
     }
 
+    // mul_mat + reshape + add(bias) + softplus + mul(scale): the GDN decay chain.
+    // These are disjoint DFS subtrees from the delta-net op, so the two 5120x48 mat-vecs
+    // (alpha, beta) can never be adjacent -- but each IS adjacent to its own epilogue,
+    // which is what this fuses. The reshape is a view and costs no dispatch; it is listed
+    // only because it occupies a graph node slot. The mat-vec output is elided (nothing
+    // else reads it), so the single declared output is the final mul.
+    if (ops.size() == 5 && ops.begin()[0] == GGML_OP_MUL_MAT && ops.begin()[1] == GGML_OP_RESHAPE &&
+        ops.begin()[2] == GGML_OP_ADD && ops.begin()[3] == GGML_OP_UNARY && ops.begin()[4] == GGML_OP_MUL) {
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 4 })) {
+            return false;
+        }
+        const ggml_tensor * mm  = cgraph->nodes[node_idx];
+        const ggml_tensor * rsh = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * add = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * sp  = cgraph->nodes[node_idx + 3];
+        const ggml_tensor * mul = cgraph->nodes[node_idx + 4];
+        if (ggml_get_unary_op(sp) != GGML_UNARY_OP_SOFTPLUS) { return false; }
+        // strict chain: anything else means an operand we would silently drop
+        if (rsh->src[0] != mm || add->src[0] != rsh || sp->src[0] != add || mul->src[0] != sp) { return false; }
+        const ggml_tensor * bias  = add->src[1];
+        const ggml_tensor * scale = mul->src[1];
+        if (bias == nullptr || scale == nullptr) { return false; }
+        // the epilogue is applied per output row, so both operands must be exactly one
+        // value per row -- a broadcast over anything else is a different computation
+        if (bias->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32) { return false; }
+        if (!ggml_is_contiguous(bias) || !ggml_is_contiguous(scale))     { return false; }
+        if (ggml_nelements(bias) != mm->ne[0] || ggml_nelements(scale) != mm->ne[0]) { return false; }
+        if (mm->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32)     { return false; }
+        if (ggml_nelements(mm) != mm->ne[0] || ggml_nelements(mul) != mm->ne[0]) { return false; }
+        return true;
+    }
+
+    // add(residual) + rms_norm + mul(weight). Every transformer block ends with a residual
+    // add whose sum is read twice: once by the norm that follows it, and once by the NEXT
+    // block's residual. That second use makes the sum a real output, so plain ggml_can_fuse
+    // -- which requires single-use intermediates -- rejects the chain. The subgraph check
+    // exempts the listed outputs from that requirement, which is exactly the shape here:
+    // the add (node_idx) and the mul (node_idx + 2) are written, the rms_norm is elided.
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_RMS_NORM &&
+        ops.begin()[2] == GGML_OP_MUL) {
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx, node_idx + 2 })) {
+            return false;
+        }
+        const ggml_tensor * add      = cgraph->nodes[node_idx];
+        const ggml_tensor * rms_norm = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * mul      = cgraph->nodes[node_idx + 2];
+
+        if (rms_norm->src[0] != add) {
+            return false;
+        }
+        if (add->type != GGML_TYPE_F32 || add->src[0]->type != GGML_TYPE_F32 ||
+            add->src[1]->type != GGML_TYPE_F32) {
+            return false;
+        }
+        // the kernel walks all three add operands with the sum's strides, so no broadcast
+        // and no strided rows -- residual adds are always plain same-shape contiguous
+        if (!ggml_are_same_shape(add->src[0], add->src[1]) || !ggml_are_same_shape(add->src[0], add)) {
+            return false;
+        }
+        if (!ggml_is_contiguous(add->src[0]) || !ggml_is_contiguous(add->src[1]) ||
+            !ggml_is_contiguous(add)) {
+            return false;
+        }
+        return ggml_sycl_should_fuse_rms_norm_mul(rms_norm, mul);
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }

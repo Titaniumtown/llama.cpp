@@ -6709,6 +6709,40 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
+        // GDN decay chain: fold +ssm_dt, softplus and *ssm_a into the mat-vec store.
+        // Only the reordered Q4_K ncols==1 kernel implements the epilogue, so the
+        // capability is checked HERE: if the mmvq switch fell through to any other
+        // kernel the three skipped nodes would simply never run, which is a wrong
+        // answer rather than a slow one.
+        static const int fuse_dsa = ggml_sycl_get_env("GGML_SYCL_FUSE_DSA", 1);
+        if (fuse_dsa && node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr &&
+            node->src[1] != nullptr && node->src[1]->ne[1] == 1 &&
+            node->src[0]->type == GGML_TYPE_Q4_K && node->src[0]->extra != nullptr &&
+            ((ggml_tensor_extra_gpu *) node->src[0]->extra)->optimized_feature.reorder &&
+            ggml_sycl_can_fuse(cgraph, i,
+                               { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL },
+                               { GGML_UNARY_OP_SOFTPLUS })) {
+            ggml_tensor * mul        = cgraph->nodes[i + 4];
+            sycl_ctx->mmvq_dsa_out   = mul;
+            sycl_ctx->mmvq_dsa_bias  = cgraph->nodes[i + 2]->src[1];
+            sycl_ctx->mmvq_dsa_scale = mul->src[1];
+            ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(*sycl_ctx, node->src[0], node->src[1], node,
+                                                                ggml_sycl_op_mul_mat_vec_q);
+            sycl_ctx->mmvq_dsa_out   = nullptr;
+            sycl_ctx->mmvq_dsa_bias  = nullptr;
+            sycl_ctx->mmvq_dsa_scale = nullptr;
+            prof.mark(node, cgraph, i, 5);
+            i += 4;
+            continue;
+        }
+
+        if (node->op == GGML_OP_ADD &&
+            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+            ggml_sycl_op_rms_norm_fused_add(*sycl_ctx, cgraph->nodes[i + 1], cgraph->nodes[i + 2], node);
+            prof.mark(node, cgraph, i, 3);
+            i += 2;
+            continue;
+        }
         if (node->op == GGML_OP_RMS_NORM &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
             ggml_sycl_op_rms_norm_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);

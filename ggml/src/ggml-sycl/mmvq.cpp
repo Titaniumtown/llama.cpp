@@ -1797,6 +1797,80 @@ static void mul_mat_vec_q4_K_reorder_wide_glu(const void * __restrict__ vx, cons
     }
 }
 
+// Wide (128-bit load) Q4_K reorder mat-vec, ncols_dst == 1, with the GDN decay
+// epilogue folded into the store: out[row] = softplus(sum + bias[row]) * scale[row].
+// softplus is spelled exactly as op_softplus in element_wise.cpp (max(x,0) +
+// log1p(exp(-|x|))), so the fused result is the same expression, not an approximation.
+static void mul_mat_vec_q4_K_reorder_wide_dsa(const void * __restrict__ vx, const void * __restrict__ vy,
+                                              const float * __restrict__ bias, const float * __restrict__ scale,
+                                              float * __restrict__ dst, const int ncols, const int nrows,
+                                              const sycl::nd_item<3> & nd_item) {
+    using q4_k_block = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q4_K>;
+
+    const auto sg       = nd_item.get_sub_group();
+    const int  sg_range = sg.get_group_linear_range();
+    const int  row      = nd_item.get_group_linear_id() * sg_range + sg.get_group_linear_id();
+    if (row >= nrows) {
+        return;
+    }
+
+    const int blocks_per_row  = ncols / QK_K;
+    const int nblocks         = nrows * blocks_per_row;
+    const int lane            = sg.get_local_linear_id();
+    const int blocks_per_wave = WARP_SIZE / 8;
+    const int lb              = lane / 8;
+    const int c               = lane % 8;
+    const int g               = c >> 1;
+    const int uoff            = (c & 1) ? 4 : 0;
+
+    const uint8_t *     base = static_cast<const uint8_t *>(vx);
+    const sycl::half2 * vyds = reinterpret_cast<const sycl::half2 *>(static_cast<const char *>(vy) + ncols);
+    const int8_t *      vy8  = static_cast<const int8_t *>(vy);
+
+    float partial = 0.0f;
+
+    for (int blk = lb; blk < blocks_per_row; blk += blocks_per_wave) {
+        const int  ibx     = row * blocks_per_row + blk;
+        const auto ibx_off = q4_k_block::get_block_offset(ibx, nblocks);
+        const auto d_off   = q4_k_block::get_d_offset(nrows, ncols, ibx);
+
+        const int         gq8 = blk * (QK_K / QK8_1) + 2 * g;
+        const sycl::half2 ds0 = vyds[gq8 + 0];
+        const sycl::half2 ds1 = vyds[gq8 + 1];
+        const sycl::int4  u0  = *reinterpret_cast<const sycl::int4 *>(reinterpret_cast<const int *>(vy8 + (gq8 + 0) * QK8_1) + uoff);
+        const sycl::int4  u1  = *reinterpret_cast<const sycl::int4 *>(reinterpret_cast<const int *>(vy8 + (gq8 + 1) * QK8_1) + uoff);
+
+        partial += q4k_wide_lane_partial(base + ibx_off.first,
+                                         reinterpret_cast<const uint16_t *>(base + d_off.first),
+                                         reinterpret_cast<const sycl::half2 *>(base + d_off.second), c, u0, u1,
+                                         ds0[0], ds1[0], ds0[1], ds1[1]);
+    }
+
+    const float sum = sycl::reduce_over_group(sg, partial, std::plus<>());
+    if (sg.leader()) {
+        const float x  = sum + bias[row];
+        const float ax = sycl::fabs(x);
+        const float m  = sycl::fmax(x, 0.0f);
+        dst[row]       = (m + sycl::log1p(sycl::exp(-ax))) * scale[row];
+    }
+}
+
+static void reorder_mul_mat_vec_q4_k_q8_1_dsa_wide_sycl(const void * vx, const void * vy, const float * bias,
+                                                        const float * scale, float * dst, const int ncols,
+                                                        const int nrows, dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    constexpr size_t     num_subgroups = WARP_SIZE;
+    const int            block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_q4_K_reorder_wide_dsa(vx, vy, bias, scale, dst, ncols, nrows, nd_item);
+                         });
+    });
+}
+
 static void reorder_mul_mat_vec_q4_k_q8_1_glu_fused_wide_sycl(const void * vx, const void * vgate, const void * vy,
                                                               float * dst, const int ncols, const int nrows,
                                                               dpct::queue_ptr stream) {
@@ -3204,6 +3278,22 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                             src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
                             src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
                         return;
+                    } else if (ctx.mmvq_dsa_out != nullptr && src1_ncols == 1) {
+                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_k_q8_1_dsa_wide_sycl\n");
+                        // dst is the mat-vec (correct reorder detection); the fused kernel
+                        // folds +bias, softplus and *scale and writes the chain's output
+                        float * dsa_out = (float *) ctx.mmvq_dsa_out->data + i * dst->ne[0];
+                        reorder_mul_mat_vec_q4_k_q8_1_dsa_wide_sycl(
+                            src0_dd_i, src1_ddq_i_bs, (const float *) ctx.mmvq_dsa_bias->data,
+                            (const float *) ctx.mmvq_dsa_scale->data, dsa_out, ne00, row_diff, stream);
+                    } else if (ctx.mmvq_fused_glu != nullptr && src1_ncols == 1) {
+                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_k_q8_1_glu_fused_sycl\n");
+                        // dst is the up mat-vec (correct reorder detection); the fused
+                        // kernel folds in the gate weight and writes the GLU output instead
+                        const ggml_tensor * gate_w  = ctx.mmvq_fused_glu->src[0]->src[0];
+                        float *             glu_out = (float *) ctx.mmvq_fused_glu->data + i * dst->ne[0];
+                        reorder_mul_mat_vec_q4_k_q8_1_glu_fused_wide_sycl(
+                            src0_dd_i, (const char *) gate_w->data, src1_ddq_i_bs, glu_out, ne00, row_diff, stream);
                     } else {
                         GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_k_q8_1_sycl\n");
                         reorder_mul_mat_vec_q4_k_q8_1_wide_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);

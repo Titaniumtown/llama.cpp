@@ -2388,7 +2388,114 @@ static void argsort_f32_i32_sycl(const float *x, int *dst, const int ncols,
     }
 }
 
+// The scan and the block merge, shared by all three launch shapes below so that a
+// partitioned row runs the same insertion order as an unpartitioned one -- for a row of
+// distinct values the two are bit-identical.
+//
+// src_map  != nullptr: a candidate's reported index is src_map[col], not col itself. That
+//                      is what lets a merge pass carry the original column through.
+// out_vals != nullptr: also emit the k winning values, so a later pass can merge them.
+// swap01:              the final pass reproduces this function's historical output order.
+static void top_k_scan_merge_f32(
+    const float *   src_vals,
+    const int32_t * src_map,
+    const int       begin,
+    const int       end,
+    const int       k,
+    const int       block_size,
+    float *         shared_vals,
+    int *           shared_idx,
+    float *         out_vals,
+    int32_t *       out_idx,
+    const bool      swap01,
+    const sycl::nd_item<1> & item_ct1
+) {
+    const int tid = item_ct1.get_local_id(0);
+
+    float local_vals[32];
+    int local_idx[32];
+
+    for (int i = 0; i < k; i++) {
+        local_vals[i] = -FLT_MAX;
+        local_idx[i] = -1;
+    }
+
+    for (int col = begin + tid; col < end; col += block_size) {
+        float val = src_vals[col];
+
+        if (val > local_vals[k-1]) {
+            int pos = k - 1;
+            while (pos > 0 && val > local_vals[pos - 1]) {
+                pos--;
+            }
+
+            for (int i = k - 1; i > pos; i--) {
+                local_vals[i] = local_vals[i - 1];
+                local_idx[i] = local_idx[i - 1];
+            }
+            local_vals[pos] = val;
+            local_idx[pos] = src_map ? src_map[col] : col;
+        }
+    }
+
+    for (int i = 0; i < k; i++) {
+        shared_vals[tid * k + i] = local_vals[i];
+        shared_idx[tid * k + i] = local_idx[i];
+    }
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+
+    if (tid != 0) {
+        return;
+    }
+
+    float final_vals[32];
+    int final_idx[32];
+
+    for (int i = 0; i < k; i++) {
+        final_vals[i] = -FLT_MAX;
+        final_idx[i] = -1;
+    }
+
+    for (int t = 0; t < block_size; t++) {
+        for (int i = 0; i < k; i++) {
+            float val = shared_vals[t * k + i];
+            int idx = shared_idx[t * k + i];
+
+            if (val > final_vals[k-1]) {
+                int pos = k - 1;
+                while (pos > 0 && val > final_vals[pos - 1]) {
+                    pos--;
+                }
+
+                for (int j = k - 1; j > pos; j--) {
+                    final_vals[j] = final_vals[j - 1];
+                    final_idx[j] = final_idx[j - 1];
+                }
+                final_vals[pos] = val;
+                final_idx[pos] = idx;
+            }
+        }
+    }
+
+    if (out_vals) {
+        for (int i = 0; i < k; i++) {
+            out_vals[i] = final_vals[i];
+        }
+    }
+
+    for (int i = 0; i < k; i++) {
+        out_idx[i] = final_idx[i];
+    }
+
+    if (swap01 && k > 1) {
+        int32_t temp = out_idx[0];
+        out_idx[0] = out_idx[1];
+        out_idx[1] = temp;
+    }
+}
+
 static void top_k_f32_sycl(
+    ggml_backend_sycl_context & ctx,
     const float * src,
     int32_t * dst_indices,
     const int64_t ncols,
@@ -2396,6 +2503,87 @@ static void top_k_f32_sycl(
     const int k,
     dpct::queue_ptr main_stream
 ) {
+    // A row is scanned by exactly one work-group, so an LM-head-sized row leaves the rest
+    // of the device idle. On this model (ncols = 248320, nrows = 1) that is 560 us/call
+    // and 1.8 GB/s against the card's 598 GB/s measured wall.
+    //
+    // Split the row across independent work-groups instead. What the scan is short of is
+    // memory requests in flight, not bandwidth or per-request latency, so the number of
+    // groups is the lever; each emits its partition's top-k and a second launch merges
+    // those nsplit*k candidates. 32 lanes per group rather than 128 is deliberate on both
+    // counts: it keeps the serial tid-0 merge at 32*k insertions instead of 128*k, and the
+    // SLM footprint at 8 KB instead of 32 KB -- the latter alone capped the old kernel at
+    // two resident groups per Xe-core.
+    constexpr int split_block = 32;
+    constexpr int max_splits  = 128;
+    constexpr int min_cols    = 8192;
+
+    int nsplit = 1;
+    if (ncols >= min_cols) {
+        // >= split_block*32 columns per partition, so a partition never has fewer than
+        // k <= 32 elements and no pass can be padded with -FLT_MAX sentinels.
+        const int64_t want = ncols / (split_block * 32);
+        nsplit = (int) (want > max_splits ? max_splits : want);
+    }
+
+    if (nsplit > 1) {
+        const int nchunk = (int) ((ncols + nsplit - 1) / nsplit);
+        const size_t ncand = (size_t) nrows * nsplit * k;
+
+        ggml_sycl_pool_alloc<float>   part_vals(ctx.pool(), ncand);
+        ggml_sycl_pool_alloc<int32_t> part_idx(ctx.pool(), ncand);
+
+        float *   pv = part_vals.get();
+        int32_t * pi = part_idx.get();
+
+        const sycl::range<1> block_dims(split_block);
+
+        main_stream->submit([&](sycl::handler &cgh) {
+            sycl::local_accessor<float, 1> shared_vals(sycl::range<1>(split_block * k), cgh);
+            sycl::local_accessor<int, 1> shared_idx(sycl::range<1>(split_block * k), cgh);
+
+            cgh.parallel_for(
+                sycl::nd_range<1>(sycl::range<1>(nrows * nsplit) * block_dims, block_dims),
+                [=](sycl::nd_item<1> item_ct1) {
+                    const int grp = item_ct1.get_group(0);
+                    const int row = grp / nsplit;
+                    const int part = grp % nsplit;
+
+                    const int begin = part * nchunk;
+                    int end = begin + nchunk;
+                    if (end > (int) ncols) {
+                        end = (int) ncols;
+                    }
+
+                    top_k_scan_merge_f32(
+                        src + (int64_t) row * ncols, nullptr, begin, end, k, split_block,
+                        shared_vals.get_multi_ptr<sycl::access::decorated::no>().get(),
+                        shared_idx.get_multi_ptr<sycl::access::decorated::no>().get(),
+                        pv + (size_t) grp * k, pi + (size_t) grp * k, false, item_ct1);
+                });
+        });
+
+        main_stream->submit([&](sycl::handler &cgh) {
+            sycl::local_accessor<float, 1> shared_vals(sycl::range<1>(split_block * k), cgh);
+            sycl::local_accessor<int, 1> shared_idx(sycl::range<1>(split_block * k), cgh);
+
+            cgh.parallel_for(
+                sycl::nd_range<1>(sycl::range<1>(nrows) * block_dims, block_dims),
+                [=](sycl::nd_item<1> item_ct1) {
+                    const int row = item_ct1.get_group(0);
+                    const size_t off = (size_t) row * nsplit * k;
+
+                    top_k_scan_merge_f32(
+                        pv + off, pi + off, 0, nsplit * k, k, split_block,
+                        shared_vals.get_multi_ptr<sycl::access::decorated::no>().get(),
+                        shared_idx.get_multi_ptr<sycl::access::decorated::no>().get(),
+                        nullptr, dst_indices + (int64_t) row * k, true, item_ct1);
+                });
+        });
+
+        return;
+    }
+
     const int block_size = 128;
 
     const sycl::range<1> block_dims(block_size);
@@ -2409,85 +2597,14 @@ static void top_k_f32_sycl(
             sycl::nd_range<1>(grid_dims * block_dims, block_dims),
             [=](sycl::nd_item<1> item_ct1) {
                 const int row = item_ct1.get_group(0);
-                const int tid = item_ct1.get_local_id(0);
 
                 if (row >= nrows) return;
 
-                const float * src_row = src + row * ncols;
-                int32_t * dst_idx_row = dst_indices + row * k;
-
-                float local_vals[32];
-                int local_idx[32];
-
-                for (int i = 0; i < k; i++) {
-                    local_vals[i] = -FLT_MAX;
-                    local_idx[i] = -1;
-                }
-
-                for (int col = tid; col < ncols; col += block_size) {
-                    float val = src_row[col];
-
-                    if (val > local_vals[k-1]) {
-                        int pos = k - 1;
-                        while (pos > 0 && val > local_vals[pos - 1]) {
-                            pos--;
-                        }
-
-                        for (int i = k - 1; i > pos; i--) {
-                            local_vals[i] = local_vals[i - 1];
-                            local_idx[i] = local_idx[i - 1];
-                        }
-                        local_vals[pos] = val;
-                        local_idx[pos] = col;
-                    }
-                }
-
-                for (int i = 0; i < k; i++) {
-                    shared_vals[tid * k + i] = local_vals[i];
-                    shared_idx[tid * k + i] = local_idx[i];
-                }
-                item_ct1.barrier(sycl::access::fence_space::local_space);
-
-                if (tid == 0) {
-                    float final_vals[32];
-                    int final_idx[32];
-
-                    for (int i = 0; i < k; i++) {
-                        final_vals[i] = -FLT_MAX;
-                        final_idx[i] = -1;
-                    }
-
-                    for (int t = 0; t < block_size; t++) {
-                        for (int i = 0; i < k; i++) {
-                            float val = shared_vals[t * k + i];
-                            int idx = shared_idx[t * k + i];
-
-                            if (val > final_vals[k-1]) {
-                                int pos = k - 1;
-                                while (pos > 0 && val > final_vals[pos - 1]) {
-                                    pos--;
-                                }
-
-                                for (int j = k - 1; j > pos; j--) {
-                                    final_vals[j] = final_vals[j - 1];
-                                    final_idx[j] = final_idx[j - 1];
-                                }
-                                final_vals[pos] = val;
-                                final_idx[pos] = idx;
-                            }
-                        }
-                    }
-
-                    for (int i = 0; i < k; i++) {
-                        dst_idx_row[i] = final_idx[i];
-                    }
-
-                    if (k > 1) {
-                        int32_t temp = dst_idx_row[0];
-                        dst_idx_row[0] = dst_idx_row[1];
-                        dst_idx_row[1] = temp;
-                    }
-                }
+                top_k_scan_merge_f32(
+                    src + (int64_t) row * ncols, nullptr, 0, (int) ncols, k, block_size,
+                    shared_vals.get_multi_ptr<sycl::access::decorated::no>().get(),
+                    shared_idx.get_multi_ptr<sycl::access::decorated::no>().get(),
+                    nullptr, dst_indices + (int64_t) row * k, true, item_ct1);
             });
     });
 }
@@ -2979,7 +3096,7 @@ static void ggml_sycl_op_top_k(ggml_backend_sycl_context & ctx, ggml_tensor * ds
     GGML_ASSERT(k > 0 && k <= 32);
     GGML_ASSERT(k <= ncols);
 
-    top_k_f32_sycl(src0_dd, dst_dd, ncols, nrows, k, main_stream);
+    top_k_f32_sycl(ctx, src0_dd, dst_dd, ncols, nrows, k, main_stream);
 }
 
 inline void ggml_sycl_op_argmax(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {

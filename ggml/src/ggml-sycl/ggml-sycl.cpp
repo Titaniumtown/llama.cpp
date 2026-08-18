@@ -4632,7 +4632,38 @@ static inline bool ggml_sycl_f32mm_enabled() {
     return m != 0;
 }
 
-static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+// The GDN output projection hands its MTP columns to mul_mat in ne[2], not ne[1]:
+// src1='final_output' is ne=[6144, 1, 5, 1] where the attention block's identically
+// shaped attn_output gets ne=[6144, 5, 1, 1]. Every multi-column path keys off ne[1],
+// so ssm_out is dispatched as ncols_dst == 1 once per i02 and re-streams its whole
+// 17.69 MiB weight five times per token. Measured cost: 34.7 us per column against
+// 5-7 for every sibling, and 17.69 MiB at the 598 GB/s wall is 31.0 us.
+//
+// nb[2] == nb[1] on both src1 and dst there (24576 == 6144*4, 20480 == 5120*4), i.e.
+// it is already exactly a contiguous [K, ne2] matrix wearing the wrong ne. Relabel it
+// so the wide kernel can see the columns. Same dot products, same order, one weight read.
+static bool ggml_sycl_fold_ne2_columns(const ggml_tensor * src0, ggml_tensor & src1_f, ggml_tensor & dst_f) {
+    // A batched src0 multiplies each i02 slice by a DIFFERENT weight, so folding those
+    // slices into columns of one GEMM would silently use slice 0 for every column.
+    if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
+    if (src1_f.ne[1] != 1 || dst_f.ne[1] != 1) return false;
+    if (src1_f.ne[2] <= 1 || src1_f.ne[2] != dst_f.ne[2]) return false;
+    if (src1_f.ne[3] != 1 || dst_f.ne[3] != 1) return false;
+    // ne[1] == 1 makes nb[1] a dead stride, so the slice stride must be the row size.
+    if (src1_f.nb[2] != (size_t) src1_f.ne[0] * src1_f.nb[0]) return false;
+    if (dst_f.nb[2]  != (size_t) dst_f.ne[0]  * dst_f.nb[0])  return false;
+    src1_f.ne[1] = src1_f.ne[2]; src1_f.ne[2] = 1; src1_f.nb[1] = src1_f.nb[2];
+    dst_f.ne[1]  = dst_f.ne[2];  dst_f.ne[2]  = 1;  dst_f.nb[1]  = dst_f.nb[2];
+    return true;
+}
+
+static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1_in, ggml_tensor * dst_in) {
+    static const int fold_env = ggml_sycl_get_env("GGML_SYCL_FOLD_NE2_COLS", 1);
+    ggml_tensor src1_folded = *src1_in;
+    ggml_tensor dst_folded  = *dst_in;
+    const bool folded = fold_env && ggml_sycl_fold_ne2_columns(src0, src1_folded, dst_folded);
+    const ggml_tensor * src1 = folded ? &src1_folded : src1_in;
+    ggml_tensor *       dst  = folded ? &dst_folded  : dst_in;
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
     const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
     int64_t min_compute_capability = INT_MAX;

@@ -480,9 +480,18 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0> {
         int v[q8_0_traits::vdr_mmvq];
         int u[q8_0_traits::vdr_mmvq];
 
+        // Aligned load. The reorder layout puts this block's weights at
+        // get_block_offset() == block_index * QK8_0 == block_index * 32, a multiple of 4, and
+        // the accessor adds sizeof(int) * i32 on top, so every access here is 4-byte aligned.
+        // The unaligned get_int_from_int8 promises only 2-byte alignment, which forbids the
+        // compiler from widening: with vdr_mmvq == 4 these are 4 ADJACENT ints, i.e. 16
+        // contiguous bytes per work-item, and the 2-byte promise turns one 16-byte load into
+        // eight 2-byte loads. Access width is the binding constraint on this card -- measured
+        // read ceiling is 603 GB/s at >=8 B per work-item but only 444 GB/s at 4 B -- and this
+        // kernel was at 353 GB/s.
 #pragma unroll
         for (size_t i = 0; i < q8_0_traits::vdr_mmvq; ++i) {
-            v[i] = get_int_from_int8(qs, iqs + i);
+            v[i] = get_int_from_int8_aligned(qs, iqs + i);
             u[i] = get_int_from_int8_aligned(q8_1_quant_ptr, iqs + i);
         }
 
@@ -713,8 +722,14 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K> {
         const int scale_offset = (QI6_K / 4) * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 8);
         const int vh_shift     = 2 * ((iqs % (QI6_K / 2)) / (QI6_K / 4));
 
-        const int vl = get_int_from_uint8(ql, iqs);
-        const int vh = get_int_from_uint8(qh, (QI6_K / 4) * (iqs / (QI6_K / 2)) + iqs % (QI6_K / 4)) >> vh_shift;
+        // Aligned loads. In the reorder layout get_block_offset() returns
+        // ql = block_index * (QK_K / QR6_K) = block_index * 128 and
+        // qh = n_blocks * (QK_K / 2) + block_index * (QK_K / 4) = n_blocks * 128 + block_index * 64,
+        // both multiples of 4, and the accessor adds sizeof(int) * i32. The unaligned variant's
+        // 2-byte promise splits each of these dword reads in half for no reason; q6_K is the
+        // only type in this file at vdr_mmvq == 1, so it is already the narrowest reader.
+        const int vl = get_int_from_uint8_aligned(ql, iqs);
+        const int vh = get_int_from_uint8_aligned(qh, (QI6_K / 4) * (iqs / (QI6_K / 2)) + iqs % (QI6_K / 4)) >> vh_shift;
 
         const int8_t * scs = scales + scale_offset;
 

@@ -2639,6 +2639,12 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+// Charge the span since the previous mark to `name` in the GGML_SYCL_PROF table. Lets one
+// ggml node be split into its sub-submissions -- for a quantized matmul the weight dequant
+// pass and the GEMM are separate kernels, and only the split says which one to attack.
+// A no-op unless GGML_SYCL_PROF=1; defined next to the profiler further down.
+static void ggml_sycl_prof_mark_sub(const std::string & name, uint64_t bytes);
+
 inline void ggml_sycl_op_mul_mat_sycl(
     ggml_backend_sycl_context & ctx,
     const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
@@ -2707,6 +2713,15 @@ inline void ggml_sycl_op_mul_mat_sycl(
             size_t ne = row_diff*ne00;
             src0_as_f16.alloc(ne);
             to_fp16_sycl(src0_dd_i, src0_as_f16.get(), ne, stream);
+            // Bytes are what this pass actually streams: the quantized weight in, f16 out.
+            // The f16 output is then re-read by the GEMM, so the true cost of carrying a
+            // quantized weight through a f16 GEMM is this row plus that extra read.
+            char shape[48];
+            snprintf(shape, sizeof(shape), "/%s/%ldx%ld", ggml_type_name(src0->type),
+                     (long) ne00, (long) row_diff);
+            ggml_sycl_prof_mark_sub(std::string("DEQUANT") + shape,
+                                    ggml_row_size(src0->type, ne00) * row_diff
+                                        + ne * sizeof(sycl::half));
         }
         const sycl::half *src0_ptr = src0->type == GGML_TYPE_F16
                                          ? (const sycl::half *)src0_dd_i
@@ -2721,6 +2736,8 @@ inline void ggml_sycl_op_mul_mat_sycl(
             size_t ne = src1_ncols*ne10;
             src1_as_f16.alloc(ne);
             to_fp16_sycl(src1_ddf_i, src1_as_f16.get(), ne, stream);
+            ggml_sycl_prof_mark_sub("CONVERT/src1/f32->f16",
+                                    ne * (sizeof(float) + sizeof(sycl::half)));
         }
         const sycl::half *src1_ptr = src1->type == GGML_TYPE_F16
                 ? (const sycl::half *)src1->data + src1_padded_row_size
@@ -2731,6 +2748,18 @@ inline void ggml_sycl_op_mul_mat_sycl(
                 DnnlGemmWrapper::row_gemm(ctx,row_diff, src1_ncols , ne10, src0_ptr,
                                      DnnlGemmWrapper::to_dt<sycl::half>(), src1_ptr, DnnlGemmWrapper::to_dt<sycl::half>(),
                                       dst_dd_i, DnnlGemmWrapper::to_dt<float>(), stream);
+                // f16 A and B in, f32 C out, with the dequant and convert charged to their own
+                // rows. The key carries M x N x K because ggml_sycl_op_mul_mat splits one node
+                // into several calls with different N: an aggregated row cannot say how many
+                // FLOPs a call did, and therefore cannot say how close the GEMM is to the
+                // card's fp16 peak -- which is the whole question for the largest row in the
+                // profile. Bytes stay honest so the GB/s column remains arithmetic intensity.
+                char gkey[80];
+                snprintf(gkey, sizeof(gkey), "GEMM/f16/%ldx%ldx%ld", (long) row_diff,
+                         (long) src1_ncols, (long) ne10);
+                ggml_sycl_prof_mark_sub(gkey,
+                                        (uint64_t) (row_diff * ne10 + src1_ncols * ne10) * sizeof(sycl::half)
+                                            + (uint64_t) row_diff * src1_ncols * sizeof(float));
         }
         else
 #endif
@@ -5691,6 +5720,14 @@ struct ggml_sycl_op_prof {
     std::vector<entry> marks;
     sycl::queue *      q = nullptr;
 
+    // The instrumented sub-marks are raised from deep inside op implementations that have no
+    // handle on the graph-scoped profiler, so it publishes itself here for the duration of
+    // one graph. Single-threaded by construction: graph_compute_impl owns the queue.
+    static ggml_sycl_op_prof *& active() {
+        static ggml_sycl_op_prof * a = nullptr;
+        return a;
+    }
+
     void begin(sycl::queue * queue) {
         if (!enabled()) {
             return;
@@ -5698,6 +5735,17 @@ struct ggml_sycl_op_prof {
         q = queue;
         marks.clear();
         marks.push_back({ std::string(), 0, q->ext_oneapi_submit_barrier() });
+        active() = this;
+    }
+
+    // Close a span early under an explicit name. The enclosing node's own mark then covers
+    // only what is left after this point, so a matmul's row becomes the GEMM tail rather
+    // than the whole op -- intended, and the reason DEQUANT/CONVERT/GEMM sum to the op.
+    void mark_named(const std::string & name, uint64_t bytes) {
+        if (!enabled() || q == nullptr) {
+            return;
+        }
+        marks.push_back({ name, bytes, q->ext_oneapi_submit_barrier() });
     }
 
     // Bytes this node is expected to move. For a matmul in decode the weight dwarfs
@@ -5777,6 +5825,7 @@ struct ggml_sycl_op_prof {
             slot.bytes += marks[i].bytes;
         }
         marks.clear();
+        active() = nullptr;
     }
 
     static void dump() {
@@ -5808,6 +5857,12 @@ struct ggml_sycl_op_prof {
         fflush(stderr);
     }
 };
+
+static void ggml_sycl_prof_mark_sub(const std::string & name, uint64_t bytes) {
+    if (ggml_sycl_op_prof * a = ggml_sycl_op_prof::active()) {
+        a->mark_named(name, bytes);
+    }
+}
 
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);

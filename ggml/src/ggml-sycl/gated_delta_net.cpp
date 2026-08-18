@@ -100,36 +100,55 @@ void gated_delta_net_sycl(
         if constexpr (!KDA) {
             const float g_val = sycl::native::exp(*g_t);
 
-            // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
+            // attn[col] wants the NEW state, and reducing over it directly is what used to
+            // serialise this loop: that reduction could not start until delta[col] was known,
+            // and delta[col] needs kv[col]'s reduction to have landed. Substituting the state
+            // update removes the dependency rather than hiding it:
+            //
+            //   attn[col] = sum_i (g*S[i][col] + k[i]*delta[col]) * q[i]
+            //             = g * sum_i S[i][col]*q[i]  +  delta[col] * sum_i k[i]*q[i]
+            //             = g * qs[col]               +  delta[col] * kq
+            //
+            // Both sums read only the OLD state and this token's inputs, so every reduction on
+            // the critical path is independent: kv and qs share one float2 shuffle loop (that
+            // overload interleaves two reductions in a single pass), and kq needs one more
+            // reduction per token rather than per column, since it does not depend on col.
+            // Same terms in a different summation order, so results differ in rounding only.
             float kv_col[C];
+            float qs_col[C];
 #pragma unroll
             for (int c = 0; c < C; c++) {
-                float kv_shard = 0.0f;
+                sycl::float2 acc(0.0f, 0.0f);
 #pragma unroll
                 for (int r = 0; r < rows_per_lane; r++) {
-                    kv_shard += s_shard[c][r] * k_reg[r];
+                    acc.x() += s_shard[c][r] * k_reg[r];
+                    acc.y() += s_shard[c][r] * q_reg[r];
                 }
-                kv_col[c] = warp_reduce_sum<warp_size>(kv_shard);
+                acc       = warp_reduce_sum<warp_size>(acc);
+                kv_col[c] = acc.x();
+                qs_col[c] = acc.y();
             }
+
+            float kq_shard = 0.0f;
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                kq_shard += k_reg[r] * q_reg[r];
+            }
+            const float kq = warp_reduce_sum<warp_size>(kq_shard);
 
 #pragma unroll
             for (int c = 0; c < C; c++) {
                 // delta[col] = (v[col] - g * kv[col]) * beta
                 const float delta_col = (v_t[col0 + c] - g_val * kv_col[c]) * beta_val;
 
-                // fused: S[i][col] = g * S[i][col] + k[i] * delta[col]
-                // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
-                float attn_partial = 0.0f;
+                // S[i][col] = g * S[i][col] + k[i] * delta[col]
 #pragma unroll
                 for (int r = 0; r < rows_per_lane; r++) {
                     s_shard[c][r] = g_val * s_shard[c][r] + k_reg[r] * delta_col;
-                    attn_partial += s_shard[c][r] * q_reg[r];
                 }
 
-                const float attn_col = warp_reduce_sum<warp_size>(attn_partial);
-
                 if (lane == 0) {
-                    attn_data[col0 + c] = attn_col * scale;
+                    attn_data[col0 + c] = (g_val * qs_col[c] + delta_col * kq) * scale;
                 }
             }
         } else {
@@ -142,36 +161,45 @@ void gated_delta_net_sycl(
                 g_reg[r]    = sycl::native::exp(g_t[i]);
             }
 
-            // kv[col] = sum_i g[i] * S[i][col] * k[i]
+            // Same substitution as the !KDA branch. g is per row here, so it weights qs
+            // inside the sum instead of scaling the result afterwards:
+            //   attn[col] = sum_i g[i]*S[i][col]*q[i] + delta[col] * sum_i k[i]*q[i]
             float kv_col[C];
+            float qs_col[C];
 #pragma unroll
             for (int c = 0; c < C; c++) {
-                float kv_shard = 0.0f;
+                sycl::float2 acc(0.0f, 0.0f);
 #pragma unroll
                 for (int r = 0; r < rows_per_lane; r++) {
-                    kv_shard += g_reg[r] * s_shard[c][r] * k_reg[r];
+                    const float gs = g_reg[r] * s_shard[c][r];
+                    acc.x() += gs * k_reg[r];
+                    acc.y() += gs * q_reg[r];
                 }
-                kv_col[c] = warp_reduce_sum<warp_size>(kv_shard);
+                acc       = warp_reduce_sum<warp_size>(acc);
+                kv_col[c] = acc.x();
+                qs_col[c] = acc.y();
             }
+
+            float kq_shard = 0.0f;
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                kq_shard += k_reg[r] * q_reg[r];
+            }
+            const float kq = warp_reduce_sum<warp_size>(kq_shard);
 
 #pragma unroll
             for (int c = 0; c < C; c++) {
                 // delta[col] = (v[col] - kv[col]) * beta
                 const float delta_col = (v_t[col0 + c] - kv_col[c]) * beta_val;
 
-                // fused: S[i][col] = g[i] * S[i][col] + k[i] * delta[col]
-                // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
-                float attn_partial = 0.0f;
+                // S[i][col] = g[i] * S[i][col] + k[i] * delta[col]
 #pragma unroll
                 for (int r = 0; r < rows_per_lane; r++) {
                     s_shard[c][r] = g_reg[r] * s_shard[c][r] + k_reg[r] * delta_col;
-                    attn_partial += s_shard[c][r] * q_reg[r];
                 }
 
-                const float attn_col = warp_reduce_sum<warp_size>(attn_partial);
-
                 if (lane == 0) {
-                    attn_data[col0 + c] = attn_col * scale;
+                    attn_data[col0 + c] = (qs_col[c] + delta_col * kq) * scale;
                 }
             }
         }

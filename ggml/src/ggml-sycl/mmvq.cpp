@@ -1749,7 +1749,10 @@ static inline float q4k_wide_lane_partial(const uint8_t * qs, const uint16_t * s
 // vec_dot_q4_K_q8_1_impl_vmmq_presum (min term added once per scale group).
 static void mul_mat_vec_q4_K_reorder_wide(const void * __restrict__ vx, const void * __restrict__ vy,
                                           float * __restrict__ dst, const int ncols, const int nrows,
-                                          const sycl::nd_item<3> & nd_item) {
+                                          const sycl::nd_item<3> & nd_item,
+                                          const float * __restrict__ glu_other = nullptr,
+                                          float * __restrict__ glu_dst = nullptr,
+                                          const bool glu_anchor_is_up = false) {
     using q4_k_block = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q4_K>;
 
     const auto sg       = nd_item.get_sub_group();
@@ -1794,7 +1797,16 @@ static void mul_mat_vec_q4_K_reorder_wide(const void * __restrict__ vx, const vo
 
     const float row_sum = sycl::reduce_over_group(sg, partial, std::plus<>());
     if (sg.leader()) {
-        dst[row] = row_sum;
+        if (glu_dst != nullptr) {
+            // SWIGLU epilogue: the sibling mat-vec already wrote its row; fold
+            // silu(gate)*up into this store and skip the standalone GLU kernel.
+            const float other = glu_other[row];
+            const float g     = glu_anchor_is_up ? other : row_sum;
+            const float u     = glu_anchor_is_up ? row_sum : other;
+            glu_dst[row]      = g / (1.0f + sycl::exp(-g)) * u;
+        } else {
+            dst[row] = row_sum;
+        }
     }
 }
 
@@ -1809,6 +1821,28 @@ static void reorder_mul_mat_vec_q4_k_q8_1_wide_sycl(const void * vx, const void 
         cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                          [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                              mul_mat_vec_q4_K_reorder_wide(vx, vy, dst, ncols, nrows, nd_item);
+                         });
+    });
+}
+
+// SWIGLU-epilogue wide mat-vec launchers (mixed-type gate/up triples): the anchor
+// runs its own optimal wide kernel; the store reads the sibling's row and writes
+// the GLU output. The anchor's own dst tensor is never written (GLU is its only
+// consumer, same contract as the fully-fused GLU path).
+static void reorder_mul_mat_vec_q4_k_q8_1_wide_glu_epi_sycl(const void * vx, const void * vy,
+                                                            const float * glu_other, float * glu_dst,
+                                                            const bool glu_anchor_is_up, const int ncols,
+                                                            const int nrows, dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    constexpr size_t     num_subgroups = WARP_SIZE;
+    const int            block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_q4_K_reorder_wide(vx, vy, nullptr, ncols, nrows, nd_item,
+                                                           glu_other, glu_dst, glu_anchor_is_up);
                          });
     });
 }
@@ -2641,7 +2675,10 @@ template <int ncols_dst>
 static void mul_mat_vec_q5_K_reorder_wide_ncols(const void * __restrict__ vx, const void * __restrict__ vy,
                                                 float * __restrict__ dst, const int ncols, const int nrows,
                                                 const int stride_col_y_bytes, const int stride_col_dst,
-                                                const sycl::nd_item<3> & nd_item);
+                                                const sycl::nd_item<3> & nd_item,
+                                                const float * __restrict__ glu_other = nullptr,
+                                                float * __restrict__ glu_dst = nullptr,
+                                                const bool glu_anchor_is_up = false);
 
 template <int ncols_dst, int SPLIT>
 static void reorder_mul_mat_vec_q5_k_q8_1_sycl_ncols_split(
@@ -2682,6 +2719,26 @@ static void reorder_mul_mat_vec_q5_k_q8_1_sycl(const void * vx, const void * vy,
     });
 }
 
+// SWIGLU-epilogue twin of the wide n=1 launch above (mixed-type gate/up triples).
+// nrows here is ffn-sized (>= the split target), so the split cases never apply.
+static void reorder_mul_mat_vec_q5_k_q8_1_wide_glu_epi_sycl(const void * vx, const void * vy,
+                                                            const float * glu_other, float * glu_dst,
+                                                            const bool glu_anchor_is_up, const int ncols,
+                                                            const int nrows, dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    constexpr size_t     num_subgroups = WARP_SIZE;
+    const int            block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                            [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                mul_mat_vec_q5_K_reorder_wide_ncols<1>(vx, vy, nullptr, ncols, nrows, 0, 0, nd_item,
+                                                                       glu_other, glu_dst, glu_anchor_is_up);
+                            });
+    });
+}
+
 // Wide multi-column Q5_K reorder MMVQ (MTP verify). Same lane->iqs mapping as
 // the generic mul_mat_vec_q_reorder_ncols, but the weight load + 5-bit decode
 // (vl|vh, scales, mins, dm) is hoisted out of the per-column loop -- the scalar
@@ -2691,7 +2748,10 @@ template <int ncols_dst>
 static void mul_mat_vec_q5_K_reorder_wide_ncols(const void * __restrict__ vx, const void * __restrict__ vy,
                                                 float * __restrict__ dst, const int ncols, const int nrows,
                                                 const int stride_col_y_bytes, const int stride_col_dst,
-                                                const sycl::nd_item<3> & nd_item) {
+                                                const sycl::nd_item<3> & nd_item,
+                                                const float * __restrict__ glu_other,
+                                                float * __restrict__ glu_dst,
+                                                const bool glu_anchor_is_up) {
     using block_type   = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q5_K>;
     using block_traits = typename block_type::traits;
 
@@ -2796,7 +2856,16 @@ static void mul_mat_vec_q5_K_reorder_wide_ncols(const void * __restrict__ vx, co
     for (int col = 0; col < ncols_dst; ++col) {
         const float sum = sycl::reduce_over_group(sg, partial[col], std::plus<>());
         if (sg.leader()) {
-            dst[col * stride_col_dst + row] = sum;
+            if (ncols_dst == 1 && glu_dst != nullptr) {
+                // SWIGLU epilogue: the sibling mat-vec already wrote its row; fold
+                // silu(gate)*up into this store and skip the standalone GLU kernel.
+                const float other = glu_other[row];
+                const float g     = glu_anchor_is_up ? other : sum;
+                const float u     = glu_anchor_is_up ? sum : other;
+                glu_dst[row]      = g / (1.0f + sycl::exp(-g)) * u;
+            } else {
+                dst[col * stride_col_dst + row] = sum;
+            }
         }
     }
 }
@@ -3825,6 +3894,15 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                             fprintf(stderr, "[MMGRP] q4_K rows=%d+%d a_mismatches=%ld b_mismatches=%ld\n",
                                     row_diff, rows2, ba, bb);
                         }
+                    } else if (ctx.mmvq_glu_epi_out != nullptr && src1_ncols == 1) {
+                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_k_q8_1_wide_glu_epi_sycl\n");
+                        // second mat-vec of a mixed-type (gate, up, SWIGLU) triple: read the
+                        // sibling's row, write silu(gate)*up into the GLU output directly
+                        reorder_mul_mat_vec_q4_k_q8_1_wide_glu_epi_sycl(
+                            src0_dd_i, src1_ddq_i_bs,
+                            (const float *) ctx.mmvq_glu_epi_other->data,
+                            (float *) ctx.mmvq_glu_epi_out->data,
+                            ctx.mmvq_glu_epi_anchor_is_up, ne00, row_diff, stream);
                     } else if (ctx.mmvq_dsa_out != nullptr && src1_ncols == 1) {
                         GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_k_q8_1_dsa_wide_sycl\n");
                         // dst is the mat-vec (correct reorder detection); the fused kernel
@@ -3905,6 +3983,15 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                                 }
                             }
                         }
+                    } else if (ctx.mmvq_glu_epi_out != nullptr && src1_ncols == 1) {
+                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q5_k_q8_1_wide_glu_epi_sycl\n");
+                        // second mat-vec of a mixed-type (gate, up, SWIGLU) triple: read the
+                        // sibling's row, write silu(gate)*up into the GLU output directly
+                        reorder_mul_mat_vec_q5_k_q8_1_wide_glu_epi_sycl(
+                            src0_dd_i, src1_ddq_i_bs,
+                            (const float *) ctx.mmvq_glu_epi_other->data,
+                            (float *) ctx.mmvq_glu_epi_out->data,
+                            ctx.mmvq_glu_epi_anchor_is_up, ne00, row_diff, stream);
                     } else {
                         GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q5_k_q8_1_sycl\n");
                         reorder_mul_mat_vec_q5_k_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);

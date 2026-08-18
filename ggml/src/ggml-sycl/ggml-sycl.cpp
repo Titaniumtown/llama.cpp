@@ -7955,7 +7955,6 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 #endif
-        // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
         if (node->op == GGML_OP_UNARY && g_ggml_sycl_enable_fusion) {
             if (ggml_tensor * gdn = find_gdn_beta_sigmoid(cgraph, i)) {
                 // No dispatch at all: the GDN below applies the sigmoid at its beta load.
@@ -8026,6 +8025,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 continue;
             }
         }
+        // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
         if (node->op == GGML_OP_GATED_DELTA_NET && g_ggml_sycl_enable_fusion) {
             // A skipped SIGMOID means src[4] is never written, and a skipped GET_ROWS means
             // src[5] is never written, so BOTH flags MUST reach the kernel on every path
@@ -8060,11 +8060,59 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
-        // GDN decay chain: fold +ssm_dt, softplus and *ssm_a into the mat-vec store.
-        // Only the reordered Q4_K ncols==1 kernel implements the epilogue, so the
-        // capability is checked HERE: if the mmvq switch fell through to any other
-        // kernel the three skipped nodes would simply never run, which is a wrong
-        // answer rather than a slow one.
+        // Mixed-type (gate-mm, up-mm, SWIGLU) triple: the equal-type triple is folded
+        // whole by the GLU hook below, but this model quantizes gate=q4_K and up=q5_K,
+        // which no shared-offset kernel serves. Instead, anchor at the SECOND mat-vec
+        // (the first already dispatched normally on the in-order queue): its store
+        // reads the sibling's row from DRAM and writes silu(gate)*up straight into the
+        // GLU output, and the standalone SWIGLU kernel never dispatches. Writing the
+        // GLU dst one node early is alias-safe: the only tensor whose last consumer is
+        // this node is the shared activation, and its final read (the q8_1 quantize)
+        // is ordered before this kernel on the same queue. Must precede the pair hook
+        // or a grouped pair could claim this mat-vec first. GGML_SYCL_FUSE_GLU_EPI=0
+        // disables.
+        static const int fuse_glu_epi = ggml_sycl_get_env("GGML_SYCL_FUSE_GLU_EPI", 1);
+        if (fuse_glu_epi && node->op == GGML_OP_MUL_MAT && i >= 1 && i + 1 < cgraph->n_nodes &&
+            cgraph->nodes[i + 1]->op == GGML_OP_GLU &&
+            ggml_get_glu_op(cgraph->nodes[i + 1]) == GGML_GLU_OP_SWIGLU) {
+            ggml_tensor * glu   = cgraph->nodes[i + 1];
+            ggml_tensor * first = cgraph->nodes[i - 1];
+            const bool    pattern_ok =
+                first->op == GGML_OP_MUL_MAT && glu->src[0] != nullptr && glu->src[1] != nullptr &&
+                ((glu->src[0] == first && glu->src[1] == node) ||
+                 (glu->src[0] == node && glu->src[1] == first)) &&
+                node->src[0] != nullptr && node->src[1] != nullptr && node->src[1]->ne[1] == 1 &&
+                node->src[1]->ne[2] == 1 && node->src[1]->ne[3] == 1 &&
+                (node->src[0]->type == GGML_TYPE_Q4_K || node->src[0]->type == GGML_TYPE_Q5_K) &&
+                node->src[0]->ne[0] % QK_K == 0 && node->src[0]->ne[2] == 1 && node->src[0]->ne[3] == 1 &&
+                node->type == GGML_TYPE_F32 && first->type == GGML_TYPE_F32 &&
+                glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) && ggml_is_contiguous(first) &&
+                glu->ne[0] == node->ne[0] && first->ne[0] == node->ne[0] &&
+                node->src[0]->extra != nullptr &&
+                ((ggml_tensor_extra_gpu *) node->src[0]->extra)->optimized_feature.reorder &&
+                ggml_sycl_info().device_count == 1;
+            if (pattern_ok) {
+                sycl_ctx->mmvq_glu_epi_out          = glu;
+                sycl_ctx->mmvq_glu_epi_other        = first;
+                sycl_ctx->mmvq_glu_epi_anchor_is_up = glu->src[1] == node;
+                ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(*sycl_ctx, node->src[0], node->src[1], node,
+                                                                    ggml_sycl_op_mul_mat_vec_q);
+                sycl_ctx->mmvq_glu_epi_out          = nullptr;
+                sycl_ctx->mmvq_glu_epi_other        = nullptr;
+                sycl_ctx->mmvq_glu_epi_anchor_is_up = false;
+                prof.mark(node, cgraph, i, 2);
+                i += 1;
+                continue;
+            }
+        }
+
+        // Folding the gate weight and the SwiGLU into the up projection's mat-vec is a win
+        // at ONE column and a loss at two or more: the fused kernel carries partial_up and
+        // partial_gate plus a second weight quad per work-item, and past a single column
+        // that costs more than the launch and the activation re-quantisation it saves.
+        // GGML_SYCL_FUSE_GLU is therefore the largest ncols_dst to fuse at, not a flag --
+        // 0 still disables it outright and 8 restores the previous always-fuse behaviour,
+        // which keeps the multi-column fused kernel reachable for re-testing on other parts.
         // Two independent mat-vecs over one activation, folded into a single
         // two-destination dispatch. At this size both are ~99% launch overhead -- the
         // delta-net beta/alpha projections each move 138 KB in ~8.4 us, i.e. 16 GB/s
@@ -8074,7 +8122,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         static const int fuse_pair = ggml_sycl_get_env("GGML_SYCL_FUSE_PAIR", 1);
         if (fuse_pair && node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr &&
             node->src[1] != nullptr && node->src[1]->ne[1] == 1 &&
-            node->src[0]->type == GGML_TYPE_Q4_K && node->src[0]->extra != nullptr &&
+            (node->src[0]->type == GGML_TYPE_Q4_K || node->src[0]->type == GGML_TYPE_Q5_K) &&
+            node->src[0]->extra != nullptr &&
             ((ggml_tensor_extra_gpu *) node->src[0]->extra)->optimized_feature.reorder) {
             mul_mat_pair_fusion pf;
             if (find_mul_mat_pair(cgraph, i, pf)) {
@@ -8090,12 +8139,25 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 sycl_ctx->mmvq_dsa_out            = nullptr;
                 sycl_ctx->mmvq_dsa_bias           = nullptr;
                 sycl_ctx->mmvq_dsa_scale          = nullptr;
+                const auto pair_skip_add = [&](ggml_tensor * t) {
+                    for (auto & sk : pair_skip_node) {
+                        if (sk == nullptr) {
+                            sk = t;
+                            return;
+                        }
+                    }
+                    GGML_ABORT("pair skip slots exhausted");
+                };
                 if (pf.anchor_is_dsa) {
                     // the chain starts at this node; step over its four followers and skip
                     // the paired mat-vec wherever it lands
                     prof.mark(node, cgraph, i, 5);
-                    i              += 4;
-                    pair_skip_node  = pf.other;
+                    i += 4;
+                    pair_skip_add(pf.other);
+                } else if (pf.plain) {
+                    // grouped two-destination dispatch: only the paired mat-vec is folded
+                    prof.mark(node);
+                    pair_skip_add(pf.other);
                 } else {
                     prof.mark(node);
                     pair_skip_lo = pf.chain_lo;
@@ -8105,6 +8167,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 
+        // GDN decay chain: fold +ssm_dt, softplus and *ssm_a into the mat-vec store.
+        // Only the reordered Q4_K ncols==1 kernel implements the epilogue, so the
+        // capability is checked HERE: if the mmvq switch fell through to any other
+        // kernel the three skipped nodes would simply never run, which is a wrong
+        // answer rather than a slow one.
         static const int fuse_dsa = ggml_sycl_get_env("GGML_SYCL_FUSE_DSA", 1);
         if (fuse_dsa && node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr &&
             node->src[1] != nullptr && node->src[1]->ne[1] == 1 &&

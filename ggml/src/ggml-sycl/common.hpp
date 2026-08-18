@@ -359,6 +359,13 @@ struct ggml_backend_sycl_context {
     // or to it, since ggml's order between the two is not fixed.
     const ggml_tensor * mmvq_pair_other = nullptr;
     bool                mmvq_pair_anchor_is_dsa = false;
+    // Set while dispatching the SECOND mat-vec of a (gate-mm, up-mm, SWIGLU) triple whose
+    // quant types differ (the equal-type triple takes the direct GLU fusion hook): the first
+    // mat-vec ran normally, and this dispatch's store reads its row from DRAM and writes
+    // silu(gate)*up straight into the GLU output -- the standalone SWIGLU kernel never runs.
+    const ggml_tensor * mmvq_glu_epi_out          = nullptr;  // the GLU node (written here)
+    const ggml_tensor * mmvq_glu_epi_other        = nullptr;  // the already-dispatched mat-vec
+    bool                mmvq_glu_epi_anchor_is_up = false;    // anchor is the linear (up) half
     const ggml_tensor * mmvq_dsa_out   = nullptr;
     const ggml_tensor * mmvq_dsa_bias  = nullptr;
     const ggml_tensor * mmvq_dsa_scale = nullptr;

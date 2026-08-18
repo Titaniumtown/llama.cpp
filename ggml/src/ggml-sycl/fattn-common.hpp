@@ -1105,7 +1105,13 @@ void launch_fattn(
         // The test is on ncols1, not ncols1*ncols2: one token per tile is what makes this
         // latency-bound, and how many heads are packed alongside it does not change that.
         // ncols2 is 6 on this model, so testing the product disabled this entirely.
-        if (ncols1 == 1) {
+        // Production decodes several columns per step -- an MTP verify step is n-max+1
+        // wide and, with a unified KV cache, arrives as one tile of that many tokens.
+        // The latency argument does not stop applying at two columns, so the gate is the
+        // largest ncols1 still latency-bound rather than a hard equality. Default 1 keeps
+        // the previous behaviour exactly; GGML_SYCL_FA_KV_SPLIT_MAX_NCOLS raises it.
+        static const int kv_split_max_ncols = ggml_sycl_get_env("GGML_SYCL_FA_KV_SPLIT_MAX_NCOLS", 8);
+        if (ncols1 <= kv_split_max_ncols) {
             // Raise only. On a short cache this formula asks for fewer blocks than the
             // wave-fill loop already chose, and taking it verbatim throws away parallelism
             // the machine has room for -- measurably so at depth 0.

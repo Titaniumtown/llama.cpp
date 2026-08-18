@@ -2475,23 +2475,31 @@ static void top_k_scan_merge_f32(
     for (int t = 0; t < block_size; t++) {
         for (int i = 0; i < k; i++) {
             float val = shared_vals[i * block_size + t];
+
+            if (val <= fkth) {
+                // Lane t's list is sorted descending, so once one of its entries loses
+                // to the k-th best, every later entry loses too -- and fkth only ever
+                // rises, so that stays true for the rest of the merge. This is what
+                // turns the merge from block_size*k steps into ~block_size plus the
+                // number of candidates actually accepted.
+                break;
+            }
+
             int idx = shared_idx[i * block_size + t];
 
-            if (val > fkth) {
-                int pos = k - 1;
-                while (pos > 0 && val > fv[pos - 1]) {
-                    pos--;
-                }
-
-                for (int j = k - 1; j > pos; j--) {
-                    fv[j] = fv[j - 1];
-                    fi[j] = fi[j - 1];
-                }
-                fv[pos] = val;
-                fi[pos] = idx;
-
-                fkth = fv[k - 1];
+            int pos = k - 1;
+            while (pos > 0 && val > fv[pos - 1]) {
+                pos--;
             }
+
+            for (int j = k - 1; j > pos; j--) {
+                fv[j] = fv[j - 1];
+                fi[j] = fi[j - 1];
+            }
+            fv[pos] = val;
+            fi[pos] = idx;
+
+            fkth = fv[k - 1];
         }
     }
 

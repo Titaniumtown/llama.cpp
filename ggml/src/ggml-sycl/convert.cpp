@@ -199,26 +199,15 @@ static void dequantize_row_q4_1_sycl(const void *vx, dst_t *y, const int64_t k,
 }
 
 
-// Shape of the q4_K -> f16 dequant kernel, which prefill runs over every q4_K weight before
-// handing it to the GEMM. There is deliberately no default in the template signatures: the
-// shape is decided here and nowhere else.
-//
-//   GGML_SYCL_Q4K_DEQ_N=2|4|8 qs bytes per thread; the work-group is 4*(32/n) threads.
-//                             2 (64 threads) measured 509 GB/s against 270 for the historical
-//                             4 (32 threads) and 192 for 8 (16 threads): a streaming kernel
-//                             this small is limited by how many loads are in flight, and
-//                             halving the bytes per thread doubles the threads that issue them.
-//   GGML_SYCL_Q4K_DEQ_SLM=0   read the 12 scale bytes from global rather than staging them
-//                             through SLM behind a work-group barrier. Measured WORSE at every
-//                             n (270 -> 216 at n=4), so the staging stays: it coalesces 12
-//                             loads once instead of letting every thread issue 6 scattered
-//                             byte loads of its own.
-static inline int q4k_deq_n() {
+// Work-group width for the wide K-quant dequant kernels (q4_K/q5_K, both layouts).
+// 16 threads cover one 256-weight block; the launcher packs WG/16 blocks per group.
+// Swept standalone on the hot 5120x17408 shape (see dequantize.hpp): 64 -> 526 GB/s,
+// 128 -> 896, 256 -> 1124, 512 -> 1133. 256 is the default; 512 is within noise of it
+// but halves the group count, which matters for the small tail shapes.
+static inline int deqk_wg() {
     static const int v = [] {
-        // 0050 measured 2 as best with scalar stores; with the wide stores in
-        // dequantize_q4_K_common the ordering inverts and 4 wins. Still tunable.
-        const int n = ggml_sycl_get_env("GGML_SYCL_Q4K_DEQ_N", 4);
-        return (n == 2 || n == 4 || n == 8) ? n : 2;
+        const int w = ggml_sycl_get_env("GGML_SYCL_DEQK_WG", 256);
+        return (w >= 16 && w <= 1024 && w % 16 == 0) ? w : 256;
     }();
     return v;
 }
@@ -233,54 +222,13 @@ static inline int q6k_deq_m() {
     return v;
 }
 
-static inline bool q4k_deq_slm() {
-    static const bool v = ggml_sycl_get_env("GGML_SYCL_Q4K_DEQ_SLM", 1) != 0;
-    return v;
-}
-
-template <int n, bool slm, typename dst_t>
-static void q4k_launch(const void * vx, dst_t * y, const int64_t nb, dpct::queue_ptr stream) {
-    constexpr size_t local_size = 4 * (32 / n);
-    stream->submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<uint8_t, 1> scale_local_acc(sycl::range<1>(slm ? 12 : 1), cgh);
-        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) * sycl::range<3>(1, 1, local_size),
-                                           sycl::range<3>(1, 1, local_size)),
-                         [=](sycl::nd_item<3> item_ct1) {
-                             dequantize_block_q4_K<dst_t, n, slm>(vx, y, get_pointer(scale_local_acc), item_ct1);
-                         });
-    });
-}
-
-template <int n, bool slm, typename dst_t>
-static void q4k_launch_reorder(const void * vx, dst_t * y, const int64_t nb, dpct::queue_ptr stream) {
-    constexpr size_t local_size = 4 * (32 / n);
-    stream->submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<uint8_t, 1> scale_local_acc(sycl::range<1>(slm ? 12 : 1), cgh);
-        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(nb * local_size), sycl::range<1>(local_size)),
-                         [=](sycl::nd_item<1> item_ct1) {
-                             dequantize_block_q4_K_reorder<dst_t, n, slm>(vx, y, get_pointer(scale_local_acc),
-                                                                          item_ct1, nb);
-                         });
-    });
-}
-
-#define GGML_SYCL_Q4K_DISPATCH(LAUNCH)                                   \
-    do {                                                                 \
-        const int  n_   = q4k_deq_n();                                   \
-        const bool slm_ = q4k_deq_slm();                                 \
-        if (slm_) {                                                      \
-            switch (n_) {                                                \
-                case 2:  LAUNCH<2, true>(vx, y, nb, stream);  break;      \
-                case 8:  LAUNCH<8, true>(vx, y, nb, stream);  break;      \
-                default: LAUNCH<4, true>(vx, y, nb, stream);  break;      \
-            }                                                            \
-        } else {                                                         \
-            switch (n_) {                                                \
-                case 2:  LAUNCH<2, false>(vx, y, nb, stream); break;      \
-                case 8:  LAUNCH<8, false>(vx, y, nb, stream); break;      \
-                default: LAUNCH<4, false>(vx, y, nb, stream); break;      \
-            }                                                            \
-        }                                                                \
+#define GGML_SYCL_LAUNCH_DEQK_WIDE(KERNEL)                                                        \
+    do {                                                                                          \
+        const int     wg     = deqk_wg();                                                         \
+        const int64_t groups = (nb * 16 + wg - 1) / wg;                                           \
+        stream->parallel_for(sycl::nd_range<1>(groups * wg, wg), [=](sycl::nd_item<1> it) {       \
+            KERNEL<dst_t>(vx, y, nb, it);                                                         \
+        });                                                                                       \
     } while (0)
 
 template <typename dst_t>
@@ -288,63 +236,29 @@ static void dequantize_row_q4_K_sycl(const void *vx, dst_t *y, const int64_t k,
                                      dpct::queue_ptr stream) {
     const int64_t nb = k / QK_K;
     dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
-    GGML_SYCL_Q4K_DISPATCH(q4k_launch);
+    GGML_SYCL_LAUNCH_DEQK_WIDE(dequantize_block_q4_K_wide);
 }
 
 template <typename dst_t>
 static void dequantize_row_q4_K_sycl_reorder(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
     const int64_t nb = k / QK_K;
     dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
-    GGML_SYCL_Q4K_DISPATCH(q4k_launch_reorder);
+    GGML_SYCL_LAUNCH_DEQK_WIDE(dequantize_block_q4_K_reorder_wide);
 }
 
 template <typename dst_t>
 static void dequantize_row_q5_K_sycl(const void *vx, dst_t *y, const int64_t k,
                                      dpct::queue_ptr stream) {
     const int64_t nb = k / QK_K;
-#if QK_K == 256
-    {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
-
-        stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
-                                                   sycl::range<3>(1, 1, 64),
-                                               sycl::range<3>(1, 1, 64)),
-                             [=](sycl::nd_item<3> item_ct1) {
-                                 dequantize_block_q5_K(vx, y, item_ct1);
-                             });
-    }
-#else
-    {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
-
-        stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
-                                                   sycl::range<3>(1, 1, 32),
-                                               sycl::range<3>(1, 1, 32)),
-                             [=](sycl::nd_item<3> item_ct1) {
-                                 dequantize_block_q5_K(vx, y, item_ct1);
-                             });
-    }
-
-#endif
+    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+    GGML_SYCL_LAUNCH_DEQK_WIDE(dequantize_block_q5_K_wide);
 }
 
 template <typename dst_t>
 static void dequantize_row_q5_K_sycl_reorder(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
     const int64_t nb = k / QK_K;
-
     dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
-
-    stream->submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<uint8_t, 1> scale_local_acc(sycl::range<1>(K_SCALE_SIZE), cgh);
-
-        cgh.parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, nb) * sycl::range<3>(1, 1, 64), sycl::range<3>(1, 1, 64)),
-            [=](sycl::nd_item<3> item_ct1) {
-                dequantize_block_q5_K_reorder(vx, y, get_pointer(scale_local_acc), item_ct1, nb);
-            });
-    });
+    GGML_SYCL_LAUNCH_DEQK_WIDE(dequantize_block_q5_K_reorder_wide);
 }
 
 template <typename dst_t>

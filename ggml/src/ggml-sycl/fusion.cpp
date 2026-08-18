@@ -1,6 +1,33 @@
 #include "fusion.hpp"
 
 #include <algorithm>
+static bool ggml_sycl_should_fuse_rope_set_rows(const ggml_tensor * rope,
+                                                const ggml_tensor * view,
+                                                const ggml_tensor * set_rows) {
+    if (rope->op != GGML_OP_ROPE || view->op != GGML_OP_VIEW || set_rows->op != GGML_OP_SET_ROWS) {
+        return false;
+    }
+    // ne3 is not handled by the fused write path
+    if (rope->src[0]->ne[3] != 1) {
+        return false;
+    }
+    if (set_rows->type != GGML_TYPE_F32 && set_rows->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (set_rows->src[1]->type != GGML_TYPE_I64) {
+        return false;
+    }
+    // the view must flatten two rope dims into one contiguous dim
+    if (!ggml_is_contiguous(view) || view->ne[0] != rope->ne[0] * rope->ne[1]) {
+        return false;
+    }
+    // only the norm/neox rope kernels carry the fused set_rows write
+    const int mode = ((const int32_t *) rope->op_params)[2];
+    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
+        return false;
+    }
+    return true;
+}
 
 // mul_mat(gate) + mul_mat(up) + GLU: graph shape and tensor properties only. Backend state
 // (weight layout, split buffers, DMMV) is checked by ggml_sycl_mul_mat_glu_mmvq_fused().
@@ -88,6 +115,17 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
         }
 
         return ggml_sycl_should_fuse_mul_mat_glu(gate, up, glu);
+    }
+
+    // rope + view + set_rows: the view feeds set_rows at node_idx + 2, so use the
+    // subgraph check (plain ggml_can_fuse only matches a linear chain)
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ROPE && ops.begin()[1] == GGML_OP_VIEW &&
+        ops.begin()[2] == GGML_OP_SET_ROWS) {
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
+            return false;
+        }
+        return ggml_sycl_should_fuse_rope_set_rows(cgraph->nodes[node_idx], cgraph->nodes[node_idx + 1],
+                                                   cgraph->nodes[node_idx + 2]);
     }
 
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {

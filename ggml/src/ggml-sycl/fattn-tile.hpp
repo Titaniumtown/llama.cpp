@@ -64,11 +64,15 @@ static constexpr uint32_t ggml_sycl_fattn_tile_get_config_fp16(const int DKQ, co
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  2,  64, 2,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 2,  64,  64)
     // ncols 6 and 12 exist so gqa_ratio 6 can be packed whole (see the ncols2 == 6 path
-    // in launch_fattn_tile_switch_ncols1). nthreads is 192 so nwarps divides ncols
-    // exactly -- 6 warps, cpw 1 for ncols 6 and cpw 2 for ncols 12 -- which is what the
-    // cpw/np static_asserts in flash_attn_tile require. Other fields mirror the
-    // neighbouring power-of-two rows.
-    GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  6, 384, 2,  64,  64)
+    // in launch_fattn_tile_switch_ncols1); nwarps/np divides ncols exactly either way,
+    // which is what the cpw/np static_asserts in flash_attn_tile require. Other fields
+    // mirror the neighbouring power-of-two rows.
+    //
+    // ncols 6 takes 192 threads, not 384: at 128 GRF (16 KB/thread) a 384-thread
+    // work-group pins 192 KB of the 512 KB register file, so only 2 stay resident --
+    // too few to cover the 16 barriers flash_attn_tile runs per KV chunk. 192 fits 5,
+    // worth +2.2% tg at d65536 even though np drops 2 -> 1 and per-thread work doubles.
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  6, 192, 2,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 12, 384, 2,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 24, 384, 2,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  8, 256, 2,  64,  64)

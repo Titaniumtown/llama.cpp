@@ -262,7 +262,15 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
                 }
             }
         } else {
-            if (Q->ne[1] <= 2) {
+            // Mirror the F16 branch above: when the GQA optimisation applies, TILE beats
+            // VEC by enough to pay for dequantising K/V to F16 first. Measured on B70,
+            // Qwen3.6-27B (gqa_ratio 6, head_dim 256), decode at depth 8192:
+            //   q8_0 -> VEC   641.9 us/call   (27.8 GB/s over the q8_0 cache)
+            //   f16  -> TILE  271.9 us/call  (123.4 GB/s over an f16 cache)
+            // Per KV token that is 78 ns via VEC against ~45 ns via TILE including the
+            // convert (2176 B read + 4096 B written at streaming rate), so the crossover
+            // does not depend on context length -- both terms are linear in n_kv.
+            if (Q->ne[1] <= 2 && !gqa_opt_applies) {
                 return BEST_FATTN_KERNEL_VEC;
             }
         }

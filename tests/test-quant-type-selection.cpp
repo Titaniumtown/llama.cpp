@@ -538,7 +538,7 @@ static bool build_override_fixture(override_test_fixture & fx, const llama_model
         return false;
     }
 
-    struct ggml_init_params ctx_params = { 2 * ggml_tensor_overhead(), nullptr, true };
+    struct ggml_init_params ctx_params = { 4 * ggml_tensor_overhead(), nullptr, true };
     fx.ctx.reset(ggml_init(ctx_params));
 
     // ne[0] = 256 so no block-size fallback interferes with k-quant overrides
@@ -592,6 +592,59 @@ static bool test_override_with_nonquant_target() {
     return all_pass;
 }
 
+// a COPY pass (--only-copy) converts nothing, except tensors explicitly named
+// by --tensor-type: that exemption is the only way to retype ONE tensor of a
+// GGUF whose other tensors are already quantized. the exemption must not
+// bypass the other safety checks (dims, norm tensors, ...).
+static bool test_override_with_only_copy() {
+    static const llama_model_tensor_override patterns[] = {
+        { "output\\.weight", GGML_TYPE_Q6_K },
+        { "attn_norm",       GGML_TYPE_Q8_0 }, // matches a norm tensor: must still be blocked
+        { nullptr,           GGML_TYPE_COUNT },
+    };
+
+    llama_model_quantize_params qparams = llama_model_quantize_default_params();
+    qparams.tt_overrides                = patterns;
+    qparams.only_copy                   = true;
+
+    override_test_fixture fx;
+    if (!build_override_fixture(fx, &qparams)) {
+        printf("  FAIL  could not build mock model\n");
+        return false;
+    }
+
+    // 1D norm tensor whose name matches the second override pattern
+    ggml_tensor * t_norm = ggml_new_tensor_1d(fx.ctx.get(), GGML_TYPE_F32, 256);
+    ggml_set_name(t_norm, "blk.0.attn_norm.weight");
+
+    bool all_pass = true;
+
+    if (!llama_quant_tensor_allows_quantization(fx.qs, fx.t_output)) {
+        printf("  FAIL  only_copy: overridden output.weight should be quantizable\n");
+        all_pass = false;
+    }
+    if (llama_quant_tensor_allows_quantization(fx.qs, fx.t_attn)) {
+        printf("  FAIL  only_copy: non-overridden blk.0.attn_q.weight should be copied\n");
+        all_pass = false;
+    }
+    if (llama_quant_tensor_allows_quantization(fx.qs, t_norm)) {
+        printf("  FAIL  only_copy: override must not bypass the 1D/norm checks\n");
+        all_pass = false;
+    }
+
+    // end to end through type selection: the overridden tensor gets its type
+    ggml_tensor * tensors[1]      = { fx.t_output };
+    ggml_type     result_types[1] = { GGML_TYPE_COUNT };
+    llama_quant_compute_types(fx.qs, LLAMA_FTYPE_ALL_F32, tensors, result_types, 1);
+    if (result_types[0] != GGML_TYPE_Q6_K) {
+        printf("  FAIL  only_copy: output.weight: expected q6_K override, got %s\n",
+               ggml_type_name(result_types[0]));
+        all_pass = false;
+    }
+
+    return all_pass;
+}
+
 static int run_override_tests() {
     printf("=== --tensor-type overrides (offline) ===\n");
 
@@ -599,6 +652,12 @@ static int run_override_tests() {
 
     if (test_override_with_nonquant_target()) {
         printf("  PASS  override honored with non-quantized target ftypes\n");
+    } else {
+        n_fail++;
+    }
+
+    if (test_override_with_only_copy()) {
+        printf("  PASS  only_copy exempts overridden tensors, safety checks intact\n");
     } else {
         n_fail++;
     }

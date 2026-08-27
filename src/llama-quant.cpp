@@ -286,12 +286,30 @@ static void llama_tensor_dequantize_impl(
 // do we allow this tensor to be quantized?
 //
 
-static bool tensor_allows_quantization(const llama_model_quantize_params * params, llm_arch arch, const ggml_tensor * tensor) {
-    // trivial checks first -- no string ops needed
-    if (params->only_copy)       return false;
+// is this tensor named explicitly by --tensor-type / --tensor-type-file?
+// uses the patterns quantize_state_impl compiled once at init
+static bool tensor_type_is_overridden(const quantize_state_impl & qs, const char * name) {
+    for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
+        if (std::regex_search(name, pattern)) {
+            return true;
+        }
+    }
+    return false;
+}
 
+static bool tensor_allows_quantization(const quantize_state_impl & qs, const ggml_tensor * tensor) {
+    const llama_model_quantize_params * params = qs.params;
+    const llm_arch arch = qs.model.arch;
+
+    // trivial check first -- no string ops needed
     // quantize only 2D and 3D tensors (experts)
     if (ggml_n_dims(tensor) < 2) return false;
+
+    // a COPY pass converts nothing, except tensors explicitly named by --tensor-type.
+    // exempting those is the only way to retype one tensor of a GGUF whose other
+    // tensors are already quantized: a full pass needs --allow-requantize, which
+    // requantizes them all (lossy-on-lossy). the name checks below still apply.
+    if (params->only_copy && !tensor_type_is_overridden(qs, ggml_get_name(tensor))) return false;
 
     const std::string name = ggml_get_name(tensor);
 
@@ -677,7 +695,7 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
 
 // outer wrapper: determine the ggml_type that this tensor should be quantized to
 static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_model_quantize_params * params, const ggml_tensor * tensor, ggml_type default_type, const tensor_metadata & tm) {
-    if (!tensor_allows_quantization(params, qs.model.arch, tensor)) {
+    if (!tensor_allows_quantization(qs, tensor)) {
         return tensor->type;
     }
     if (params->token_embedding_type < GGML_TYPE_COUNT && tm.category == tensor_category::TOKEN_EMBD) {
@@ -1052,7 +1070,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
         gguf_add_tensor(ctx_outs[i_split].get(), tensor);
 
-        metadata[i].allows_quantization = tensor_allows_quantization(params, model->arch, tensor);
+        metadata[i].allows_quantization = tensor_allows_quantization(qs, tensor);
 
         if (metadata[i].allows_quantization) {
             metadata[i].target_type = llama_tensor_get_type(qs, params, tensor, default_type, metadata[i]);
@@ -1392,7 +1410,7 @@ llama_model * llama_quant_model_from_metadata(const llama_quant_model_desc * des
 bool llama_quant_tensor_allows_quantization(
         const quantize_state_impl * qs,
         const ggml_tensor * tensor) {
-    return tensor_allows_quantization(qs->params, qs->model.arch, tensor);
+    return tensor_allows_quantization(*qs, tensor);
 }
 
 void llama_quant_compute_types(

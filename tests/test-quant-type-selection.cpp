@@ -497,6 +497,116 @@ static int run_remote_tests(const std::string & snapshot_dir, const char * argv0
     return total_fail > 0 ? 1 : 0;
 }
 
+// ---------------------------------------------------------------------------
+// Offline tests for --tensor-type overrides (no network needed)
+// ---------------------------------------------------------------------------
+
+struct override_test_fixture {
+    llama_model *         model = nullptr;
+    quantize_state_impl * qs    = nullptr;
+    ggml_context_ptr      ctx;
+    ggml_tensor *         t_output = nullptr; // matches the override pattern
+    ggml_tensor *         t_attn   = nullptr; // does not match
+
+    ~override_test_fixture() {
+        if (qs) {
+            llama_quant_free(qs);
+        }
+        if (model) {
+            llama_model_free(model);
+        }
+    }
+};
+
+static bool build_override_fixture(override_test_fixture & fx, const llama_model_quantize_params * qparams) {
+    llama_quant_model_desc desc = {};
+    desc.architecture           = "llama";
+    desc.n_embd                 = 256;
+    desc.n_ff                   = 512;
+    desc.n_layer                = 1;
+    desc.n_head                 = 4;
+    desc.n_head_kv              = 4;
+    desc.n_embd_head_k          = 64;
+    desc.n_embd_head_v          = 64;
+
+    fx.model = llama_quant_model_from_metadata(&desc);
+    if (!fx.model) {
+        return false;
+    }
+    fx.qs = llama_quant_init(fx.model, qparams);
+    if (!fx.qs) {
+        return false;
+    }
+
+    struct ggml_init_params ctx_params = { 2 * ggml_tensor_overhead(), nullptr, true };
+    fx.ctx.reset(ggml_init(ctx_params));
+
+    // ne[0] = 256 so no block-size fallback interferes with k-quant overrides
+    fx.t_output = ggml_new_tensor_2d(fx.ctx.get(), GGML_TYPE_F32, 256, 512);
+    ggml_set_name(fx.t_output, "output.weight");
+    fx.t_attn = ggml_new_tensor_2d(fx.ctx.get(), GGML_TYPE_F32, 256, 256);
+    ggml_set_name(fx.t_attn, "blk.0.attn_q.weight");
+
+    return true;
+}
+
+static const llama_model_tensor_override override_test_patterns[] = {
+    { "output\\.weight", GGML_TYPE_Q6_K },
+    { nullptr,           GGML_TYPE_COUNT },
+};
+
+// a --tensor-type override must be honored even when the target ftype is not
+// quantized (F32/F16/BF16): the override block used to sit inside an
+// `if (ggml_is_quantized(default_type))` branch that silently skipped it
+static bool test_override_with_nonquant_target() {
+    llama_model_quantize_params qparams = llama_model_quantize_default_params();
+    qparams.tt_overrides                = override_test_patterns;
+
+    override_test_fixture fx;
+    if (!build_override_fixture(fx, &qparams)) {
+        printf("  FAIL  could not build mock model\n");
+        return false;
+    }
+
+    bool all_pass = true;
+
+    const llama_ftype ftypes[] = { LLAMA_FTYPE_ALL_F32, LLAMA_FTYPE_MOSTLY_F16 };
+    for (llama_ftype ft : ftypes) {
+        ggml_tensor * tensors[2]      = { fx.t_output, fx.t_attn };
+        ggml_type     result_types[2] = { GGML_TYPE_COUNT, GGML_TYPE_COUNT };
+        llama_quant_compute_types(fx.qs, ft, tensors, result_types, 2);
+
+        const ggml_type default_type = llama_ftype_get_default_type(ft);
+        if (result_types[0] != GGML_TYPE_Q6_K) {
+            printf("  FAIL  [%s] output.weight: expected q6_K override, got %s\n",
+                   llama_ftype_to_name(ft), ggml_type_name(result_types[0]));
+            all_pass = false;
+        }
+        if (result_types[1] != default_type) {
+            printf("  FAIL  [%s] blk.0.attn_q.weight: expected default %s, got %s\n",
+                   llama_ftype_to_name(ft), ggml_type_name(default_type), ggml_type_name(result_types[1]));
+            all_pass = false;
+        }
+    }
+
+    return all_pass;
+}
+
+static int run_override_tests() {
+    printf("=== --tensor-type overrides (offline) ===\n");
+
+    int n_fail = 0;
+
+    if (test_override_with_nonquant_target()) {
+        printf("  PASS  override honored with non-quantized target ftypes\n");
+    } else {
+        n_fail++;
+    }
+
+    printf("\n");
+    return n_fail > 0 ? 1 : 0;
+}
+
 int main(int argc, char ** argv) {
     std::string snapshot_dir = SNAPSHOT_DIR;
     bool        generate     = false;
@@ -516,5 +626,8 @@ int main(int argc, char ** argv) {
     // suppress llama log warnings during test (e.g. tensor type fallback messages)
     llama_log_set([](enum ggml_log_level, const char *, void *) {}, nullptr);
 
-    return run_remote_tests(snapshot_dir, argv[0]);
+    const int rc_override = run_override_tests();
+    const int rc_remote   = run_remote_tests(snapshot_dir, argv[0]);
+
+    return rc_override || rc_remote ? 1 : 0;
 }

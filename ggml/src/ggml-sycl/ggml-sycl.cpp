@@ -4229,32 +4229,14 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
 }
 
 enum class mul_mat_algo {
-    DMMV         = 0,
-    MMVQ         = 1,
-    MUL_MAT_SYCL = 2,
+    DMMV = 0,
+    MMVQ = 1,
 };
 
 inline bool ggml_sycl_supports_mmq(enum ggml_type type) {
     // TODO: accuracy issues in MMQ
     GGML_UNUSED(type);
     return false;
-}
-
-inline bool ggml_sycl_supports_reorder_mul_mat_sycl(enum ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_Q1_0:
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q8_0:
-            return true;
-        case GGML_TYPE_Q2_K:
-        case GGML_TYPE_Q3_K:
-        case GGML_TYPE_Q4_K:
-        case GGML_TYPE_Q5_K:
-        case GGML_TYPE_Q6_K:
-            return !g_ggml_sycl_prioritize_dmmv;
-        default:
-            return false;
-    }
 }
 
 inline bool ggml_sycl_supports_reorder_dmmv(enum ggml_type type) {
@@ -5113,11 +5095,6 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
             break;
         case mul_mat_algo::MMVQ:
             if (!ggml_sycl_supports_reorder_mmvq(src0->type)) {
-                return;
-            }
-            break;
-        case mul_mat_algo::MUL_MAT_SYCL:
-            if (!ggml_sycl_supports_reorder_mul_mat_sycl(src0->type)) {
                 return;
             }
             break;

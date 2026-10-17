@@ -1897,6 +1897,137 @@ static void mul_mat_vec_iq4_xs_q8_1_sycl_switch_ncols(
     }
 }
 
+// Per-type dispatch table for the dense MMVQ path. Launcher types are identical
+// for every quant; only the kernel/vec_dot instantiation differs.
+struct mmvq_ops {
+    void (*single)(const void *, const void *, float *, const int, const int, dpct::queue_ptr);
+    void (*switch_ncols)(const void *, const void *, float *, const int, const int, const int,
+                         const int, const int, dpct::queue_ptr);
+    void (*reorder_single)(const void *, const void *, float *, const int, const int, dpct::queue_ptr);
+    void (*reorder_switch_ncols)(const void *, const void *, float *, const int, const int, const int,
+                                 const int, const int, dpct::queue_ptr);
+};
+
+template <ggml_type t> const mmvq_ops & mmvq_ops_for();
+template <> const mmvq_ops & mmvq_ops_for<GGML_TYPE_Q4_0>() {
+    static constexpr mmvq_ops ops = { mul_mat_vec_q4_0_q8_1_sycl, mul_mat_vec_q4_0_q8_1_sycl_switch_ncols, reorder_mul_mat_vec_q4_0_q8_1_sycl, reorder_mul_mat_vec_q4_0_q8_1_sycl_switch_ncols };
+    return ops;
+}
+
+template <> const mmvq_ops & mmvq_ops_for<GGML_TYPE_Q4_1>() {
+    static constexpr mmvq_ops ops = { mul_mat_vec_q4_1_q8_1_sycl, mul_mat_vec_q4_1_q8_1_sycl_switch_ncols, nullptr, nullptr };
+    return ops;
+}
+
+template <> const mmvq_ops & mmvq_ops_for<GGML_TYPE_Q5_0>() {
+    static constexpr mmvq_ops ops = { mul_mat_vec_q5_0_q8_1_sycl, mul_mat_vec_q5_0_q8_1_sycl_switch_ncols, nullptr, nullptr };
+    return ops;
+}
+
+template <> const mmvq_ops & mmvq_ops_for<GGML_TYPE_Q5_1>() {
+    static constexpr mmvq_ops ops = { mul_mat_vec_q5_1_q8_1_sycl, mul_mat_vec_q5_1_q8_1_sycl_switch_ncols, nullptr, nullptr };
+    return ops;
+}
+
+template <> const mmvq_ops & mmvq_ops_for<GGML_TYPE_Q8_0>() {
+    static constexpr mmvq_ops ops = { mul_mat_vec_q8_0_q8_1_sycl, mul_mat_vec_q8_0_q8_1_sycl_switch_ncols, reorder_mul_mat_vec_q8_0_q8_1_sycl, reorder_mul_mat_vec_q8_0_q8_1_sycl_switch_ncols };
+    return ops;
+}
+
+template <> const mmvq_ops & mmvq_ops_for<GGML_TYPE_Q1_0>() {
+    static constexpr mmvq_ops ops = { mul_mat_vec_q1_0_q8_1_sycl, mul_mat_vec_q1_0_q8_1_sycl_switch_ncols, nullptr, nullptr };
+    return ops;
+}
+
+template <> const mmvq_ops & mmvq_ops_for<GGML_TYPE_Q2_0>() {
+    static constexpr mmvq_ops ops = { mul_mat_vec_q2_0_q8_1_sycl, mul_mat_vec_q2_0_q8_1_sycl_switch_ncols, nullptr, nullptr };
+    return ops;
+}
+
+template <> const mmvq_ops & mmvq_ops_for<GGML_TYPE_Q2_K>() {
+    static constexpr mmvq_ops ops = { mul_mat_vec_q2_K_q8_1_sycl, mul_mat_vec_q2_K_q8_1_sycl_switch_ncols, reorder_mul_mat_vec_q2_k_q8_1_sycl, reorder_mul_mat_vec_q2_k_q8_1_sycl_switch_ncols };
+    return ops;
+}
+
+template <> const mmvq_ops & mmvq_ops_for<GGML_TYPE_Q3_K>() {
+    static constexpr mmvq_ops ops = { mul_mat_vec_q3_K_q8_1_sycl, mul_mat_vec_q3_K_q8_1_sycl_switch_ncols, reorder_mul_mat_vec_q3_k_q8_1_sycl, reorder_mul_mat_vec_q3_k_q8_1_sycl_switch_ncols };
+    return ops;
+}
+
+template <> const mmvq_ops & mmvq_ops_for<GGML_TYPE_Q4_K>() {
+    static constexpr mmvq_ops ops = { mul_mat_vec_q4_K_q8_1_sycl, mul_mat_vec_q4_K_q8_1_sycl_switch_ncols, reorder_mul_mat_vec_q4_k_q8_1_sycl, reorder_mul_mat_vec_q4_k_q8_1_sycl_switch_ncols };
+    return ops;
+}
+
+template <> const mmvq_ops & mmvq_ops_for<GGML_TYPE_Q5_K>() {
+    static constexpr mmvq_ops ops = { mul_mat_vec_q5_K_q8_1_sycl, mul_mat_vec_q5_K_q8_1_sycl_switch_ncols, reorder_mul_mat_vec_q5_k_q8_1_sycl, reorder_mul_mat_vec_q5_k_q8_1_sycl_switch_ncols };
+    return ops;
+}
+
+template <> const mmvq_ops & mmvq_ops_for<GGML_TYPE_Q6_K>() {
+    static constexpr mmvq_ops ops = { mul_mat_vec_q6_K_q8_1_sycl, mul_mat_vec_q6_K_q8_1_sycl_switch_ncols, reorder_mul_mat_vec_q6_k_q8_1_sycl, reorder_mul_mat_vec_q6_k_q8_1_sycl_switch_ncols };
+    return ops;
+}
+
+template <> const mmvq_ops & mmvq_ops_for<GGML_TYPE_IQ1_S>() {
+    static constexpr mmvq_ops ops = { mul_mat_vec_iq1_s_q8_1_sycl, nullptr, nullptr, nullptr };
+    return ops;
+}
+
+template <> const mmvq_ops & mmvq_ops_for<GGML_TYPE_IQ1_M>() {
+    static constexpr mmvq_ops ops = { mul_mat_vec_iq1_m_q8_1_sycl, nullptr, nullptr, nullptr };
+    return ops;
+}
+
+template <> const mmvq_ops & mmvq_ops_for<GGML_TYPE_IQ2_XXS>() {
+    static constexpr mmvq_ops ops = { mul_mat_vec_iq2_xxs_q8_1_sycl, nullptr, nullptr, nullptr };
+    return ops;
+}
+
+template <> const mmvq_ops & mmvq_ops_for<GGML_TYPE_IQ2_XS>() {
+    static constexpr mmvq_ops ops = { mul_mat_vec_iq2_xs_q8_1_sycl, nullptr, nullptr, nullptr };
+    return ops;
+}
+
+template <> const mmvq_ops & mmvq_ops_for<GGML_TYPE_IQ2_S>() {
+    static constexpr mmvq_ops ops = { mul_mat_vec_iq2_s_q8_1_sycl, nullptr, nullptr, nullptr };
+    return ops;
+}
+
+template <> const mmvq_ops & mmvq_ops_for<GGML_TYPE_IQ3_XXS>() {
+    static constexpr mmvq_ops ops = { mul_mat_vec_iq3_xxs_q8_1_sycl, nullptr,
+                                      reorder_mul_mat_vec_iq3_q8_1_sycl<GGML_TYPE_IQ3_XXS>,
+                                      reorder_mul_mat_vec_iq3_q8_1_sycl_switch_ncols<GGML_TYPE_IQ3_XXS> };
+    return ops;
+}
+
+template <> const mmvq_ops & mmvq_ops_for<GGML_TYPE_IQ3_S>() {
+    static constexpr mmvq_ops ops = { mul_mat_vec_iq3_s_q8_1_sycl, mul_mat_vec_iq3_s_q8_1_sycl_switch_ncols,
+                                      reorder_mul_mat_vec_iq3_q8_1_sycl<GGML_TYPE_IQ3_S>,
+                                      reorder_mul_mat_vec_iq3_q8_1_sycl_switch_ncols<GGML_TYPE_IQ3_S> };
+    return ops;
+}
+
+template <> const mmvq_ops & mmvq_ops_for<GGML_TYPE_IQ4_NL>() {
+    static constexpr mmvq_ops ops = { mul_mat_vec_iq4_nl_q8_1_sycl, nullptr, nullptr, nullptr };
+    return ops;
+}
+
+template <> const mmvq_ops & mmvq_ops_for<GGML_TYPE_IQ4_XS>() {
+    static constexpr mmvq_ops ops = { mul_mat_vec_iq4_xs_q8_1_sycl, mul_mat_vec_iq4_xs_q8_1_sycl_switch_ncols, nullptr, nullptr };
+    return ops;
+}
+
+template <> const mmvq_ops & mmvq_ops_for<GGML_TYPE_MXFP4>() {
+    static constexpr mmvq_ops ops = { mul_mat_vec_mxfp4_q8_1_sycl, mul_mat_vec_mxfp4_q8_1_sycl_switch_ncols, reorder_mul_mat_vec_mxfp4_q8_1_sycl, reorder_mul_mat_vec_mxfp4_q8_1_sycl_switch_ncols };
+    return ops;
+}
+
+template <> const mmvq_ops & mmvq_ops_for<GGML_TYPE_NVFP4>() {
+    static constexpr mmvq_ops ops = { mul_mat_vec_nvfp4_q8_1_sycl, mul_mat_vec_nvfp4_q8_1_sycl_switch_ncols, nullptr, nullptr };
+    return ops;
+}
+
 void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                                 ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
                                 const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low,
@@ -1919,393 +2050,60 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
         const size_t src1_ddq_i_offset = i * src1_padded_col_size * q8_1_ts / q8_1_bs;
         const char * src1_ddq_i_bs     = src1_ddq_i + src1_ddq_i_offset;
         float *      dst_dd_i_bs       = dst_dd_i + i * dst->ne[0];
+        const mmvq_ops * ops = nullptr;
         switch (src0->type) {
-            case GGML_TYPE_Q4_0:
-                if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
-                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
-                    if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                        const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
-                        const int stride_col_dst     = dst->ne[0];
-                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_0_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                        reorder_mul_mat_vec_q4_0_q8_1_sycl_switch_ncols(
-                            src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                            src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
-                        return;
-                    } else {
-                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_0_q8_1_sycl\n");
-                        reorder_mul_mat_vec_q4_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                    }
-                } else if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                    const int stride_col_y   = src1_padded_col_size / QK8_1;
-                    const int stride_col_dst = dst->ne[0];
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q4_0_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                    mul_mat_vec_q4_0_q8_1_sycl_switch_ncols(
-                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                        src1_ncols, stride_col_y, stride_col_dst, stream);
-                    return;
-                } else if (i == 0 || src1_ncols == 1) {
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q4_0_q8_1_sycl\n");
-                    mul_mat_vec_q4_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                }
-                break;
-            case GGML_TYPE_Q4_1:
-                if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                    const int stride_col_y   = src1_padded_col_size / QK8_1;
-                    const int stride_col_dst = dst->ne[0];
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q4_1_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                    mul_mat_vec_q4_1_q8_1_sycl_switch_ncols(
-                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                        src1_ncols, stride_col_y, stride_col_dst, stream);
-                    return;
-                } else if (i == 0 || src1_ncols == 1) {
-                    mul_mat_vec_q4_1_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                }
-                break;
-            case GGML_TYPE_Q5_0:
-                if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                    const int stride_col_y   = src1_padded_col_size / QK8_1;
-                    const int stride_col_dst = dst->ne[0];
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q5_0_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                    mul_mat_vec_q5_0_q8_1_sycl_switch_ncols(
-                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                        src1_ncols, stride_col_y, stride_col_dst, stream);
-                    return;
-                } else if (i == 0 || src1_ncols == 1) {
-                    mul_mat_vec_q5_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                }
-                break;
-            case GGML_TYPE_Q5_1:
-                if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                    const int stride_col_y   = src1_padded_col_size / QK8_1;
-                    const int stride_col_dst = dst->ne[0];
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q5_1_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                    mul_mat_vec_q5_1_q8_1_sycl_switch_ncols(
-                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                        src1_ncols, stride_col_y, stride_col_dst, stream);
-                    return;
-                } else if (i == 0 || src1_ncols == 1) {
-                    mul_mat_vec_q5_1_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                }
-                break;
-            case GGML_TYPE_Q8_0:
-                if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
-                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
-                    if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                        const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
-                        const int stride_col_dst     = dst->ne[0];
-                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q8_0_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                        reorder_mul_mat_vec_q8_0_q8_1_sycl_switch_ncols(
-                            src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                            src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
-                        return;
-                    } else {
-                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q8_0_q8_1_sycl\n");
-                        reorder_mul_mat_vec_q8_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                    }
-                } else if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                    const int stride_col_y   = src1_padded_col_size / QK8_1;
-                    const int stride_col_dst = dst->ne[0];
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q8_0_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                    mul_mat_vec_q8_0_q8_1_sycl_switch_ncols(
-                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                        src1_ncols, stride_col_y, stride_col_dst, stream);
-                    return;
-                } else if (i == 0 || src1_ncols == 1) {
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q8_0_q8_1_sycl\n");
-                    mul_mat_vec_q8_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                }
-                break;
-            case GGML_TYPE_Q1_0:
-                if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                    const int stride_col_y   = src1_padded_col_size / QK8_1;
-                    const int stride_col_dst = dst->ne[0];
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q1_0_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                    mul_mat_vec_q1_0_q8_1_sycl_switch_ncols(
-                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                        src1_ncols, stride_col_y, stride_col_dst, stream);
-                    return;
-                } else if (i == 0 || src1_ncols == 1) {
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q1_0_q8_1_sycl\n");
-                    mul_mat_vec_q1_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                }
-                break;
-            case GGML_TYPE_Q2_0:
-                if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                    const int stride_col_y   = src1_padded_col_size / QK8_1;
-                    const int stride_col_dst = dst->ne[0];
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q2_0_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                    mul_mat_vec_q2_0_q8_1_sycl_switch_ncols(
-                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                        src1_ncols, stride_col_y, stride_col_dst, stream);
-                    return;
-                } else if (i == 0 || src1_ncols == 1) {
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q2_0_q8_1_sycl\n");
-                    mul_mat_vec_q2_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                }
-                break;
-            case GGML_TYPE_Q2_K:
-                if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
-                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
-                    if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                        const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
-                        const int stride_col_dst     = dst->ne[0];
-                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q2_k_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                        reorder_mul_mat_vec_q2_k_q8_1_sycl_switch_ncols(
-                            src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                            src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
-                        return;
-                    } else {
-                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q2_k_q8_1_sycl\n");
-                        reorder_mul_mat_vec_q2_k_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                    }
-                } else if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                    const int stride_col_y   = src1_padded_col_size / QK8_1;
-                    const int stride_col_dst = dst->ne[0];
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q2_K_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                    mul_mat_vec_q2_K_q8_1_sycl_switch_ncols(
-                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                        src1_ncols, stride_col_y, stride_col_dst, stream);
-                    return;
-                } else if (i == 0 || src1_ncols == 1) {
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q2_K_q8_1_sycl\n");
-                    mul_mat_vec_q2_K_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                }
-                break;
-            case GGML_TYPE_Q3_K:
-                if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
-                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
-                    if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                        const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
-                        const int stride_col_dst     = dst->ne[0];
-                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q3_k_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                        reorder_mul_mat_vec_q3_k_q8_1_sycl_switch_ncols(
-                            src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                            src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
-                        return;
-                    } else {
-                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q3_k_q8_1_sycl\n");
-                        reorder_mul_mat_vec_q3_k_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                    }
-                } else if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                    const int stride_col_y   = src1_padded_col_size / QK8_1;
-                    const int stride_col_dst = dst->ne[0];
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q3_K_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                    mul_mat_vec_q3_K_q8_1_sycl_switch_ncols(
-                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                        src1_ncols, stride_col_y, stride_col_dst, stream);
-                    return;
-                } else if (i == 0 || src1_ncols == 1) {
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q3_K_q8_1_sycl\n");
-                    mul_mat_vec_q3_K_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                }
-                break;
-            case GGML_TYPE_Q4_K:
-                if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
-                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
-                    if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                        const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
-                        const int stride_col_dst     = dst->ne[0];
-                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_k_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                        reorder_mul_mat_vec_q4_k_q8_1_sycl_switch_ncols(
-                            src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                            src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
-                        return;
-                    } else {
-                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_k_q8_1_sycl\n");
-                        reorder_mul_mat_vec_q4_k_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                    }
-                } else if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                    const int stride_col_y   = src1_padded_col_size / QK8_1;
-                    const int stride_col_dst = dst->ne[0];
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q4_K_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                    mul_mat_vec_q4_K_q8_1_sycl_switch_ncols(
-                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                        src1_ncols, stride_col_y, stride_col_dst, stream);
-                    return;
-                } else if (i == 0 || src1_ncols == 1) {
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q4_K_q8_1_sycl\n");
-                    mul_mat_vec_q4_K_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                }
-                break;
-            case GGML_TYPE_Q5_K:
-                if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
-                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
-                    if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                        const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
-                        const int stride_col_dst     = dst->ne[0];
-                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q5_k_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                        reorder_mul_mat_vec_q5_k_q8_1_sycl_switch_ncols(
-                            src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                            src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
-                        return;
-                    } else {
-                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q5_k_q8_1_sycl\n");
-                        reorder_mul_mat_vec_q5_k_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                    }
-                } else if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                    const int stride_col_y   = src1_padded_col_size / QK8_1;
-                    const int stride_col_dst = dst->ne[0];
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q5_K_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                    mul_mat_vec_q5_K_q8_1_sycl_switch_ncols(
-                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                        src1_ncols, stride_col_y, stride_col_dst, stream);
-                    return;
-                } else if (i == 0 || src1_ncols == 1) {
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q5_K_q8_1_sycl\n");
-                    mul_mat_vec_q5_K_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                }
-                break;
-            case GGML_TYPE_Q6_K:
-                if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
-                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
-                    if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                        const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
-                        const int stride_col_dst     = dst->ne[0];
-                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q6_k_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                        reorder_mul_mat_vec_q6_k_q8_1_sycl_switch_ncols(
-                            src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                            src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
-                        return;
-                    } else {
-                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q6_k_q8_1_sycl\n");
-                        reorder_mul_mat_vec_q6_k_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                    }
-                } else if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                    const int stride_col_y   = src1_padded_col_size / QK8_1;
-                    const int stride_col_dst = dst->ne[0];
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q6_K_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                    mul_mat_vec_q6_K_q8_1_sycl_switch_ncols(
-                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                        src1_ncols, stride_col_y, stride_col_dst, stream);
-                    return;
-                } else if (i == 0 || src1_ncols == 1) {
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q6_k_q8_1_sycl\n");
-                    mul_mat_vec_q6_K_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                }
-                break;
-            case GGML_TYPE_IQ1_S:
-                mul_mat_vec_iq1_s_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                break;
-            case GGML_TYPE_IQ1_M:
-                mul_mat_vec_iq1_m_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                break;
-            case GGML_TYPE_IQ2_XXS:
-                mul_mat_vec_iq2_xxs_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                break;
-            case GGML_TYPE_IQ2_XS:
-                mul_mat_vec_iq2_xs_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                break;
-            case GGML_TYPE_IQ2_S:
-                mul_mat_vec_iq2_s_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                break;
-            case GGML_TYPE_IQ3_XXS:
-                if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
-                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
-                    if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                        const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
-                        const int stride_col_dst     = dst->ne[0];
-                        GGML_SYCL_DEBUG("Calling reordered IQ3_XXS multi-col MMVQ ncols=%d\n", (int) src1_ncols);
-                        reorder_mul_mat_vec_iq3_q8_1_sycl_switch_ncols<GGML_TYPE_IQ3_XXS>(
-                            src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                            src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
-                        return;
-                    } else {
-                        GGML_SYCL_DEBUG("Calling reordered IQ3_XXS MMVQ\n");
-                        reorder_mul_mat_vec_iq3_q8_1_sycl<GGML_TYPE_IQ3_XXS>(
-                            src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                    }
-                } else {
-                    mul_mat_vec_iq3_xxs_q8_1_sycl(
-                        src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                }
-                break;
-            case GGML_TYPE_IQ3_S:
-                if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
-                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
-                    if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                        const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
-                        const int stride_col_dst     = dst->ne[0];
-                        GGML_SYCL_DEBUG("Calling reordered IQ3_S multi-col MMVQ ncols=%d\n", (int) src1_ncols);
-                        reorder_mul_mat_vec_iq3_q8_1_sycl_switch_ncols<GGML_TYPE_IQ3_S>(
-                            src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                            src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
-                        return;
-                    } else {
-                        GGML_SYCL_DEBUG("Calling reordered IQ3_S MMVQ\n");
-                        reorder_mul_mat_vec_iq3_q8_1_sycl<GGML_TYPE_IQ3_S>(
-                            src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                    }
-                } else if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                    const int stride_col_y   = src1_padded_col_size / QK8_1;
-                    const int stride_col_dst = dst->ne[0];
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_iq3_s_q8_1_sycl_switch_ncols ncols=%d\n", (int) src1_ncols);
-                    mul_mat_vec_iq3_s_q8_1_sycl_switch_ncols(
-                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                        src1_ncols, stride_col_y, stride_col_dst, stream);
-                    return;
-                } else if (i == 0 || src1_ncols == 1) {
-                    mul_mat_vec_iq3_s_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                }
-                break;
-            case GGML_TYPE_IQ4_NL:
-                mul_mat_vec_iq4_nl_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                break;
-            case GGML_TYPE_IQ4_XS:
-                if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                    const int stride_col_y   = src1_padded_col_size / QK8_1;
-                    const int stride_col_dst = dst->ne[0];
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_iq4_xs_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                    mul_mat_vec_iq4_xs_q8_1_sycl_switch_ncols(
-                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                        src1_ncols, stride_col_y, stride_col_dst, stream);
-                    return;
-                } else if (i == 0 || src1_ncols == 1) {
-                    mul_mat_vec_iq4_xs_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                }
-                break;
-            case GGML_TYPE_MXFP4:
-                if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
-                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
-                    if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                        const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
-                        const int stride_col_dst     = dst->ne[0];
-                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_mxfp4_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                        reorder_mul_mat_vec_mxfp4_q8_1_sycl_switch_ncols(
-                            src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                            src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
-                        return;
-                    } else {
-                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_mxfp4_q8_1_sycl\n");
-                        reorder_mul_mat_vec_mxfp4_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                    }
-                } else if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                    const int stride_col_y   = src1_padded_col_size / QK8_1;
-                    const int stride_col_dst = dst->ne[0];
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_mxfp4_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                    mul_mat_vec_mxfp4_q8_1_sycl_switch_ncols(
-                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                        src1_ncols, stride_col_y, stride_col_dst, stream);
-                    return;
-                } else if (i == 0 || src1_ncols == 1) {
-                    mul_mat_vec_mxfp4_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                }
-                break;
-            case GGML_TYPE_NVFP4:
-                if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                    const int stride_col_y   = src1_padded_col_size / QK8_1;
-                    const int stride_col_dst = dst->ne[0];
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_nvfp4_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                    mul_mat_vec_nvfp4_q8_1_sycl_switch_ncols(
-                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                        src1_ncols, stride_col_y, stride_col_dst, stream);
-                    return;
-                } else if (i == 0 || src1_ncols == 1) {
-                    mul_mat_vec_nvfp4_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                }
-                break;
-            default:
-                GGML_ABORT("fatal error: unsupport src0 data type %s\n", ggml_type_name(src0->type));
+            case GGML_TYPE_Q4_0: ops = &mmvq_ops_for<GGML_TYPE_Q4_0>(); break;
+            case GGML_TYPE_Q4_1: ops = &mmvq_ops_for<GGML_TYPE_Q4_1>(); break;
+            case GGML_TYPE_Q5_0: ops = &mmvq_ops_for<GGML_TYPE_Q5_0>(); break;
+            case GGML_TYPE_Q5_1: ops = &mmvq_ops_for<GGML_TYPE_Q5_1>(); break;
+            case GGML_TYPE_Q8_0: ops = &mmvq_ops_for<GGML_TYPE_Q8_0>(); break;
+            case GGML_TYPE_Q1_0: ops = &mmvq_ops_for<GGML_TYPE_Q1_0>(); break;
+            case GGML_TYPE_Q2_0: ops = &mmvq_ops_for<GGML_TYPE_Q2_0>(); break;
+            case GGML_TYPE_Q2_K: ops = &mmvq_ops_for<GGML_TYPE_Q2_K>(); break;
+            case GGML_TYPE_Q3_K: ops = &mmvq_ops_for<GGML_TYPE_Q3_K>(); break;
+            case GGML_TYPE_Q4_K: ops = &mmvq_ops_for<GGML_TYPE_Q4_K>(); break;
+            case GGML_TYPE_Q5_K: ops = &mmvq_ops_for<GGML_TYPE_Q5_K>(); break;
+            case GGML_TYPE_Q6_K: ops = &mmvq_ops_for<GGML_TYPE_Q6_K>(); break;
+            case GGML_TYPE_IQ1_S: ops = &mmvq_ops_for<GGML_TYPE_IQ1_S>(); break;
+            case GGML_TYPE_IQ1_M: ops = &mmvq_ops_for<GGML_TYPE_IQ1_M>(); break;
+            case GGML_TYPE_IQ2_XXS: ops = &mmvq_ops_for<GGML_TYPE_IQ2_XXS>(); break;
+            case GGML_TYPE_IQ2_XS: ops = &mmvq_ops_for<GGML_TYPE_IQ2_XS>(); break;
+            case GGML_TYPE_IQ2_S: ops = &mmvq_ops_for<GGML_TYPE_IQ2_S>(); break;
+            case GGML_TYPE_IQ3_XXS: ops = &mmvq_ops_for<GGML_TYPE_IQ3_XXS>(); break;
+            case GGML_TYPE_IQ3_S: ops = &mmvq_ops_for<GGML_TYPE_IQ3_S>(); break;
+            case GGML_TYPE_IQ4_NL: ops = &mmvq_ops_for<GGML_TYPE_IQ4_NL>(); break;
+            case GGML_TYPE_IQ4_XS: ops = &mmvq_ops_for<GGML_TYPE_IQ4_XS>(); break;
+            case GGML_TYPE_MXFP4: ops = &mmvq_ops_for<GGML_TYPE_MXFP4>(); break;
+            case GGML_TYPE_NVFP4: ops = &mmvq_ops_for<GGML_TYPE_NVFP4>(); break;
+            default: GGML_ABORT("fatal error: unsupport src0 data type %s\n", ggml_type_name(src0->type));
         }
+
+        const bool reordered = ((ggml_tensor_extra_gpu *) dst->src[0]->extra) &&
+                               ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder;
+        if (reordered && ops->reorder_single) {
+            if (ops->reorder_switch_ncols && i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
+                const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
+                const int stride_col_dst     = dst->ne[0];
+                ops->reorder_switch_ncols(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
+                                          src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
+                return;
+            }
+            ops->reorder_single(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+        } else if (ops->switch_ncols) {
+            if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
+                const int stride_col_y   = src1_padded_col_size / QK8_1;
+                const int stride_col_dst = dst->ne[0];
+                ops->switch_ncols(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
+                                  src1_ncols, stride_col_y, stride_col_dst, stream);
+                return;
+            }
+            if (i == 0 || src1_ncols == 1) {
+                ops->single(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+            }
+        } else {
+            ops->single(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+        }
+
     }
     GGML_UNUSED(src1);
     GGML_UNUSED(dst);

@@ -1520,6 +1520,17 @@ void ggml_sycl_cpy_batch(ggml_backend_sycl_context & ctx, ggml_tensor ** nodes, 
                                 nb11, nb12, nb13, ctx.stream());
 }
 
+// Whether t holds a reordered copy of its own bytes. opt_for_reorder permutes a weight
+// in place and records that in the tensor extra, so a reordered tensor is a DIFFERENT
+// byte order of the same size, and every same-type copy below moves blocks without ever
+// looking at the layout -- correct only when both sides agree. A null extra means "not
+// reordered": a view never gets one (init_tensor returns early on view_src), and neither
+// does a type outside the reorder list.
+static bool cpy_reordered(const ggml_tensor * t) {
+    const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(t->extra);
+    return extra != nullptr && extra->optimized_feature.reorder;
+}
+
 void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1) try {
     // Unlike other operators ggml_sycl_cpy takes 2 distinct tensors instead of a dst ggml_tensor and rely on its src field
     GGML_SYCL_DEBUG("ggml_sycl_cpy: src0->type=%s, src1->type=%s\n",
@@ -1538,6 +1549,10 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, co
     char * src0_ddc = (char *) src0->data;
     char * src1_ddc = (char *) src1->data;
     if ((src0->type == src1->type) && (ggml_is_contiguous(src0) && ggml_is_contiguous(src1))) {
+        // Same-type contiguous is a raw byte move, so it carries a layout from src0 to
+        // src1 unchecked -- the case a CONT/DUP of a reordered weight lands in.
+        GGML_ASSERT(cpy_reordered(src0) == cpy_reordered(src1) &&
+                    "same-type contiguous copy between reordered and plain layouts");
         GGML_SYCL_DEBUG("%s: memcpy path\n", __func__);
         main_stream->memcpy(src1_ddc, src0_ddc, ggml_nbytes(src0));
     } else if (src0->type == GGML_TYPE_F32 && ggml_sycl_is_quantized_type(src1->type)) {
@@ -1645,12 +1660,18 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, co
         // Byte-level row copies are layout-agnostic only when both sides agree.
         GGML_ASSERT(ggml_sycl_kv_reorder_seg(src0) == ggml_sycl_kv_reorder_seg(src1) &&
                     "q8_0 copy between reordered and plain layouts");
+        // The KV registry above says nothing about a reordered q8_0 WEIGHT: the in-place
+        // weight permutation is a second, independent layout with its own bookkeeping.
+        GGML_ASSERT(cpy_reordered(src0) == cpy_reordered(src1) &&
+                    "q8_0 weight copy between reordered and plain layouts");
         ggml_cpy_q8_0_q8_0(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_Q5_0 && src1->type == GGML_TYPE_Q5_0) {
         ggml_cpy_q5_0_q5_0(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_Q5_1 && src1->type == GGML_TYPE_Q5_1) {
         ggml_cpy_q5_1_q5_1(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_Q4_0 && src1->type == GGML_TYPE_Q4_0) {
+        GGML_ASSERT(cpy_reordered(src0) == cpy_reordered(src1) &&
+                    "q4_0 copy between reordered and plain layouts");
         ggml_cpy_q4_0_q4_0(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_Q4_1 && src1->type == GGML_TYPE_Q4_1) {
         ggml_cpy_q4_1_q4_1(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
@@ -1663,14 +1684,24 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, co
     } else if (src0->type == GGML_TYPE_NVFP4 && src1->type == GGML_TYPE_NVFP4) {
         ggml_cpy_nvfp4_nvfp4(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_Q2_K && src1->type == GGML_TYPE_Q2_K) {
+        GGML_ASSERT(cpy_reordered(src0) == cpy_reordered(src1) &&
+                    "q2_K copy between reordered and plain layouts");
         ggml_cpy_q2_K_q2_K(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_Q3_K && src1->type == GGML_TYPE_Q3_K) {
+        GGML_ASSERT(cpy_reordered(src0) == cpy_reordered(src1) &&
+                    "q3_K copy between reordered and plain layouts");
         ggml_cpy_q3_K_q3_K(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_Q4_K && src1->type == GGML_TYPE_Q4_K) {
+        GGML_ASSERT(cpy_reordered(src0) == cpy_reordered(src1) &&
+                    "q4_K copy between reordered and plain layouts");
         ggml_cpy_q4_K_q4_K(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_Q5_K && src1->type == GGML_TYPE_Q5_K) {
+        GGML_ASSERT(cpy_reordered(src0) == cpy_reordered(src1) &&
+                    "q5_K copy between reordered and plain layouts");
         ggml_cpy_q5_K_q5_K(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_Q6_K && src1->type == GGML_TYPE_Q6_K) {
+        GGML_ASSERT(cpy_reordered(src0) == cpy_reordered(src1) &&
+                    "q6_K copy between reordered and plain layouts");
         ggml_cpy_q6_K_q6_K(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_IQ2_XXS && src1->type == GGML_TYPE_IQ2_XXS) {
         ggml_cpy_iq2_xxs_iq2_xxs(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
@@ -1685,10 +1716,16 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, co
     } else if (src0->type == GGML_TYPE_IQ1_M && src1->type == GGML_TYPE_IQ1_M) {
         ggml_cpy_iq1_m_iq1_m(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_IQ4_NL && src1->type == GGML_TYPE_IQ4_NL) {
+        GGML_ASSERT(cpy_reordered(src0) == cpy_reordered(src1) &&
+                    "iq4_nl copy between reordered and plain layouts");
         ggml_cpy_iq4_nl_iq4_nl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_IQ3_S && src1->type == GGML_TYPE_IQ3_S) {
+        GGML_ASSERT(cpy_reordered(src0) == cpy_reordered(src1) &&
+                    "iq3_s copy between reordered and plain layouts");
         ggml_cpy_iq3_s_iq3_s(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_IQ4_XS && src1->type == GGML_TYPE_IQ4_XS) {
+        GGML_ASSERT(cpy_reordered(src0) == cpy_reordered(src1) &&
+                    "iq4_xs copy between reordered and plain layouts");
         ggml_cpy_iq4_xs_iq4_xs(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
 #ifdef GGML_SYCL_HAS_BF16
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_BF16) {

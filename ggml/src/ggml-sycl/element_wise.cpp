@@ -115,7 +115,16 @@ static __dpct_inline__ T op_relu(T x) {
 
 template<typename T>
 static __dpct_inline__ T op_sigmoid(T x) {
-    return static_cast<T>(1.0f) / (static_cast<T>(1.0f) + op_exp(-x));
+    if constexpr (std::is_same_v<T, float>) {
+        return static_cast<T>(1.0f) / (static_cast<T>(1.0f) + op_exp(-x));
+    } else {
+        // ggml_vec_sigmoid_f32 converts to f32, evaluates and rounds once; evaluating in
+        // the element type rounds after negate, exp, add and divide. In bf16 that is four
+        // roundings and it missed the suite tolerance on its own. The float instantiation
+        // is unchanged, so the f32 path this model runs costs exactly what it did.
+        const float v = static_cast<float>(x);
+        return static_cast<T>(1.0f / (1.0f + op_exp(-v)));
+    }
 }
 
 template<typename T>
@@ -147,13 +156,14 @@ static __dpct_inline__ T op_cos(T x) {
 
 template<typename T>
 static __dpct_inline__ T op_hardsigmoid(T x) {
-    if constexpr (std::is_same_v<T, sycl::ext::oneapi::bfloat16>) {
-        return sycl::ext::oneapi::experimental::fmin(
-            static_cast<T>(1.0f), sycl::ext::oneapi::experimental::fmax(
-                                      static_cast<T>(0.0f), (x + static_cast<T>(3.0f)) / static_cast<T>(6.0f)));
-    } else {
+    if constexpr (std::is_same_v<T, float>) {
         return sycl::fmin(static_cast<T>(1.0f),
                           sycl::fmax(static_cast<T>(0.0f), (x + static_cast<T>(3.0f)) / static_cast<T>(6.0f)));
+    } else {
+        // Same f32-then-round-once rule as op_sigmoid: (x + 3) / 6 rounds twice in bf16
+        // and the CPU reference rounds once.
+        const float v = static_cast<float>(x);
+        return static_cast<T>(sycl::fmin(1.0f, sycl::fmax(0.0f, (v + 3.0f) / 6.0f)));
     }
 }
 

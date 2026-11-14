@@ -171,6 +171,7 @@ void ggml_sycl_op_lightning_indexer(ggml_backend_sycl_context & ctx, ggml_tensor
 
     // input rows must be contiguous
     GGML_ASSERT(nbq0 == ggml_type_size(q->type));
+    GGML_ASSERT(nbw0 == ggml_type_size(w->type));
     GGML_ASSERT(nbk0 == ggml_type_size(k->type));
     GGML_ASSERT(nbm0 == ggml_type_size(m->type));
     GGML_ASSERT(nb0  == ggml_type_size(dst->type));

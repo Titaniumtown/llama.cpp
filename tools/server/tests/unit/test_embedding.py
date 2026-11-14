@@ -329,6 +329,33 @@ def test_embedding_openai_library_base64():
         assert abs(x - y) < EPSILON
 
 
+def test_embedding_concurrent_prompts_are_not_split():
+    # a non-causal model has no memory, so a prompt must be processed in a
+    # single batch. two prompts that together exceed n_batch (128) are
+    # processed in separate batches, each still whole: the concurrent
+    # embeddings must match the ones computed alone
+    server.pooling = 'last'
+    server.start()
+    inputs = [
+        "I believe the meaning of life is " * 12,
+        "Write a joke about AI from a very long prompt " * 10,
+    ]
+
+    alone = []
+    for text in inputs:
+        res = server.make_request("POST", "/v1/embeddings", data={"input": text})
+        assert res.status_code == 200
+        assert 64 < res.body['usage']['prompt_tokens'] <= 128
+        alone.append(res.body['data'][0]['embedding'])
+
+    res = server.make_request("POST", "/v1/embeddings", data={"input": inputs})
+    assert res.status_code == 200
+    assert len(res.body['data']) == 2
+    for expected, d in zip(alone, res.body['data']):
+        for x, y in zip(expected, d['embedding']):
+            assert abs(x - y) < EPSILON
+
+
 @pytest.mark.parametrize(
     "data",
     [

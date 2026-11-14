@@ -3970,6 +3970,22 @@ private:
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
+            // the remaining batch capacity is shared equally between the pending prompts:
+            // a slot that fills the batch alone keeps every prompt after it in iteration order
+            // waiting until its own prompt is fully processed. slots launched since the last
+            // iteration are still SLOT_STATE_STARTED here and add their first tokens below
+            int32_t n_prompt_slots = 0;
+            for (const auto & slot : slots) {
+                if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+                    n_prompt_slots++;
+                }
+            }
+
+            // at least one token per slot, so that a batch smaller than the number of pending
+            // prompts still makes progress
+            const int32_t n_share = std::max(1, (n_batch - batch.size()) / std::max(1, n_prompt_slots));
+            int32_t n_leftover = 0;
+
             iterate(slots, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
@@ -4429,8 +4445,14 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
+                    // prompts that cannot be split are added whole (see the can_split() check above)
+                    const int32_t n_pending = slot.task->n_tokens() - slot.prompt.n_tokens();
+                    const int32_t n_quantum = std::min(n_share + n_leftover, n_pending);
+                    n_leftover = std::max(0, n_share + n_leftover - n_pending);
+                    const int32_t n_batch_slot = slot.can_split() ? n_tokens_prev + n_quantum : n_batch;
+
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch && batch.size() < n_batch_slot) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {

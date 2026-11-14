@@ -265,3 +265,61 @@ def test_draft_token_probs():
         assert abs(tok_draft["logprob"] - tok_no_draft["logprob"]) < 0.25
     # real logprobs are not all exactly 0.0 (prob 1.0)
     assert any(tok["logprob"] < -1e-4 for tok in probs_draft)
+
+def test_prompt_share_with_nearly_full_batch():
+    """A drafting slot can leave fewer free batch tokens than pending prompts.
+
+    n_batch == n_slots == 3 with slot A generating and drafting one token per
+    batch leaves one free token for the two prompts B and C that arrive next.
+    The per-prompt share is at least one token, so a prompt advances one token
+    per batch and both finish while A is still generating; an integer share of
+    1 / 2 = 0 would hold both prompts until A finishes.
+    """
+    global server
+    server.n_slots = 3
+    server.n_batch = 3
+    server.n_ubatch = 3
+    server.spec_draft_n_min = 1
+    server.spec_draft_n_max = 1
+    server.spec_draft_p_min = 0.0
+    server.server_slots = True
+    server.start()
+
+    def generate_a():
+        return server.make_request("POST", "/completion", data={
+            "prompt": "I believe the meaning of life is",
+            "n_predict": 512,
+            "ignore_eos": True,
+            "temperature": 0.0,
+        })
+
+    def prompt_while_a_generates(prompt: str):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompt,
+            "n_predict": 1,
+            "temperature": 0.0,
+        })
+        assert res.status_code == 200
+        assert res.body["timings"]["prompt_n"] > 8
+        # the number of slots still processing right after this prompt finished
+        slots = server.make_request("GET", "/slots").body
+        return sum(1 for s in slots if s["is_processing"])
+
+    def prompts_bc():
+        while True:
+            res = server.make_request("GET", "/slots")
+            if any(s["is_processing"] for s in res.body):
+                break
+        return parallel_function_calls([
+            (prompt_while_a_generates, ("Once upon a time there was a little girl named Lily who",)),
+            (prompt_while_a_generates, ("The quick brown fox jumps over the lazy dog and then",)),
+        ])
+
+    results = parallel_function_calls([
+        (generate_a, ()),
+        (prompts_bc, ()),
+    ])
+    assert results[0].status_code == 200
+    assert results[0].body["timings"]["draft_n"] > 0
+    # A was still generating when each of B and C finished
+    assert min(results[1]) >= 1

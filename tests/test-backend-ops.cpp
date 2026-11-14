@@ -12696,6 +12696,61 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // no additional coverage of the code that was wrong.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 5120, 33, 5120, {1, 1}, {1, 1}));
 
+    // Per-type differential coverage for the reordered mat-vec, in BOTH layouts, for
+    // every type ggml_backend_sycl_buffer_init_tensor hands a tensor_extra_gpu to
+    // (ggml-sycl.cpp:707-722). That switch is the authority for "is a reorder even
+    // possible for this type": it is q4_0, q8_0, q2_K, q3_K, q4_K, q5_K, q6_K, iq4_xs,
+    // iq4_nl, iq3_s, and every one of them is also in reorder_qw's switch and in
+    // ggml_sycl_supports_reorder_mmvq. IQ3_S is covered above; the
+    // other nine had no per-type case at a production row count or k, which is why a
+    // wrong-results claim about iq4_xs could be neither confirmed nor refuted from
+    // the suite.
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
+                            GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+                            GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL }) {
+        // A, reordered: 17408x5120 is the ffn_down production weight and the widest row
+        // count any of these kernels maps, so it is where a wrong nrows-to-subgroup or
+        // get_d_offset (per-tensor scale) shows up. n=1 keeps src1->ne[2]/ne[3] at 1,
+        // which is what should_reorder_tensor requires before it will touch the weight.
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 17408, 1,  5120, {1, 1}, {1, 1}));
+        // B, reordered: 5120x17408 is the other production geometry, at n=5 -- the width
+        // MTP verify decodes. can_use_dequantize_mul_mat_vec requires src1->ne[1] == 1,
+        // so any n>1 lands on MMVQ, and every ncols_dst is a separate instantiation per
+        // type. n=5 rather than a 2..8 sweep: one non-power-of-two width per type is
+        // the whole multi-column route, and 9 types x 7 widths is 63 more
+        // production-size weights for the same single point of failure.
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  5120, 5, 17408, {1, 1}, {1, 1}));
+        // C, NOT reordered: 5120x5120 at n=1 with bs = {2, 1}, which makes src1->ne[2]
+        // == 2 and should_reorder_tensor decline (ggml-sycl.cpp:5714). The weight is
+        // still a plain ggml_new_tensor_4d, so init_tensor still hands it an extra;
+        // opt_for_reorder is what declines, so the bytes stay AoS and the plain kernel
+        // is what runs. This is the only handle the public test API has on the
+        // non-reordered arm: the extra is attached at allocation and the flag is set
+        // at the first eligible MUL_MAT, so a bs={1,1} case already reads reordered
+        // bytes on its very first dispatch.
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  5120, 1,  5120, {2, 1}, {1, 1}));
+        // D, NOT reordered and multi-column: the plain (AoS) mul_mat_vec_q at n=5, which
+        // re-streams the whole weight once per column instead of loading it once. That
+        // is the path measured at 5 x 596 us for iq4_nl, and nothing in the suite
+        // ran it at a production weight.
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  5120, 5,  5120, {2, 1}, {1, 1}));
+    }
+    // IQ3_S needs only the two non-reordered arms; its reordered ones are covered
+    // above.
+    for (int n : { 1, 5 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 5120, n, 5120, {2, 1}, {1, 1}));
+    }
+    // The paired MTP verify: two slots x (n_max 4 + 1) = 10 columns, plus the other
+    // widths above MMVQ_MAX_BATCH_SIZE that the chunked / wide / XMX mat-vec paths serve.
+    // {m, k} are the production gate/up (17408x5120) and down (5120x17408) weights.
+    for (ggml_type type : { GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS }) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 } }) {
+            for (int n : { 9, 10, 12, 16 }) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+            }
+        }
+    }
+
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 1*256, { 1,  1}, {1, 1}));

@@ -516,6 +516,13 @@ struct ggml_backend_sycl_context {
     // This is the GDN decay chain (ssm_alpha -> +ssm_dt -> softplus -> *ssm_a). Its
     // three ggml nodes move 48 floats and cost a full dispatch each; the mat-vec that
     // produces their input already has the value in a register at the store.
+    // Set while dispatching the SECOND mat-vec of a (gate-mm, up-mm, SWIGLU) triple whose
+    // quant types differ (the equal-type triple takes the direct GLU fusion hook): the first
+    // mat-vec ran normally, and this dispatch's store reads its row from DRAM and writes
+    // silu(gate)*up straight into the GLU output -- the standalone SWIGLU kernel never runs.
+    const ggml_tensor * mmvq_glu_epi_out          = nullptr;  // the GLU node (written here)
+    const ggml_tensor * mmvq_glu_epi_other        = nullptr;  // the already-dispatched mat-vec
+    bool                mmvq_glu_epi_anchor_is_up = false;    // anchor is the linear (up) half
     const ggml_tensor * mmvq_dsa_out   = nullptr;
     const ggml_tensor * mmvq_dsa_bias  = nullptr;
     const ggml_tensor * mmvq_dsa_scale = nullptr;
@@ -559,7 +566,20 @@ struct ggml_backend_sycl_context {
         int                 variant = -1;       // which quantize functor wrote this layout
         int                 node    = -1;       // graph node index it was produced at
         std::unique_ptr<ggml_sycl_pool_alloc<char>> buf;
+        // Producer-emitted entries (the glu-epi anchor) live in the ctx-owned side
+        // buffer below, NOT in buf: the anchor kernel still READS the previous entry's
+        // buf as its own activation, and the src1q pool is stack-disciplined, so the
+        // producer can neither free buf (kernel not yet run) nor allocate on top of it
+        // and free later (LIFO violation, asserts in the pool). When ext is set it is
+        // the entry's storage and buf is just the previous allocation kept for pool
+        // discipline; the next consumer store frees buf as the stack top, as always.
+        char * ext = nullptr;
     } src1_q8;
+
+    // Grow-only device buffer for producer-emitted q8_1 mirrors, outside every pool.
+    // ~157 KB worst case on this model (8 cols x 19.6 KB rows); freed in the dtor.
+    char * src1_q8_ext_buf = nullptr;
+    size_t src1_q8_ext_cap = 0;
 
     // set by the graph walker so the matmul op can locate itself in the graph
     const ggml_cgraph * cur_graph = nullptr;
@@ -603,6 +623,7 @@ struct ggml_backend_sycl_context {
 
     void src1_q8_reset() {
         src1_q8.buf.reset();
+        src1_q8.ext     = nullptr;
         src1_q8.graph   = nullptr;
         src1_q8.key     = nullptr;
         src1_q8.node    = -1;
@@ -626,7 +647,13 @@ struct ggml_backend_sycl_context {
     // on no decode-only one -- decode's ne1 == 1 takes mmvq, never converts src1, and so never
     // populates the cache. The results had already been printed by then, which is exactly what
     // makes it easy to miss.
-    ~ggml_backend_sycl_context() { src1_f16_reset(); src1_q8_reset(); }
+    ~ggml_backend_sycl_context() {
+        src1_f16_reset();
+        src1_q8_reset();
+        if (src1_q8_ext_buf != nullptr) {
+            sycl::free(src1_q8_ext_buf, *stream());
+        }
+    }
 
     queue_ptr stream(int device, int stream) {
         if (qptrs[device][stream] == nullptr) {
@@ -947,7 +974,8 @@ inline bool ggml_sycl_dnnl_has_optimized_gemm(int device) {
 int ggml_sycl_get_env(const char *env_name, int default_val);
 
 char * ggml_sycl_src1_q8_store_ext(ggml_backend_sycl_context & ctx, const void * key, const void * strm,
-                                   size_t bytes, size_t src_ne, int variant, const ggml_tensor * out);
+                                   size_t bytes, size_t src_ne, int variant, const ggml_tensor * out,
+                                   bool self_reading = false);
 
 // Attribute a device-side pass that is NOT a graph node to its own profiler row
 // (GGML_SYCL_PROF=1). No-op when profiling is off. Without this, work submitted inside an
@@ -1086,7 +1114,8 @@ sycl::half * ggml_sycl_f16_mirror_for_next_matmul(ggml_backend_sycl_context & ct
 // Returns nullptr when the consumer would not quantize, so the caller can template the
 // emission away. *kx receives ne00. Defined in ggml-sycl.cpp beside the cache.
 char * ggml_sycl_q8_emit_for_next_matvec(ggml_backend_sycl_context & ctx,
-                                         const ggml_tensor * dst, int * kx);
+                                         const ggml_tensor * dst, int * kx,
+                                         bool self_reading = false);
 
 // Binary GGML_OP_MUL fast path: same-shape contiguous f32 product fused with the q8_1
 // emission above. Returns false (and launches nothing) when the emission gate declines;

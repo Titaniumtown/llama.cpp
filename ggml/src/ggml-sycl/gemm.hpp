@@ -19,6 +19,7 @@
 
 #include "dnnl.hpp"
 #include "dnnl_sycl.hpp"
+#include "dpas-eu-repair.hpp"
 
 class DnnlGemmWrapper {
 public:
@@ -77,6 +78,13 @@ public:
         matmul_args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
 
         matmul_prim.execute(stream, matmul_args);
+
+        // oneDNN's jit GEMM cannot repair a defective DPAS EU; recompute the rows it wrote wrong.
+        if (ct == dt::f32 && (at == dt::f16 || at == dt::bf16) && at == bt) {
+            ggml_sycl_dpas_repair_gemm(ctx, a, at == dt::bf16, stra0, stra1, stra2, b, bt == dt::bf16, strb0, strb1,
+                                       strb2, (float *) c, 1, m, (int64_t) m * n, m, n, k, (int) batches_a,
+                                       (int) batches_b);
+        }
     }
 
     static void row_gemm(ggml_backend_sycl_context & ctx, int m, int n, int k,

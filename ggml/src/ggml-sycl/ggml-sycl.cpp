@@ -76,6 +76,7 @@
 #include "ggml-sycl/fwht.hpp"
 #include "ggml-sycl/fused-gemm.hpp"
 #include "ggml-sycl/gemm.hpp"
+#include "ggml-sycl/mmvq.hpp"
 #include "ggml-sycl/getrows.hpp"
 #include "ggml-sycl/mem.hpp"
 #include "ggml-sycl/norm.hpp"

@@ -299,6 +299,15 @@ static void ggml_sycl_dpas_self_test(int device) try {
         snprintf(buf, sizeof(buf), "DPAS-R flash attention recomputes lanes 0x%04x on that EU, ", lanes);
         resp += buf;
     }
+#if GGML_SYCL_DNNL
+    lanes = 0;
+    for (const ggml_sycl_dpas_fault & f : h.faults) {
+        lanes |= f.lanes_chain;
+    }
+    char buf[96];
+    snprintf(buf, sizeof(buf), "the oneDNN f16/bf16 GEMMs recompute the rows of lanes 0x%04x, ", lanes);
+    resp += buf;
+#endif
     if (g_ggml_sycl_dpas_faulty[device]) {
         resp += "DPAS flash attention stays off (GGML_SYCL_DPAS_CHECK=2 keeps it on), ";
     }

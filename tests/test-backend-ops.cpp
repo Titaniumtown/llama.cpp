@@ -180,8 +180,16 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     std::vector<float>       data_f32(ne0*ne1*ne2*ne3);
     std::vector<ggml_fp16_t> data_f16(ne0*ne1*ne2*ne3);
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    // This mask decides WHICH kv positions are masked, so drawing it from a
+    // std::random_device makes every FLASH_ATTN_EXT case a DIFFERENT case on every
+    // run. The damage is not that the cases are random -- it is that the draw also
+    // decides which side of the comparison threshold a borderline case lands on, so
+    // a run-to-run delta in a FA failure count carries no information about the
+    // kernel. init_tensor_kq_mask_sparse, its sibling below, has had a fixed seed
+    // (0x5A17) all along; this one had the same shape with a random_device behind it
+    // AND five raw rd() calls that bypassed the generator entirely. One generator,
+    // one seed, every draw from inside it.
+    std::mt19937 gen(0x5A17);
     std::uniform_real_distribution<float> dis(min, max);
 
     for (size_t i = 0; i < data_f32.size(); i++) {
@@ -196,12 +204,16 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     const int n_inf_zero_blocks = 0.2*(ne0*ne1*ne2*ne3)/(blck0*blck1);
 
     for (int b = 0; b < n_inf_zero_blocks; b++) {
-        const int p3 = (rd() % ne3);
-        const int p2 = (rd() % ne2);
-        const int p1 = (rd() % ne1);
-        const int p0 = (rd() % ne0);
+        // Draws come from gen, not from a second random_device. These five were
+        // the larger of the two nondeterminism sources: they set the block's position
+        // AND whether the block is -INF or 0, which is the mask's entire effect on the
+        // kernel's output.
+        const int p3 = (gen() % ne3);
+        const int p2 = (gen() % ne2);
+        const int p1 = (gen() % ne1);
+        const int p0 = (gen() % ne0);
 
-        bool inf = rd() & 1;
+        bool inf = gen() & 1;
 
         for (int i1 = 0; i1 < blck1 && p1 + i1 < ne1; i1++) {
             const int idx = p3*ne2*ne1*ne0 + p2*ne1*ne0 + (p1 + i1)*ne0 + p0;

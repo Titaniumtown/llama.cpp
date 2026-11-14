@@ -167,10 +167,14 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
     }
 
     // fused K-quant GEMVs walk whole QK_K super-blocks: the reorder kernel covers same-type
-    // q4_K, the plain-layout kernel covers q5_K / iq4_xs pairs incl. mixed gate/up types
+    // q4_K, the plain-layout kernel covers q2_K..q6_K, iq4_xs and q8_0 pairs incl. mixed
+    // gate/up types
     const bool reorder_pair = wu->type == GGML_TYPE_Q4_K && wg->type == GGML_TYPE_Q4_K;
-    const bool plain_pair   = (wu->type == GGML_TYPE_Q5_K || wu->type == GGML_TYPE_IQ4_XS) &&
-                            (wg->type == GGML_TYPE_Q5_K || wg->type == GGML_TYPE_IQ4_XS);
+    const auto plain_type   = [](ggml_type t) {
+        return (t >= GGML_TYPE_Q2_K && t <= GGML_TYPE_Q6_K) || t == GGML_TYPE_IQ4_XS ||
+               t == GGML_TYPE_Q8_0;
+    };
+    const bool plain_pair   = plain_type(wu->type) && plain_type(wg->type);
 #ifdef GGML_SYCL_MMVQ_HAS_XMX
     // same-type pairs of the types of the XMX kernels, which also take a few more columns
     // (the XMX kernels walk whole QK_K super-blocks, so they need rows of a multiple of QK_K)

@@ -6540,7 +6540,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
 // iq4_xs gate + q5_K up). Two launches replace five: one shared q8_1 quantization and one
 // dual-GEMV+GLU.
 static bool ggml_sycl_mul_mat_glu_mmvq_plain(ggml_backend_sycl_context & ctx, ggml_tensor * glu,
-                                             ggml_tensor * gate, ggml_tensor * up, const ggml_tensor * wu,
+                                             ggml_tensor * up, const ggml_tensor * wu,
                                              const ggml_tensor * wg, const ggml_tensor * act) {
     // weights already migrated to the reorder layout would be misread by the plain kernel
     const auto * extra_u = static_cast<const ggml_tensor_extra_gpu *>(wu->extra);
@@ -6549,8 +6549,12 @@ static bool ggml_sycl_mul_mat_glu_mmvq_plain(ggml_backend_sycl_context & ctx, gg
         return false;
     }
 
-    // the plain kernel only covers q5_K / iq4_xs pairs: bail before quantizing the activation
-    const auto plain_type = [](ggml_type t) { return t == GGML_TYPE_Q5_K || t == GGML_TYPE_IQ4_XS; };
+    // the plain kernel covers q2_K..q6_K, iq4_xs and q8_0 pairs incl. mixed gate/up types:
+    // bail before quantizing the activation
+    const auto plain_type = [](ggml_type t) {
+        return (t >= GGML_TYPE_Q2_K && t <= GGML_TYPE_Q6_K) || t == GGML_TYPE_IQ4_XS ||
+               t == GGML_TYPE_Q8_0;
+    };
     if (!plain_type(wu->type) || !plain_type(wg->type)) {
         return false;
     }
@@ -6576,7 +6580,6 @@ static bool ggml_sycl_mul_mat_glu_mmvq_plain(ggml_backend_sycl_context & ctx, gg
                                              (int) ne11,
                                              /*stride_col_y=*/src1_padded_cols / QK8_1,
                                              /*stride_col_dst=*/(int) glu->ne[0], stream);
-    GGML_UNUSED(gate);
 }
 
 // Gate and up weights of one type on the XMX engines: one launch reads the activations once and applies the GLU.
@@ -6706,17 +6709,12 @@ static bool ggml_sycl_mul_mat_glu_fused(ggml_backend_sycl_context & ctx, ggml_cg
 #endif
 
     // quant pairs the reorder kernel does not serve take the standard-layout fused path instead
-    // (only q5_K / iq4_xs pairs have a plain kernel); same-type q4_K / q5_K keep the reorder path below
+    // (q2_K..q6_K, iq4_xs and q8_0 pairs incl. mixed have a plain kernel); same-type q4_K / q5_K
+    // keep the reorder path below
     const bool reorder_pair = wg->type == wu->type &&
         (wu->type == GGML_TYPE_Q4_K || (wu->type == GGML_TYPE_Q5_K && ggml_sycl_q5_k_mmvq_reuse(ctx.device)));
     if (!reorder_pair) {
-        const auto is_plain_type = [](ggml_type type) {
-            return type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS;
-        };
-        if (!is_plain_type(wu->type) || !is_plain_type(wg->type)) {
-            return false;
-        }
-        return ggml_sycl_mul_mat_glu_mmvq_plain(ctx, glu, gate, up, wu, wg, act);
+        return ggml_sycl_mul_mat_glu_mmvq_plain(ctx, glu, up, wu, wg, act);
     }
 
     // past 5 columns the two unfused q5_K GEMVs are faster than the fused kernel

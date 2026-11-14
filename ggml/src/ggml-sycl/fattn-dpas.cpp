@@ -53,6 +53,9 @@ bool ggml_sycl_flash_attn_ext_dpas_supported(int device, const ggml_tensor * dst
         (sinks && sinks->type != GGML_TYPE_F32)) {
         return false;
     }
+    if (ggml_sycl_kv_reorder_seg(K) > 0 || ggml_sycl_kv_reorder_seg(V) > 0) {
+        return false;
+    }
     if (!fattn_dpas_head_ok(K->ne[0]) || V->ne[0] != K->ne[0] || Q->ne[0] != K->ne[0]) {
         return false;
     }

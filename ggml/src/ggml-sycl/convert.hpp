@@ -69,6 +69,21 @@ static inline uint8_t ggml_sycl_fp32_to_f8_e4m3(float x) {
     return sign | (uint8_t) (encoded_exp << 3) | (uint8_t) encoded_man;
 }
 
+// Row-split ("KV reorder") q8_0 -> f16. `seg` is the segment length in elements; a
+// segment is `seg` int8 qs followed by seg/QK8_0 half scales (same bytes as seg/QK8_0
+// AoS block_q8_0). Flat form walks k contiguous elements; the strided form walks rows
+// of ne00 elements at byte strides nb01/nb02/nb03 into a dense f16 destination.
+void ggml_sycl_q8_0_reordered_to_fp16(const void * vx, sycl::half * y, int64_t k, int seg,
+                                      dpct::queue_ptr stream);
+void ggml_sycl_q8_0_reordered_to_fp16_nc(const void * vx, sycl::half * y, int64_t ne00, int64_t ne01,
+                                         int64_t ne02, int64_t ne03, size_t nb01, size_t nb02, size_t nb03,
+                                         int seg, dpct::queue_ptr stream);
+void ggml_sycl_q8_0_reordered_to_fp32(const void * vx, float * y, int64_t k, int seg,
+                                      dpct::queue_ptr stream);
+void ggml_sycl_q8_0_reordered_to_fp32_nc(const void * vx, float * y, int64_t ne00, int64_t ne01,
+                                         int64_t ne02, int64_t ne03, size_t nb01, size_t nb02, size_t nb03, int seg,
+                                         dpct::queue_ptr stream);
+
 template<typename dst_t, typename src_t>
  inline dst_t ggml_sycl_cast(src_t x) {
     if constexpr (std::is_same_v<dst_t, src_t>) {

@@ -273,24 +273,43 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
             }
         } else {
             if (Q->ne[1] <= 2) {
-                // Row-split ("KV reorder") q8_0 caches read 10x faster through the VEC
-                // kernel's streaming loads than through TILE's full-history dequant
-                // prepass (kvbench: 23 -> 240 GB/s on the same bytes; the prepass
-                // re-converts the ENTIRE cache every call). The gqa optimisation that
-                // normally makes TILE the better quantized kernel is exactly the dequant
-                // trade this layout removes, so prefer VEC whenever the reordered form
-                // is available at this head size.
-                // Measured crossover: reordered VEC wins at d8192 (+4.3%), d16384
-                // (+3.8%) and d24576 (+1.2%). Beyond that the two arms are
-                // state-dependent: one window measured VEC -15% at d32768, a later
-                // quiet-box interleaved A/B (12 paired reps, 32K/48K/64K) measured
-                // exact parity +-0.1%. The "occupancy cliff" explanation did not
-                // survive that rerun; there is no reproducible deep-VEC penalty,
-                // but no win either, so the bound conservatively keeps TILE (whose
-                // converter path is proven bit-exact) at depths where VEC has never
-                // won. The bound must sit ABOVE the n_kv of the deepest winning
-                // depth (24640 at d24576, hence not 24576).
-                static const int vec_nkv_max = ggml_sycl_get_env("GGML_SYCL_KV_REORDER_VEC_NKV_MAX", 24832);
+                // Row-split ("KV reorder") q8_0 caches used to read ~10x faster through
+                // the VEC kernel's streaming loads than through TILE, because TILE
+                // re-converted the ENTIRE cache to f16 on every call. That prepass was
+                // the whole reason to prefer VEC here, and it is gone: TILE now reads the
+                // reordered cache directly (flash_attn_tile_load_tile_q8r). So the trade
+                // is no longer "streaming loads vs a dequant prepass" but simply VEC's
+                // streaming loads against TILE's tiling, which TILE wins as soon as
+                // there is enough history to tile.
+                //
+                // Re-measured after that change, interleaved, 3 reps, same binary
+                // (GGML_SYCL_KV_REORDER_VEC_NKV_MAX=0 forces TILE):
+                //
+                //     d= 4096   VEC 27.28 / 27.22   TILE 27.11 / 27.09   VEC  +0.5%
+                //     d= 8192   VEC 26.37 / 26.37   TILE 26.33 / 26.32   tie
+                //     d=16384   VEC 24.67 / 24.73   TILE 26.18 / 26.19   TILE +6.1%
+                //     d=24576   VEC 22.81 / 22.77   TILE 25.62 / 25.61   TILE +12.4%
+                //
+                // The crossover moved from ~24.8k down to ~8k, so the old bound was
+                // handing 6-12% to VEC across exactly the depths it had stopped winning.
+                // The bound is measured rather than derived, and it kept moving: after
+                // the integer QK^T tile path landed (a TILE-side change), the
+                // same interleaved same-binary sweep no longer has a VEC win region at
+                // any depth (b337, 4 reps, GGML_SYCL_KV_REORDER_VEC_NKV_MAX=0 = TILE):
+                //
+                //     d=    0   VEC 27.84   TILE 27.87   tie
+                //     d=  256   VEC 27.86   TILE 27.90   tie
+                //     d=  512   VEC 27.66   TILE 27.90   TILE +0.9%
+                //     d= 1024   VEC 27.64   TILE 27.70   tie
+                //     d= 2048   VEC 27.38   TILE 27.48   TILE +0.4%
+                //     d= 4096   VEC 26.91   TILE 27.55   TILE +2.4%
+                //     d= 6144   VEC 26.50   TILE 27.15   TILE +2.5%
+                //     d= 8192   VEC 25.98   TILE 26.97   TILE +3.8%
+                //
+                // VEC is dominated on the reordered-q8_0 path, so the default retires
+                // it (0 = TILE always); the env stays as the escape hatch and as the
+                // re-measurement instrument for the next kernel-side change.
+                static const int vec_nkv_max = ggml_sycl_get_env("GGML_SYCL_KV_REORDER_VEC_NKV_MAX", 0);
                 if (K->ne[1] <= vec_nkv_max &&
                     K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
                     ggml_sycl_kv_reorder_seg(K) == K->ne[0] && ggml_sycl_kv_reorder_seg(V) == V->ne[0]) {

@@ -316,6 +316,8 @@ target_include_directories(test-disk-fetch-floor PRIVATE ${PROJECT_SOURCE_DIR}/t
 llama_build_and_test(test-server-common.cpp  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 target_link_libraries(test-server-common PRIVATE server-context)
 target_include_directories(test-server-common PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+llama_build_and_test(test-prompt-cache-value.cpp)
+target_include_directories(test-prompt-cache-value PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 llama_build_and_test(test-entry-checkpoint-spread.cpp)
 target_include_directories(test-entry-checkpoint-spread PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 llama_build_and_test(test-step-sched-inject.cpp)

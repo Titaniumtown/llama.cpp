@@ -3,6 +3,8 @@
 #include <string>
 #include <cstddef>
 #include <algorithm>
+#include <cstdint>
+#include "server-prompt-cache-value.h"
 #include "server-prompt-cache-spread.h"
 
 // a file in the disk tier directory is a loadable entry only if it ends in ".bin";
@@ -92,4 +94,26 @@ static inline bool server_prompt_cache_disk_wins(int lcp_disk, int lcp_ram, std:
            && lcp_disk >= first_rung
            && lcp_disk >= fetch_min_gain
            && lcp_disk > (lcp_ram >= 0 ? lcp_ram + fetch_min_gain : -1);
+}
+
+// the disk tier's eviction price: the same tokens-per-byte decayed by recency the resident
+// tier pays, not file age. the tier ran first-in-first-out on a 96%-full pool: a hot
+// conversation's state was the oldest file in the directory, so every write deleted it while
+// small stale prefixes survived (measured: a 106k head restored from a 20.5k prefix entry,
+// 85.5k tokens re-processed). the states carry size and last_use_us, and the token count is
+// supplied by the caller, so the header stays free of the server's types
+template <typename States, typename Tokens>
+static inline std::size_t server_prompt_cache_disk_victim(const States & states, const Tokens & tokens,
+        std::size_t slot_tokens, int64_t now_us) {
+    std::size_t worst = 0;
+
+    for (std::size_t i = 1; i < states.size(); i++) {
+        if (server_prompt_cache_value((int64_t) tokens(states[i]), (std::size_t) states[i].size, states[i].last_use_us, slot_tokens, now_us)
+                < server_prompt_cache_value((int64_t) tokens(states[worst]), (std::size_t) states[worst].size, states[worst].last_use_us, slot_tokens,
+                       now_us)) {
+            worst = i;
+        }
+    }
+
+    return worst;
 }

@@ -1705,6 +1705,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"-crs", "--cache-ram-slots"}, "N",
+        "size the prompt cache RAM tier in slot-equivalents: N full contexts of one slot. this is the"
+        " knob that bounds the memory the tier can hold -- the byte limit is the measured cost of N"
+        " such states, so the model, the KV types and the slot count all fall out of it (default: 0,"
+        " off, and --cache-ram is used instead)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-ram-slots must be non-negative");
+            }
+            params.cache_ram_slots = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_RAM_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--cache-disk-dir"}, "PATH",
         "keep a second level of the prompt cache in this directory: one file per entry, "
         "states evicted from --cache-ram are written here and read back on demand, and the "

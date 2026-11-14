@@ -191,6 +191,25 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
+// what a state is worth keeping: the tokens a future request takes from it, per byte it
+// holds, decayed by how long ago it was last used
+float server_prompt_cache::value(const server_prompt_cache_state & state) const {
+    return server_prompt_cache_value(state.prompt.n_tokens(), state.size(), state.last_use_us,
+            slot_tokens, ggml_time_us());
+}
+
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::victim() {
+    auto worst = states.begin();
+
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        if (value(*it) < value(*worst)) {
+            worst = it;
+        }
+    }
+
+    return worst;
+}
+
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
@@ -243,6 +262,27 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
+    // admission: the tier is full and the new state is worth less than the weakest resident --
+    // keep the residents. both sides are priced as the state each holds now, the arrival by
+    // being the one just saved and the victim by how long ago it was last used, so what is
+    // compared is the tokens per byte each offers. nothing else may enter the price: the
+    // arrival is a conversation's first state as often as its twentieth, and a resident that
+    // earned a reuse count would refuse every arrival the tier has not already seen
+    if (limit_size > 0 && !states.empty() && size() + state_size_new > limit_size) {
+        const int64_t now   = ggml_time_us();
+        const float   v_new = server_prompt_cache_value(prompt.tokens.size(), state_size_new, now, slot_tokens, now);
+        const float   v_min = value(*victim());
+
+        if (v_new < v_min) {
+            SRV_WRN(" - not caching this prompt: %d tokens / %.3f MiB is worth %.2f tok/MiB, "
+                    "below the weakest of %zu resident entries at %.2f\n",
+                    prompt.n_tokens(), state_size_new / (1024.0 * 1024.0),
+                    v_new * 1024.0 * 1024.0, states.size(), v_min * 1024.0 * 1024.0);
+
+            return nullptr;
+        }
+    }
+
     // remove any cached prompts that are fully contained in the current prompt
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
@@ -257,19 +297,27 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     }
 
     if (limit_size > 0) {
-        // make room before allocating the new vectors to avoid breaching the limit
+        // make room before allocating the new vectors to avoid breaching the limit. the
+        // victim is the least valuable state, not the oldest: a tier that evicts in arrival
+        // order drops the session that was asked for a minute ago (its entry is old, its
+        // state is the one that has to be there) while keeping a stale 100k one nothing has
+        // continued
         while (!states.empty() && size() + state_size_new > limit_size) {
-            if (disk_enabled()) {
-                SRV_WRN(" - making room for prompt cache entry, moving oldest entry (size = %.3f MiB) to the disk tier\n",
-                        states.front().size() / (1024.0 * 1024.0));
+            auto it = victim();
 
-                disk_spill(states.front());
+            if (disk_enabled()) {
+                SRV_WRN(" - making room: spilling the least valuable entry out of %zu (%d tokens, %.3f MiB, %.2f tok/MiB-minute) to the disk tier\n",
+                        states.size(), it->prompt.n_tokens(), it->size() / (1024.0 * 1024.0),
+                        value(*it) * 1024.0 * 1024.0);
+
+                disk_spill(*it);
             } else {
-                SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                        states.front().size() / (1024.0 * 1024.0));
+                SRV_WRN(" - making room: dropping the least valuable entry out of %zu (%d tokens, %.3f MiB, %.2f tok/MiB-minute)\n",
+                        states.size(), it->prompt.n_tokens(), it->size() / (1024.0 * 1024.0),
+                        value(*it) * 1024.0 * 1024.0);
             }
 
-            states.pop_front();
+            states.erase(it);
         }
     }
 
@@ -302,7 +350,14 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
         },
+        /*.last_use_us =*/ ggml_time_us(),
     });
+
+    // what a token of this tier costs, measured rather than assumed: the slots-mode byte
+    // limit is this times the token budget (see update())
+    if (state_size_new > 0) {
+        density_max = std::max(density_max, (float) state_size_new / (float) std::max<size_t>(1, prompt.tokens.size()));
+    }
 
     return &states.back();
 }
@@ -503,7 +558,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             // a borrowed head: the entry is another conversation's state and its owner's next
             // turn wants the rest of it. the restore copied the state into this slot's context,
             // so the entry can stay where it is at the memory it already occupies -- and the
-            // slot needs its own copy of the token list to name what its KV now holds
+            // slot needs its own copy of the token list to name what its KV now holds. the
+            // borrow moves recency and nothing else: a head lent to another conversation says
+            // the entry was used, not that its owner came back for it
+            it_best->last_use_us = ggml_time_us();
+
             prompt = it_best->prompt.clone();
 
             SRV_INF("prompt cache: borrowed the %d-token head of a %zu-token entry\n",
@@ -535,34 +594,49 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 }
 
 void server_prompt_cache::update() {
-    if (limit_size > 0) {
-        while (!states.empty() && size() > limit_size) {
-            if (disk_enabled()) {
-                SRV_WRN(" - cache size limit reached, moving oldest entry (size = %.3f MiB) to the disk tier\n",
-                        states.front().size() / (1024.0 * 1024.0));
-
-                disk_spill(states.front());
-            } else {
-                SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n",
-                        states.front().size() / (1024.0 * 1024.0));
-            }
-
-            states.pop_front();
-        }
-    }
-
     // average size per token
     const float size_per_token = std::max<float>(1.0f, float(size()) / (std::max<size_t>(1, n_tokens())));
 
-    // dynamically increase the token limit if it can fit in the memory limit
-    const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
+    // slots mode: the byte limit is the cost of the token budget, at the density this tier has
+    // measured. this is the number the cgroup has to hold, so it is derived from the model
+    // rather than typed in next to it -- a byte limit below the states the model needs is a
+    // server that faults its way through reclaim instead of serving
+    if (size_in_slots && limit_tokens > 0 && density_max > 0.0f) {
+        limit_size = (size_t) ((double) limit_tokens * (double) density_max);
+    }
+
+    if (limit_size > 0) {
+        while (!states.empty() && size() > limit_size) {
+            auto it = victim();
+
+            if (disk_enabled()) {
+                SRV_WRN(" - cache size limit reached, spilling the least valuable entry out of %zu (%d tokens, %.3f MiB)\n",
+                        states.size(), it->prompt.n_tokens(), it->size() / (1024.0 * 1024.0));
+
+                disk_spill(*it);
+            } else {
+                SRV_WRN(" - cache size limit reached, dropping the least valuable entry out of %zu (%d tokens, %.3f MiB)\n",
+                        states.size(), it->prompt.n_tokens(), it->size() / (1024.0 * 1024.0));
+            }
+
+            states.erase(it);
+        }
+    }
+
+    // dynamically increase the token limit if it can fit in the memory limit. not in slots
+    // mode: there the token limit is the budget, and a state the model needs more memory for
+    // does not make room for more states
+    const size_t limit_tokens_cur = (limit_size > 0 && !size_in_slots)
+        ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
 
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+            auto it = victim();
 
-            states.pop_front();
+            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, dropping the least valuable entry out of %zu (%d tokens)\n",
+                    limit_tokens, limit_tokens_cur, states.size(), it->prompt.n_tokens());
+
+            states.erase(it);
         }
     }
 
@@ -1069,7 +1143,7 @@ bool server_prompt_cache::disk_init(const std::string & dir, size_t limit, const
 
         // LRU across restarts: the file's mtime is the last time it was written or fetched
         const auto mt = std::filesystem::last_write_time(path, ec);
-        const int64_t use = ec ? 0 : (int64_t) mt.time_since_epoch().count();
+        const int64_t use = ec ? 0 : server_prompt_cache_use_from_write_time(mt, ggml_time_us());
 
         disk_states.push_back({ std::move(tokens), path.string(), (size_t) sz, use });
         disk_used += (size_t) sz;
@@ -1212,7 +1286,12 @@ void server_prompt_cache::disk_write(server_prompt_cache_state & state) {
 // assumes disk_mutex
 void server_prompt_cache::disk_prune() {
     while (disk_limit > 0 && disk_used > disk_limit && !disk_states.empty()) {
-        auto & victim = disk_states.front();
+        // first-in-first-out deleted a hot conversation's state on every write while small stale
+        // prefixes survived; the victim is the least valuable entry, priced like the RAM tier's
+        const int64_t now = ggml_time_us();
+        const std::size_t vi = server_prompt_cache_disk_victim(disk_states, [](const auto & s) { return s.tokens.size(); },
+                slot_tokens, now);
+        auto & victim = disk_states[vi];
 
         SRV_INF("prompt cache: disk tier limit reached, removing '%s' (%zu tokens, %.2f MiB)\n",
                 victim.path.c_str(), victim.tokens.size(), victim.size / (1024.0 * 1024.0));
@@ -1221,7 +1300,7 @@ void server_prompt_cache::disk_prune() {
         std::filesystem::remove(victim.path, ec);
 
         disk_used -= victim.size;
-        disk_states.erase(disk_states.begin());
+        disk_states.erase(disk_states.begin() + vi);
     }
 }
 

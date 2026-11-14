@@ -3,6 +3,7 @@
 #include "server-common.h"
 #include "server-task.h"
 #include "server-prompt-cache-disk.h"
+#include "server-prompt-cache-value.h"
 #include "server-prompt-cache-spread.h"
 
 #include <condition_variable>
@@ -115,6 +116,10 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // when this state was last used: the tier prices it by how long ago that was, so an entry
+    // nothing continues decays out of the tier and one asked for a minute ago keeps its place
+    int64_t last_use_us = 0;
+
     size_t size() const {
         size_t res = data.size();
 
@@ -145,17 +150,36 @@ struct server_prompt_cache_decision {
 struct server_prompt_cache {
     ~server_prompt_cache();
 
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, int32_t max_checkpoints = 0, int32_t min_step = 8192) {
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, int32_t max_checkpoints = 0, int32_t min_step = 8192,
+            bool size_in_slots = false, size_t slot_tokens = 0) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
         this->max_checkpoints = max_checkpoints > 0 ? (size_t) max_checkpoints : 0;
         this->min_step = min_step > 0 ? (size_t) min_step : 8192;
+        this->size_in_slots = size_in_slots;
+        this->slot_tokens = slot_tokens > 0 ? slot_tokens : limit_tokens;
     }
 
     std::list<server_prompt_cache_state> states;
 
-    // in bytes, 0 = no limit
+    // in bytes, 0 = no limit. in slots mode (--cache-ram-slots) this is derived instead: the
+    // cost of the states the tier has actually seen, times the token budget (see update())
     size_t limit_size = 0;
+
+    // the byte limit is the cost of limit_tokens tokens, measured rather than assumed: the
+    // model's KV depends on its architecture, the KV types, the checkpoint density and the
+    // draft context, so a number fixed at startup is either too small (thrash, which is a
+    // frozen server) or too generous (the cgroup was set from it). 0 disables the derivation
+    // and the bit limit is the authority
+    bool   size_in_slots = false;
+
+    // one slot's full context: a state cannot serve more than this and no entry is worth more
+    size_t slot_tokens = 0;
+
+    // bytes per token, the max over the states this tier has saved. the derived byte limit is
+    // limit_tokens * this, so it can only ever be generous by how many checkpoints an entry
+    // carries -- never by how much memory the model needs for a token
+    float  density_max = 0.0f;
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
@@ -182,6 +206,14 @@ struct server_prompt_cache {
     // restore the entry with the longest usable head, from either tier, into the slot `id_slot`
     bool load(server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
             server_prompt_cache_decision * decision = nullptr);
+
+    // what a state is worth keeping: the tokens a future request takes from it per byte it
+    // holds, decayed by the time since it was last used
+    float value(const server_prompt_cache_state & state) const;
+
+    // the state to make room with: the least valuable one, not the oldest
+    std::list<server_prompt_cache_state>::iterator victim();
+
 
     void update();
 

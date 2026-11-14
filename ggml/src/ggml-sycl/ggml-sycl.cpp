@@ -3696,6 +3696,16 @@ char * ggml_sycl_src1_q8_store_ext(ggml_backend_sycl_context & ctx, const void *
     return c.ext;
 }
 
+// True if src1 may be converted down to `prec`. ggml_prec_set_src(dst, prec, 1) stores the
+// LOWEST precision src1 may take in op_params[3]: llama-graph.cpp pins MoE expert
+// activations to GGML_PREC_F32 and llama-model.cpp reads the value out of tensor metadata.
+// Nothing on this backend consulted it, so an activation above the f16 range became inf
+// and the product NaN.
+static bool ggml_sycl_src1_prec_allows(const ggml_tensor * dst, ggml_prec prec) {
+    const int32_t hint = ggml_get_op_params_i32(dst, 3);
+    return hint == GGML_PREC_UNDEFINED || (int32_t) prec <= hint;
+}
+
 inline void ggml_sycl_op_mul_mat_sycl(
     ggml_backend_sycl_context & ctx,
     const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
@@ -3734,6 +3744,7 @@ inline void ggml_sycl_op_mul_mat_sycl(
 #if GGML_SYCL_DNNL && defined(GGML_SYCL_HAS_BF16)
     // Fast path for bf16 src0
     if (src0->type == GGML_TYPE_BF16 && g_ggml_sycl_enable_dnn &&
+        ggml_sycl_src1_prec_allows(dst, GGML_PREC_BF16) &&
         ggml_sycl_dnnl_has_optimized_gemm(ggml_sycl_get_device()) && ggml_is_contiguous(src0) &&
         row_diff == src0->ne[1]) {
         ggml_sycl_elide_f32_check_read(ctx, src1_ddf_i, src1_f32_bytes, src1);
@@ -3780,7 +3791,6 @@ inline void ggml_sycl_op_mul_mat_sycl(
     use_fp16 = use_fp16 && ggml_sycl_src1_f16_ok(dst);
     if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && use_fp16 && ggml_is_contiguous(src0) &&
         row_diff == src0->ne[1] && ggml_prec_get_acc(dst) == GGML_PREC_UNDEFINED) {
-
         ggml_sycl_pool_alloc<sycl::half> src0_as_f16(ctx.pool());
         if (src0->type != GGML_TYPE_F16) {
             scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_sycl", dst, /*num_src=*/2,
@@ -6415,6 +6425,9 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     }
 
     // check data types and tensor shapes for custom matrix multiplication kernels:
+    const bool src1_q8_ok  = ggml_sycl_src1_prec_allows(dst, GGML_PREC_Q8);
+    const bool src1_f16_ok = ggml_sycl_src1_prec_allows(dst, GGML_PREC_F16);
+
     bool use_dequantize_mul_mat_vec = can_use_dequantize_mul_mat_vec(src0, src1, dst);
     if (src1->ne[1] == 1 && ggml_sycl_xmx_min_cols(src0->type) == 1 && can_use_xmx_batch(ctx.device, src0, src1)) {
         use_dequantize_mul_mat_vec = false;
@@ -6424,9 +6437,9 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     use_dequantize_mul_mat_vec = use_dequantize_mul_mat_vec && ggml_sycl_src1_f16_ok(dst);
 #endif
 
-    bool use_mul_mat_vec_q = can_use_mul_mat_vec_q(ctx.device, src0, src1, dst);
+    bool use_mul_mat_vec_q = can_use_mul_mat_vec_q(ctx.device, src0, src1, dst) && src1_q8_ok;
 
-    bool use_mul_mat_q = can_use_mul_mat_q(src0, src1, dst);
+    bool use_mul_mat_q = can_use_mul_mat_q(src0, src1, dst) && src1_q8_ok;
 
     // When reorder is enabled, both ESIMD, MMVQ and DMMV kernels may be used. For
     // best performance use ESIMD when supported, followed by MMVQ, and finally DMMV.
@@ -6476,7 +6489,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     } else if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) && src1->ne[1] == 1 && src1->ne[3] == 1) {
         // KQV single-batch
         ggml_sycl_mul_mat_vec_nc(ctx, src0, src1, dst);
-    } else if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2] * src1->ne[3] > 1) {
+    } else if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2] * src1->ne[3] > 1 && src1_f16_ok) {
         // KQ + KQV multi-batch
         ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst);
     } else if (use_dequantize_mul_mat_vec) {
@@ -6947,12 +6960,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     const int64_t n_as = ne02;
     const int64_t n_ids = ids->ne[0];
 
-    if (ne12 == 1) {
+    if (ne12 == 1 && ggml_sycl_src1_prec_allows(dst, GGML_PREC_Q8)) {
         if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
             return;
         }
     }
-    GGML_ASSERT(!ggml_sycl_mul_mat_id_should_use_mmvq(dst));
+    GGML_ASSERT(!ggml_sycl_src1_prec_allows(dst, GGML_PREC_Q8) || !ggml_sycl_mul_mat_id_should_use_mmvq(dst));
 
     // The per-expert loop below reads the experts in whatever layout they have: reorder MXFP4 here as well, so prompt processing does not depend on a single-token decode having run first.
     if (src0->type == GGML_TYPE_MXFP4) {

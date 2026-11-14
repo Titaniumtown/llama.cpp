@@ -55,9 +55,11 @@ static ggml_tensor * build_attn_inp_kq_mask(
     // only emitted when a kernel that understands it is guaranteed to consume
     // it: FA enabled and offloaded (offload_kqv), GQA with head_dim a multiple
     // of 64 in [64,512] and DKQ == DV, single-sequence prefill of >= 32 tokens
-    // over >= 1024 keys. Outside the envelope the full mask is built, so the
-    // sentinel can never reach TILE/VEC or a CPU FA; the SYCL kernel selection
-    // additionally hard-aborts if one ever does.
+    // over >= 1024 keys. A model with SWA layers is excluded: there the mask
+    // is windowed, not causal, and the sentinel carries no window. Outside the
+    // envelope the full mask is built, so the sentinel can never reach VEC or a
+    // CPU FA; the SYCL kernel selection additionally hard-aborts if one ever
+    // does.
     const int64_t dkq = hparams.n_embd_head_k();
     const int64_t dv  = hparams.n_embd_head_v();
     // Prefill only. At decode width the mask is [n_kv, 1] -- KiBs -- and the
@@ -67,6 +69,7 @@ static ggml_tensor * build_attn_inp_kq_mask(
             && hparams.n_head() / hparams.n_head_kv() >= 2
             && dkq >= 64 && dkq <= 512 && dkq % 64 == 0 && dkq == dv
             && (dkq == 64 || dkq == 128 || dkq == 256 || dkq == 512)
+            && hparams.swa_type == LLAMA_SWA_TYPE_NONE
             && ubatch.n_seqs_unq == 1
             && n_kv >= 1024 && n_tokens >= 32) {
         const llama_pos n_past = ubatch.pos[0];

@@ -57,7 +57,12 @@ typedef void (*fattn_kernel_t)(
     const int32_t ne33,
     const int32_t nb31,
     const int32_t nb32,
-    const int64_t nb33);
+    const int64_t nb33,
+    // implicit-causal sentinel: n_past >= 0 means the mask input is the
+    // [1, n_past+1] sentinel (ne[0] == 1) and the kernel computes the causal
+    // boundary in-kernel; n_past < 0 means the mask is a real [n_kv, n_tokens]
+    // matrix. The mask pointer is null in the sentinel case.
+    const int32_t n_past);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -707,12 +712,33 @@ static void flash_attn_mask_to_KV_max(const sycl::half2 * __restrict__ mask,
                                       const int ne30,
                                       const int s31,
                                       const int s33,
-                                      int *     buf_iw) {
+                                      int *     buf_iw,
+                                      const int n_past) {
     auto      item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int ne31     = item_ct1.get_group_range(2);
     const int tid      = item_ct1.get_local_id(2);
     const int sequence = item_ct1.get_group(1);
     const int jt       = item_ct1.get_group(2);
+
+    if (n_past >= 0) {
+        // Implicit-causal sentinel: there is no mask to scan. The last visible
+        // key of this query tile is n_past + its last column, so the exclusive
+        // KV bound is the end of the tile that holds it. This is the value the
+        // mask scan below would have found for the same causal boundary.
+        const int kv_rows = ne30*FATTN_KQ_STRIDE;
+        int k_max = n_past + (jt*ncols1 + ncols1 - 1);
+        if (k_max > kv_rows - 1) {
+            k_max = kv_rows - 1;
+        }
+        int KV_max_sj = ((k_max / FATTN_KQ_STRIDE) + 1) * FATTN_KQ_STRIDE;
+        if (KV_max_sj > kv_rows) {
+            KV_max_sj = kv_rows;
+        }
+        if (item_ct1.get_local_id(2) == 0) {
+            KV_max[sequence*ne31 + jt] = KV_max_sj;
+        }
+        return;
+    }
 
     mask += sequence*s33 + jt*ncols1*s31;
 
@@ -1027,7 +1053,8 @@ static void lauch_kernel(
     const int32_t ne33,
     const int32_t nb31,
     const int32_t nb32,
-    const int64_t nb33) {
+    const int64_t nb33,
+    const int32_t n_past) {
     GGML_UNUSED(local_mem_size);
 
     const auto rng = sycl::nd_range<3>(
@@ -1040,7 +1067,7 @@ static void lauch_kernel(
                      max_bias, m0, m1, n_head_log2, logit_softcap, ne00,
                      ne01, ne02, ne03, nb01, nb02, nb03, ne10, ne11,
                      ne12, ne13, nb11, nb12, nb13, nb21, nb22, nb23,
-                     ne31, ne32, ne33, nb31, nb32, nb33);
+                     ne31, ne32, ne33, nb31, nb32, nb33, n_past);
     };
 
     q->submit([&](sycl::handler &cgh) {
@@ -1076,6 +1103,15 @@ void launch_fattn(
     GGML_ASSERT(V->nb[0] == ggml_element_size(V));
 
     GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
+
+    // The implicit-causal sentinel is a [1, n_past+1] f16 tensor: ne[0] == 1
+    // marks it and ne[1]-1 carries n_past, the first position of the batch. It
+    // replaces the materialized [n_kv, n_tokens] mask, so the kernel computes
+    // the causal boundary in-kernel instead of reading one value per (query,
+    // key) pair. A real mask always has ne[0] == n_kv, and the sentinel is
+    // only emitted for n_kv >= 1024, so ne[0] == 1 identifies it unambiguously.
+    const bool implicit_causal = mask && mask->ne[0] == 1;
+    const int  n_past          = implicit_causal ? (int) mask->ne[1] - 1 : -1;
 
     ggml_sycl_pool & pool = ctx.pool();
     dpct::queue_ptr  main_stream = ctx.stream();
@@ -1234,13 +1270,12 @@ void launch_fattn(
                                      GGML_UNUSED(item_ct1);
                                      flash_attn_mask_to_KV_max<ncols1, warp_size>(
                                          mask_data_ct0, KV_max_ptr_ct1, iter_k, s31, s33,
-                                         buf_iw_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
+                                         buf_iw_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                         n_past);
                                  });
             });
         }
         SYCL_CHECK(0);
-        // the KV-max scan; bytes are the mask it scans
-        if (ggml_sycl_prof_active()) { ggml_sycl_prof_mark_sub("FA-KV-MAX", ggml_nbytes(mask)); }
     }
 
     const dpct::dim3 block_dim(warp_size, nwarps, 1);
@@ -1433,12 +1468,14 @@ void launch_fattn(
 
     lauch_kernel<fattn_kernel, warp_size, use_large_grf>(
         blocks_num, block_dim, main_stream, (unsigned int) nbytes_shared, (const char *) Q->data, K_data, V_data,
-        mask ? ((const char *) mask->data) : nullptr, sinks ? ((const char *) sinks->data) : nullptr, KV_max.ptr,
+        // the sentinel is not a mask: the kernel takes n_past and computes the
+        // boundary itself, so it must not be handed the tensor to read.
+        (mask && !implicit_causal) ? ((const char *) mask->data) : nullptr, sinks ? ((const char *) sinks->data) : nullptr, KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, (sycl::float2 *)dst_tmp_meta.ptr, scale, max_bias, m0, m1,
         n_head_log2, logit_softcap, Q->ne[0], ne01, Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->ne[0],
         K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13, nb21, nb22, nb23, mask ? mask->ne[1] : 0,
         mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0,
-        mask ? mask->nb[3] : 0);
+        mask ? mask->nb[3] : 0, n_past);
     SYCL_CHECK(0);
 
     if (stream_k) {

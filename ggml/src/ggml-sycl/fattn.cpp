@@ -97,6 +97,15 @@ static void ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_t
     vec_case(ctx, dst);
 }
 
+// TILE implements a fixed set of head sizes: 40, 64, 72, 80, 96, 112, 128,
+// 256, 512 and 576. Anything else must not reach TILE, which aborts.
+static inline bool ggml_sycl_fattn_tile_handles_head_size(const int64_t head_size) {
+    return head_size == 40 || head_size == 64 || head_size == 72 ||
+           head_size == 80 || head_size == 96 || head_size == 112 ||
+           head_size == 128 || head_size == 256 || head_size == 512 ||
+           head_size == 576;
+}
+
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
@@ -206,15 +215,27 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         }
     }
 
-    // An implicit-causal sentinel (mask->ne[0] == 1) is only understood by the
-    // MKL, ONE-DNN, and XMX kernels. A sentinel reaching this point means those
-    // all declined (GGML_SYCL_ENABLE_MKL_FA=0 + ONE-DNN gate miss, sinks,
-    // pathological strides). TILE/VEC would read the [1, n_past+1] tensor as a
-    // full [n_kv, n_tokens] mask and silently produce garbage -- abort instead.
-    if (mask && mask->ne[0] == 1) {
-        GGML_ABORT("implicit-causal mask sentinel reached a non-MKL/ONE-DNN/XMX FA kernel "
+    // An implicit-causal sentinel (mask->ne[0] == 1) is understood by the MKL,
+    // ONE-DNN and TILE kernels. TILE computes the causal boundary
+    // in-kernel, so it needs no mask at all; it cannot do that when the model
+    // uses ALiBi, because there the mask carries the bias and the sentinel
+    // carries none. A sentinel reaching this point with ALiBi means
+    // MKL/ONE-DNN both declined, and the CPU fallback would read the
+    // [1, n_past+1] tensor as a full [n_kv, n_tokens] mask -- abort.
+    const bool implicit_causal = mask && mask->ne[0] == 1;
+    if (implicit_causal && max_bias != 0.0f) {
+        GGML_ABORT("implicit-causal mask sentinel with an ALiBi bias reached a non-MKL/ONE-DNN FA kernel "
                    "(check GGML_SYCL_ENABLE_MKL_FA, the oneDNN gate, sinks, and KV strides)");
     }
+    // A shape no SYCL kernel takes falls back to the CPU, which cannot read the
+    // sentinel: fail loudly instead of reading past the end of the tensor.
+    const auto none_or_abort = [&]() -> best_fattn_kernel {
+        if (implicit_causal) {
+            GGML_ABORT("implicit-causal mask sentinel reached an FA shape no SYCL kernel takes "
+                       "(the CPU fallback would read it as a full mask)");
+        }
+        return BEST_FATTN_KERNEL_NONE;
+    };
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -238,20 +259,21 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         case 256:
         case 512:
             if (V->ne[0] != K->ne[0]) {
-                return BEST_FATTN_KERNEL_NONE;
+                return none_or_abort();
             }
             break;
         case 576:
             if (V->ne[0] != 512) {
-                return BEST_FATTN_KERNEL_NONE;
+                return none_or_abort();
             }
             if (!gqa_opt_applies) {
-                return BEST_FATTN_KERNEL_NONE;
+                return none_or_abort();
             }
             break;
         default:
-            return BEST_FATTN_KERNEL_NONE;
+            return none_or_abort();
     }
+
 
     switch (K->type) {
         case GGML_TYPE_F32:
@@ -261,14 +283,35 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
+
         case GGML_TYPE_Q8_0:
             break;
         default:
-            return BEST_FATTN_KERNEL_NONE;
+            return none_or_abort();
     }
 
     if (mask && mask->ne[2] != 1) {
-        return BEST_FATTN_KERNEL_NONE;
+        return none_or_abort();
+    }
+
+    // The sentinel pins the choice to TILE: it is the one kernel left that can
+    // read it (VEC reads the mask as a full [n_kv, n_tokens] matrix, so it
+    // would read the [1, n_past+1] tensor as one). The shape is validated by
+    // the switch above, so TILE is instantiated for it.
+    if (implicit_causal) {
+        // TILE implements a fixed set of head sizes; anything else aborts in
+        // the TILE dispatch. Reject the choice here with a clear message.
+        if (!ggml_sycl_fattn_tile_handles_head_size(Q->ne[0])) {
+            GGML_ABORT("implicit-causal FA requested a head size TILE does not implement "
+                       "(supported: 40, 64, 72, 80, 96, 112, 128, 256, 512, 576)");
+        }
+        // TILE's softcap path only writes output for DV 128 and 256; for other
+        // DV it returns without storing, so the result would be garbage.
+        if (logit_softcap != 0.0f && V->ne[0] != 128 && V->ne[0] != 256) {
+            GGML_ABORT("implicit-causal FA with logit softcap requested a DV TILE's softcap path does not write "
+                       "(supported DV: 128, 256)");
+        }
+        return BEST_FATTN_KERNEL_TILE;
     }
 
     // q4_0 / q8_0 K/V decode and small batches on Xe2: read the cache directly, no F16 copy of K and V

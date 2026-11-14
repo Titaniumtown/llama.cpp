@@ -954,6 +954,7 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
                                                  const float * const Q_d,
                                                  float *       const K_d,
                                                  const sycl::half * const __restrict__ mask,
+                                                 const int         n_past,
                                                  const sycl::uint3 ne01,
                                                  const float       logit_softcap,
                                                  const float       slope,
@@ -1029,10 +1030,19 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
             }
 
             if (!oob_check || i_KQ < k_VKQ_sup) {
-                KQ_acc[(i_KQ_0 / (np * warp_size)) * cpw + jc0] +=
-                    (ncols2 > 1 || mask) ? slope * sycl::vec<sycl::half, 1>(mask[j * stride_mask + k_VKQ_0 + i_KQ])
-                                                       .convert<float, sycl::rounding_mode::automatic>()[0] :
-                                           0.0f;
+                if (n_past >= 0) {
+                    // Implicit-causal sentinel: the key row is visible to the
+                    // query column j iff row <= n_past + j, which is the causal
+                    // boundary the materialized mask would have carried. The
+                    // rows past it are masked out here instead of read.
+                    KQ_acc[(i_KQ_0 / (np * warp_size)) * cpw + jc0] +=
+                        (k_VKQ_0 + i_KQ <= n_past + j) ? 0.0f : -INFINITY;
+                } else {
+                    KQ_acc[(i_KQ_0 / (np * warp_size)) * cpw + jc0] +=
+                        (ncols2 > 1 || mask) ? slope * sycl::vec<sycl::half, 1>(mask[j * stride_mask + k_VKQ_0 + i_KQ])
+                                                           .convert<float, sycl::rounding_mode::automatic>()[0] :
+                                               0.0f;
+                }
 
                 KQ_max_new[jc0] =
                     sycl::fmax((float) KQ_max_new[jc0],
@@ -1247,7 +1257,8 @@ static void flash_attn_tile(const char *  Q,
                             const int32_t        ne33,
                             const int32_t        nb31,
                             const int32_t        nb32,
-                            const int64_t        nb33) {
+                            const int64_t        nb33,
+                            const int32_t        n_past) {
 #ifdef SYCL_FLASH_ATTN
     // Skip unused kernel variants for faster compilation:
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
@@ -1260,7 +1271,7 @@ static void flash_attn_tile(const char *  Q,
                   nb11, nb12, nb13,
                   nb21, nb22, nb23,
                   ne31, ne32, ne33,
-                  nb31, nb32, nb33);
+                  nb31, nb32, nb33, n_past);
         return;
     }
 
@@ -1481,7 +1492,7 @@ static void flash_attn_tile(const char *  Q,
         while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap,
-                                 oob_check, q8_KV, int_qk, q4_0_KV, q5_1_KV, kv_ecs>(Q_tmp, K_h2, V_h2, Q_i8, Q_d, K_d, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
+                                 oob_check, q8_KV, int_qk, q4_0_KV, q5_1_KV, kv_ecs>(Q_tmp, K_h2, V_h2, Q_i8, Q_d, K_d, maskh, n_past, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
                                             stride_V2, stride_K_b, stride_V_b, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
                                             KQ_max_new_shared);
             k_VKQ_0 += item_ct1.get_group_range(1) * nbatch_fa;
@@ -1489,7 +1500,7 @@ static void flash_attn_tile(const char *  Q,
         if (k_VKQ_0 < k_VKQ_max) {
             constexpr bool oob_check = true;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap,
-                                 oob_check, q8_KV, int_qk, q4_0_KV, q5_1_KV, kv_ecs>(Q_tmp, K_h2, V_h2, Q_i8, Q_d, K_d, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
+                                 oob_check, q8_KV, int_qk, q4_0_KV, q5_1_KV, kv_ecs>(Q_tmp, K_h2, V_h2, Q_i8, Q_d, K_d, maskh, n_past, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
                                             stride_V2, stride_K_b, stride_V_b, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
                                             KQ_max_new_shared);
         }
@@ -1500,7 +1511,7 @@ static void flash_attn_tile(const char *  Q,
 
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap,
-                                 oob_check, q8_KV, int_qk, q4_0_KV, q5_1_KV, kv_ecs>(Q_tmp, K_h2, V_h2, Q_i8, Q_d, K_d, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
+                                 oob_check, q8_KV, int_qk, q4_0_KV, q5_1_KV, kv_ecs>(Q_tmp, K_h2, V_h2, Q_i8, Q_d, K_d, maskh, n_past, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
                                             stride_V2, stride_K_b, stride_V_b, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
                                             KQ_max_new_shared);
         }
@@ -1678,7 +1689,7 @@ static void flash_attn_tile(const char *  Q,
               nb11, nb12, nb13,
               nb21, nb22, nb23,
               ne31, ne32, ne33,
-              nb31, nb32, nb33);
+              nb31, nb32, nb33, n_past);
 #endif // SYCL_FLASH_ATTN
 }
 

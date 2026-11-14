@@ -243,9 +243,13 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
             return false;
         }
 
-        // one row stride per source comes from nb[1], so rows must be contiguous and equally
-        // shaped; the destination is written flat, so it must be fully contiguous
-        if (!ggml_is_contiguous_1(unary->src[0]) || !ggml_is_contiguous_1(other) ||
+        // the kernel indexes both sources and the destination FLAT (a[i], b[i], dst[i]
+        // over nelements), so all three must be fully contiguous and equally shaped.
+        // contiguous_1 is not enough: a permuted tensor keeps contiguous rows while its
+        // higher-dim strides are shuffled, and the flat walk then reads the wrong bytes
+        // -- accepted here, it died on the kernel's assert instead of declining
+        // (test-backend-ops SILU_MUL f16 ne=[5,7,11,13] swap=1).
+        if (!ggml_is_contiguous(unary->src[0]) || !ggml_is_contiguous(other) ||
             !ggml_are_same_shape(other, unary) || !ggml_is_contiguous(mul)) {
             return false;
         }
@@ -277,83 +281,6 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
         return true;
     }
 
-    // ADD(bias) + UNARY + MUL(scale): the delta-net alpha gate, softplus(alpha + dt) * a.
-    // The broadcast is what stops the same-shape UNARY + MUL branch above firing past one token.
-    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_UNARY &&
-        ops.begin()[2] == GGML_OP_MUL && unary_ops.size() == 1) {
-        const ggml_tensor * add   = cgraph->nodes[node_idx];
-        const ggml_tensor * unary = cgraph->nodes[node_idx + 1];
-        const ggml_tensor * mul   = cgraph->nodes[node_idx + 2];
-
-        const ggml_unary_op unary_op = ggml_get_unary_op(unary);
-        if (unary_op != unary_ops.begin()[0]) {
-            return false;
-        }
-
-        if (!ggml_sycl_fused_unary_has_kernel(unary_op)) {
-            return false;
-        }
-
-        // ggml_can_fuse() has already pinned the chain: unary consumes add, mul consumes
-        // unary, add and unary have one use each, and all three have the same shape
-        const ggml_tensor * a     = add->src[0];
-        const ggml_tensor * bias  = add->src[1];
-        const ggml_tensor * scale = (mul->src[0] == unary) ? mul->src[1] : mul->src[0];
-
-        if (a->type != GGML_TYPE_F32 || bias->type != GGML_TYPE_F32 ||
-            scale->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
-            return false;
-        }
-
-        // the activation and the destination are indexed flat
-        if (!ggml_is_contiguous(a) || !ggml_is_contiguous(mul) || !ggml_are_same_shape(a, mul)) {
-            return false;
-        }
-
-        // the kernel reads the bias and the scale as v[col], so each must be a single
-        // contiguous row spanning ne0
-        if (bias->ne[0] != a->ne[0] || scale->ne[0] != a->ne[0] ||
-            ggml_nrows(bias) != 1 || ggml_nrows(scale) != 1 ||
-            !ggml_is_contiguous(bias) || !ggml_is_contiguous(scale)) {
-            return false;
-        }
-
-        // the 32-bit fastdiv is inexact past 2^31; decline, the unfused path handles it
-        if (ggml_nelements(mul) >= ((int64_t) 1 << 31)) {
-            return false;
-        }
-
-        return true;
-    }
-
-    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_ADD &&
-        ops.begin()[2] == GGML_OP_UNARY && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU) {
-        const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
-        const ggml_tensor * add      = cgraph->nodes[node_idx + 1];
-        const ggml_tensor * silu     = cgraph->nodes[node_idx + 2];
-
-        if (ggml_get_unary_op(silu) != unary_ops.begin()[0]) {
-            return false;
-        }
-        if (ssm_conv->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || silu->type != GGML_TYPE_F32) {
-            return false;
-        }
-        // the fused kernel writes the SiLU output with dense strides, so it must be contiguous
-        if (!ggml_is_contiguous(silu)) {
-            return false;
-        }
-
-        // ADD must consume ssm_conv's output and broadcast a 1-D channel-wise bias
-        const ggml_tensor * bias = (add->src[0] == ssm_conv) ? add->src[1] : add->src[0];
-        if (bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias)) {
-            return false;
-        }
-        if (ggml_nelements(bias) != ssm_conv->ne[0] || bias->ne[0] != ssm_conv->ne[0]) {
-            return false;
-        }
-
-        return true;
-    }
 
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_SCALE) {
         const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
@@ -369,5 +296,77 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
         }
         return true;
     }
+
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL &&
+        unary_ops.size() == 1 &&
+        (unary_ops.begin()[0] == GGML_UNARY_OP_SILU || unary_ops.begin()[0] == GGML_UNARY_OP_SIGMOID ||
+         unary_ops.begin()[0] == GGML_UNARY_OP_SOFTPLUS)) {
+        const ggml_tensor * unary = cgraph->nodes[node_idx];
+        const ggml_tensor * mul   = cgraph->nodes[node_idx + 1];
+
+        if (ggml_get_unary_op(unary) != unary_ops.begin()[0]) {
+            return false;
+        }
+        if (unary->type != GGML_TYPE_F32 && unary->type != GGML_TYPE_F16) {
+            return false;
+        }
+        if (unary->type != mul->type) {
+            return false;
+        }
+
+        const ggml_tensor * other = (mul->src[0] == unary) ? mul->src[1] : mul->src[0];
+        if (other->type != unary->type) {
+            return false;
+        }
+        // fused kernel indexes all three tensors flat: require full contiguity
+        if (!ggml_is_contiguous(other) || !ggml_is_contiguous(unary->src[0]) ||
+            !ggml_are_same_shape(other, unary)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    // add(bias) + unary + mul(scale): the delta-net alpha-gate softplus(alpha+dt)*a.
+    // Linear chain, but bias and scale are ne0 vectors broadcast over the outer dims,
+    // which stops the same-shape unary+mul fusion firing once n_tokens>1 (MTP verify).
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_UNARY &&
+        ops.begin()[2] == GGML_OP_MUL && unary_ops.size() == 1 &&
+        (unary_ops.begin()[0] == GGML_UNARY_OP_SILU || unary_ops.begin()[0] == GGML_UNARY_OP_SIGMOID ||
+         unary_ops.begin()[0] == GGML_UNARY_OP_SOFTPLUS)) {
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
+            return false;
+        }
+        const ggml_tensor * add   = cgraph->nodes[node_idx];
+        const ggml_tensor * unary = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * mul   = cgraph->nodes[node_idx + 2];
+
+        if (ggml_get_unary_op(unary) != unary_ops.begin()[0]) {
+            return false;
+        }
+        // strict linear chain: unary consumes add, mul consumes unary
+        if (unary->src[0] != add || (mul->src[0] != unary && mul->src[1] != unary)) {
+            return false;
+        }
+        const ggml_tensor * a     = add->src[0];
+        const ggml_tensor * bias  = add->src[1];
+        const ggml_tensor * scale = (mul->src[0] == unary) ? mul->src[1] : mul->src[0];
+        if (a->type != GGML_TYPE_F32 || bias->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 ||
+            mul->type != GGML_TYPE_F32) {
+            return false;
+        }
+        // full activation contiguous, output same shape; bias/scale are ne0 vectors
+        // broadcast over the outer dims (a single contiguous row each)
+        if (!ggml_is_contiguous(a) || !ggml_is_contiguous(mul) || !ggml_are_same_shape(a, mul)) {
+            return false;
+        }
+        if (bias->ne[0] != a->ne[0] || scale->ne[0] != a->ne[0] ||
+            ggml_nrows(bias) != 1 || ggml_nrows(scale) != 1 ||
+            !ggml_is_contiguous(bias) || !ggml_is_contiguous(scale)) {
+            return false;
+        }
+        return true;
+    }
+
     return false;
 }

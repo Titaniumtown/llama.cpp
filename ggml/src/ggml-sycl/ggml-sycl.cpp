@@ -3238,6 +3238,112 @@ bool ggml_sycl_prof_active();
 // `weight` only names the row; passing nullptr keeps the single aggregate row.
 void ggml_sycl_prof_mark_gap(const ggml_tensor * weight = nullptr);
 
+// 0 disables the src1 f16 conversion cache, restoring a fresh conversion per matmul.
+static inline bool ggml_sycl_src1_cache_enabled() {
+    static const int e = ggml_sycl_get_env("GGML_SYCL_SRC1_CACHE", 1);
+    return e != 0;
+}
+
+static inline bool src1_f16_overlaps(const ggml_backend_sycl_context & ctx, const void * p, size_t bytes) {
+    const char * a0 = (const char *) p;
+    const char * a1 = a0 + bytes;
+    const char * b0 = (const char *) ctx.src1_f16.key;
+    const char * b1 = b0 + ctx.src1_f16.ne * sizeof(float);
+    return a0 < b1 && b0 < a1;
+}
+
+// Hit only when the same slice was converted earlier in THIS graph and no node between
+// then and now writes over it. The walk is over graph nodes, which is a superset of what
+// executed, so a fused path that skipped nodes cannot hide a write. Bounded because a
+// distant reuse is not worth the scan; the bound covers the delta-net replay graph, whose
+// pending-input gathers put ssm_beta 68 nodes after the attn_norm that stores its src1.
+static constexpr int src1_cache_max_dist = 128;
+
+static sycl::half * src1_f16_lookup(ggml_backend_sycl_context & ctx, const void * key,
+                                    const void * strm, size_t ne) {
+    auto & c = ctx.src1_f16;
+    if (!c.buf || c.key != key || c.stream != strm || c.ne != ne) { return nullptr; }
+    if (ctx.cur_graph == nullptr || c.graph != ctx.cur_graph)     { return nullptr; }
+    if (ctx.cur_node < c.node || ctx.cur_node - c.node > src1_cache_max_dist) { return nullptr; }
+    for (int j = c.node + 1; j <= ctx.cur_node; ++j) {
+        const ggml_tensor * n = ctx.cur_graph->nodes[j];
+        if (n->data != nullptr && src1_f16_overlaps(ctx, n->data, ggml_nbytes(n))) {
+            return nullptr;
+        }
+    }
+    return c.buf->get();
+}
+
+static sycl::half * src1_f16_store(ggml_backend_sycl_context & ctx, const void * key,
+                                   const void * strm, size_t ne) {
+    auto & c = ctx.src1_f16;
+    c.buf = std::make_unique<ggml_sycl_pool_alloc<sycl::half>>(ctx.src1_pool());
+    c.buf->alloc(ne);
+    c.graph  = ctx.cur_graph;
+    c.key    = key;
+    c.stream = strm;
+    c.ne     = ne;
+    c.node   = ctx.cur_node;
+    return c.buf->get();
+}
+
+// 0 disables the src1 q8_1 quantize cache, restoring a fresh quantize per mat-vec.
+static inline bool ggml_sycl_src1_q8_cache_enabled() {
+    static const int e = ggml_sycl_get_env("GGML_SYCL_SRC1_Q8_CACHE", 1);
+    return e != 0;
+}
+
+static inline bool src1_q8_overlaps(const ggml_backend_sycl_context & ctx, const void * p, size_t bytes) {
+    if (ctx.src1_q8.key == nullptr || p == nullptr) { return false; }
+    const char * b0 = (const char *) ctx.src1_q8.key;
+    const char * b1 = b0 + ctx.src1_q8.src_ne * sizeof(float);
+    const char * p0 = (const char *) p;
+    return p0 < b1 && b0 < p0 + bytes;
+}
+
+// Same validity argument as src1_f16_lookup, and deliberately the same shape so the two cannot
+// drift: a hit requires the identical source pointer, stream, size and quantize LAYOUT, the same
+// graph, a bounded node distance, and -- the part that actually makes it safe -- that no node
+// between the store and here writes over the source range. ggml's allocator reuses buffers, so
+// the pointer alone proves nothing.
+//
+// The graph-pointer check is load-bearing ONLY in combination with the per-graph reset in
+// ggml_backend_sycl_graph_compute_impl. ggml recycles the cgraph allocation, so a later graph can
+// legitimately carry the same address; and in a single-node graph cur_node == c.node, which makes
+// the overlap walk below run ZERO iterations. Both conditions hold in test-backend-ops, which is
+// how the un-reset version of this cache served one op's activation to the next op entirely.
+static char * src1_q8_lookup(ggml_backend_sycl_context & ctx, const void * key, const void * strm,
+                             size_t bytes, size_t src_ne, int variant) {
+    auto & c = ctx.src1_q8;
+    if (!c.buf || c.key != key || c.stream != strm)           { return nullptr; }
+    if (c.bytes != bytes || c.src_ne != src_ne)               { return nullptr; }
+    if (c.variant != variant)                                 { return nullptr; }
+    if (ctx.cur_graph == nullptr || c.graph != ctx.cur_graph) { return nullptr; }
+    if (ctx.cur_node < c.node || ctx.cur_node - c.node > src1_cache_max_dist) { return nullptr; }
+    for (int j = c.node + 1; j <= ctx.cur_node; ++j) {
+        const ggml_tensor * n = ctx.cur_graph->nodes[j];
+        if (n->data != nullptr && src1_q8_overlaps(ctx, n->data, ggml_nbytes(n))) {
+            return nullptr;
+        }
+    }
+    return c.buf->get();
+}
+
+static char * src1_q8_store(ggml_backend_sycl_context & ctx, const void * key, const void * strm,
+                            size_t bytes, size_t src_ne, int variant) {
+    auto & c = ctx.src1_q8;
+    c.buf = std::make_unique<ggml_sycl_pool_alloc<char>>(ctx.src1q_pool());
+    c.buf->alloc(bytes);
+    c.graph   = ctx.cur_graph;
+    c.key     = key;
+    c.stream  = strm;
+    c.bytes   = bytes;
+    c.src_ne  = src_ne;
+    c.variant = variant;
+    c.node    = ctx.cur_node;
+    return c.buf->get();
+}
+
 inline void ggml_sycl_op_mul_mat_sycl(
     ggml_backend_sycl_context & ctx,
     const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
@@ -3315,21 +3421,6 @@ inline void ggml_sycl_op_mul_mat_sycl(
     use_fp16 = use_fp16 && ggml_sycl_src1_f16_ok(dst);
     if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && use_fp16 && ggml_is_contiguous(src0) &&
         row_diff == src0->ne[1] && ggml_prec_get_acc(dst) == GGML_PREC_UNDEFINED) {
-        ggml_sycl_pool_alloc<sycl::half> src1_as_f16(ctx.pool());
-        if (src1->type != GGML_TYPE_F16) {
-            scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_sycl", dst, /*num_src=*/2,
-                                                 " : converting src1 to fp16");
-            const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src1->type, dst);
-            GGML_ASSERT(to_fp16_sycl != nullptr);
-            size_t ne = src1_ncols*ne10;
-            src1_as_f16.alloc(ne);
-            to_fp16_sycl(src1_ddf_i, src1_as_f16.get(), ne, stream);
-            ggml_sycl_prof_mark_sub("CONVERT/src1/f32->f16",
-                                    ne * (sizeof(float) + sizeof(sycl::half)));
-        }
-        const sycl::half *src1_ptr = src1->type == GGML_TYPE_F16
-                ? (const sycl::half *)src1_ddf_i
-                : src1_as_f16.get();
 
         ggml_sycl_pool_alloc<sycl::half> src0_as_f16(ctx.pool());
         if (src0->type != GGML_TYPE_F16) {
@@ -3355,6 +3446,40 @@ inline void ggml_sycl_op_mul_mat_sycl(
                                          ? (const sycl::half *)src0_dd_i
                                          : src0_as_f16.get();
 
+        ggml_sycl_pool_alloc<sycl::half> src1_as_f16(ctx.pool());
+        const sycl::half * src1_ptr = nullptr;
+        if (src1->type == GGML_TYPE_F16) {
+            src1_ptr = (const sycl::half *) src1_ddf_i;
+        } else {
+            const size_t ne    = src1_ncols * ne10;
+            // only the node's own src1 can be cached: a non-contiguous src1's pool copy and
+            // MUL_MAT_ID's per-expert rows live in buffers the overlap walk cannot see
+            const bool   cache = ggml_sycl_src1_cache_enabled() && ctx.cur_graph != nullptr &&
+                                 ctx.cur_graph->nodes[ctx.cur_node] == dst &&
+                                 (const char *) src1_ddf_i >= (const char *) src1->data &&
+                                 (const char *) (src1_ddf_i + ne) <= (const char *) src1->data + ggml_nbytes(src1);
+            sycl::half * hit   = cache ? src1_f16_lookup(ctx, src1_ddf_i, (const void *) stream, ne)
+                                       : nullptr;
+            if (hit != nullptr) {
+                src1_ptr = hit;
+            } else {
+                scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_sycl", dst, /*num_src=*/2,
+                                                     " : converting src1 to fp16");
+                const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src1->type, dst);
+                GGML_ASSERT(to_fp16_sycl != nullptr);
+                sycl::half * out;
+                if (cache) {
+                    out = src1_f16_store(ctx, src1_ddf_i, (const void *) stream, ne);
+                } else {
+                    src1_as_f16.alloc(ne);
+                    out = src1_as_f16.get();
+                }
+                to_fp16_sycl(src1_ddf_i, out, ne, stream);
+                ggml_sycl_prof_mark_sub("CONVERT/src1/f32->f16",
+                                        ne * (sizeof(float) + sizeof(sycl::half)));
+                src1_ptr = out;
+            }
+        }
 #if GGML_SYCL_DNNL
         if (g_ggml_sycl_enable_dnn && ggml_sycl_dnnl_has_optimized_gemm(ggml_sycl_get_device())) {
                 DnnlGemmWrapper::row_gemm(ctx,row_diff, src1_ncols , ne10, src0_ptr,
@@ -3813,7 +3938,39 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
         }
 
         if constexpr(quantize_enabled) {
-            dev[i].src1_ddq = dev[i].src1_ddq_alloc.alloc(ctx.pool(i), nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs);
+            const size_t ddq_bytes = (size_t) nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs;
+            // The two functors write different layouts into this buffer; tag which one did, so a
+            // reordered-SoA buffer can never be handed to a consumer expecting the plain one.
+            const int  qvariant  = std::is_same<quantize_f<QK8_1 / WARP_SIZE>,
+                                                quantize_and_reorder_q8_1_soa<QK8_1 / WARP_SIZE>>::value ? 1 : 0;
+            // MUL_MAT_ID's per-expert rows live in pool buffers the overlap walk cannot see
+            const bool cacheable = src1_on_device && src1_is_contiguous && !split
+                                   && ctx.cur_graph != nullptr && ctx.cur_graph->nodes[ctx.cur_node] == dst
+                                   && ggml_sycl_src1_q8_cache_enabled();
+            char * qhit = cacheable ? src1_q8_lookup(ctx, dev[i].src1_ddf, (const void *) stream,
+                                                     ddq_bytes, (size_t) ggml_nelements(src1), qvariant)
+                                    : nullptr;
+            if (qhit != nullptr) {
+                dev[i].src1_ddq = qhit;
+                // A hit submits nothing, so without a barrier here the next mark is the
+                // GEMV's and this MUL_MAT row bills every microsecond since the PREVIOUS
+                // op's mark -- all of this call's host setup plus the GPU idle behind it.
+                // That is precisely what mark_gap() exists to prevent, and the miss branch
+                // below has always had it.
+                //
+                // Caching src1 therefore silently split the mat-vecs into two populations
+                // measured on different bases: a first consumer of an activation misses and
+                // is billed for its kernel, every later consumer hits and is billed for its
+                // kernel plus the gap. They are then compared with each other, in this file
+                // and in the patch series' notes, as though the numbers meant the same thing.
+                // `qhit` implies `cacheable`, which already required src1 on-device and
+                // contiguous, so this matches the miss branch's guard exactly.
+                ggml_sycl_prof_mark_gap(src0);
+            } else {
+            dev[i].src1_ddq = cacheable
+                ? src1_q8_store(ctx, dev[i].src1_ddf, (const void *) stream, ddq_bytes,
+                                (size_t) ggml_nelements(src1), qvariant)
+                : dev[i].src1_ddq_alloc.alloc(ctx.pool(i), ddq_bytes);
 
             if (src1_on_device && src1_is_contiguous) {
                 // Bracket the submit so the row below measures this kernel and not the
@@ -3835,6 +3992,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                 ggml_sycl_prof_mark_sub("QUANTIZE/src1/f32->q8_1",
                                         (uint64_t) nrows1 * ne10 * sizeof(float)
                                             + (uint64_t) nrows1 * src1_padded_col_size * q8_1_ts / q8_1_bs);
+            }
             }
         }
 
@@ -7444,14 +7602,20 @@ void ggml_sycl_prof_mark_gap(const ggml_tensor * weight) {
 }
 
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
+    ggml_sycl_set_main_device(sycl_ctx->device);
+    // A tensor's bytes can be written between graphs (ggml_backend_tensor_set), and buffer
+    // addresses are reused across graphs, so nothing survives the boundary.
+    sycl_ctx->src1_f16_reset();
+    sycl_ctx->src1_q8_reset();
+    sycl_ctx->cur_graph = cgraph;
     ggml_sycl_conv_window_match conv_window;
     ggml_sycl_op_prof prof;
     prof.begin(sycl_ctx->stream());
-
     prof.mark_cheap("HOST/kv-reorder-census", 0);
     prof.mark_cheap("HOST/elide-f32-census", 0);
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        sycl_ctx->cur_node = i;
         if (ggml_sycl_is_view_or_noop(node)) {
             continue;
         }

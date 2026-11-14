@@ -436,6 +436,17 @@ void ggml_backend_sycl_print_sycl_devices() {
     }
 
     print_device_opt_feature(device_count);
+    // A build that announces ITSELF. The device table prints normally from a
+    // binary that is not provably this one, so it cannot tell builds apart.
+    //
+    // This line is unique to this build and prints UNCONDITIONALLY, so it cannot
+    // be folded away and cannot be absent unless a different binary ran. It is
+    // the only instrument in this series that has ever been SEEN to fire.
+    //
+    //   absent  -> a different binary ran; every measurement taken against it is
+    //              measuring the wrong artefact.
+    //   present -> this binary ran.
+    GGML_LOG_INFO("[BUILD-ID] llamacpp-0318-build-identity\n");
 }
 
 static const char* dev2dev_int2str(int dev2dev) {

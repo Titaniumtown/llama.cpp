@@ -65,6 +65,11 @@ void ggml_sycl_op_timestep_embedding(ggml_backend_sycl_context & ctx, ggml_tenso
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    // the kernel walks src0_d[0 .. ne[0]) flat, so unit stride is assumed.
+    // ggml_timestep_embedding constrains nothing, but the CPU reference
+    // asserts exactly this (ggml-cpu/ops.cpp:8430), so a strided src0 is
+    // valid to ggml and wrong here.
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
 
     const int dim = dst->op_params[0];
     const int max_period = dst->op_params[1];

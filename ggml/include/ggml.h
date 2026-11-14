@@ -1322,6 +1322,30 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    // Ask the backend to compute only the first `n` rows of the result.
+    //
+    // The only guarantee this makes is negative, and it holds on every backend: a
+    // backend that does not implement the hint computes every row exactly, so ignoring
+    // it is never wrong, only slower. That is what makes it safe to set unconditionally
+    // in a graph that may run anywhere. The bit lives in op_params slot 2 (slot 0 is
+    // ggml_prec_set_acc, slot 1 is GGML_HINT_SRC0_IS_HADAMARD).
+    //
+    // What the result LOOKS like is a SYCL-lane behaviour, not this API's contract.
+    // Exactly one implementation reads the limit today -- the SYCL q6_K reorder MMVQ
+    // kernel -- and it is the only thing in the tree that writes the tail, filling
+    // rows [n, a->ne[1]) with -INFINITY. Every other backend, and every other SYCL
+    // quant type, computes the full result and writes no tail. So on those this call
+    // is a no-op and the graph's logits are unshortlisted; a caller that depends on
+    // the tail for correctness, rather than for speed, depends on the SYCL q6_K lane.
+    //
+    // Where the tail is written it is meaningful only because the result is a logit
+    // vector read by a sampler: -INFINITY then means "this token cannot be chosen" and
+    // contributes exactly zero after a softmax. That is a vocabulary shortlist, and it
+    // is why the omitted rows are unobservable rather than merely unlikely.
+    //
+    // n <= 0, or n >= a->ne[0], disables it.
+    GGML_API void    ggml_mul_mat_set_row_limit(struct ggml_tensor * a, int32_t n);
+    GGML_API int32_t ggml_mul_mat_get_row_limit(const struct ggml_tensor * a);
     // change the hint of a matrix multiplication
     GGML_API void ggml_mul_mat_set_hint(
             struct ggml_tensor * a,

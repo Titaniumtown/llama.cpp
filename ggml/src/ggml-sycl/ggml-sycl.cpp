@@ -5545,6 +5545,23 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         use_dequantize_mul_mat_vec = use_dequantize_mul_mat_vec && use;
     }
 
+    // A row-limited mat-mul takes the MMVQ path, because that is where the limit is
+    // implemented: ggml_mul_mat_get_row_limit bounds mul_mat_vec_q6_K_reorder_wide_ncols
+    // and fills rows [n, dst->ne[1]) with -INFINITY. Without this, an ncols==1 call
+    // on an already-reordered tensor prefers the ESIMD/DMMV branch above and reads the
+    // full head -- which is exactly how the MTP draft head read all 1.043 GB per
+    // draft step while the shortlist was "on".
+    //
+    // The test cannot see the quant type, so read it as a q6_K-lane statement: on a head
+    // quant with no q6_K reorder MMVQ nothing implements the limit at all, this test
+    // still fires, and its whole effect is to trade the DMMV path for the MMVQ path --
+    // both of which then read every row. The shortlist is a q6_K kernel behaviour, not
+    // a graph property; a different head quant is a different story and this predicate
+    // is the reason it is not.
+    if (use_mul_mat_vec_q && ggml_mul_mat_get_row_limit(dst) > 0) {
+        use_dequantize_mul_mat_vec = false;
+    }
+
     if (!split && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1) {
         // TODO: Refactor and cleanup of mul mat dispatching.
         if (src0->ne[3] == 1 && src1->ne[3] == 1) {
@@ -7241,7 +7258,9 @@ struct ggml_sycl_op_prof {
         if (node->op == GGML_OP_MUL_MAT_ID) {
             return ggml_nbytes(w);
         }
-        return ggml_row_size(w->type, w->ne[0]) * (uint64_t) w->ne[1];
+        const int32_t limit = ggml_mul_mat_get_row_limit(node);
+        const int64_t rows = (limit > 0) ? std::min<int64_t>(limit, w->ne[1]) : w->ne[1];
+        return ggml_row_size(w->type, w->ne[0]) * (uint64_t) rows;
     }
 
     // Bytes this node is expected to move. For a matmul in decode the weight dwarfs

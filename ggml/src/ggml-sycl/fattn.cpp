@@ -135,9 +135,18 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // XMX-accelerated path: oneDNN SDPA (native F16 and dequant+non-F16).
-    // ONEDNN requires min 32 query tokens — short-circuit decode to avoid
-    // calling _supported() on every decode FA call.
-    if (Q->ne[1] >= 32 && !ggml_sycl_flash_attn_ext_onednn_failed(device)
+    // The query-width floor is the predicate's own (GGML_SYCL_FA_ONEDNN_MIN_Q, resolved
+    // and clamped once in fattn-onednn.cpp and applied by its single width gate, which
+    // covers both KV branches). It used to be re-typed here as a bare 32 in front of the
+    // call. That copy is dropped, not re-typed, because it was a second copy of a
+    // decision the predicate already makes: the predicate has exactly one `return true`
+    // and the min_q gate precedes it, so supported() == true implies Q->ne[1] >= min_q
+    // by construction. Re-typing it here would also force this file to track a value
+    // that can now be set from the environment at runtime -- which is exactly how the
+    // two copies came to disagree. The only cost is one extra pure-host predicate
+    // evaluation for shapes that return NONE before the second call below (unsupported
+    // head_dim, mixed K/V type, mask->ne[2] != 1, and the implicit-causal abort).
+    if (!ggml_sycl_flash_attn_ext_onednn_failed(device)
         && ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
         return BEST_FATTN_KERNEL_ONEDNN;
     }
@@ -311,12 +320,21 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
         fa_call_seq++;
         int64_t cur_nkv = K_dbg->ne[1];
         int Dk = (int)K_dbg->ne[0];
-        const char * kname = "TILE";
+        // Every enum value must be named here. NONE fell through to the "TILE"
+        // initialiser, so a declined dispatch was reported as a TILE one and this
+        // diagnostic could not answer the question it exists for: which path ran.
+        // A switch with no default also makes -Wswitch catch the next enum value
+        // added upstream, which an if-chain silently mislabels.
         best_fattn_kernel k = ggml_sycl_get_best_fattn_kernel(ctx.device, dst);
-        if (k == BEST_FATTN_KERNEL_MKL)  kname = "MKL";
-        if (k == BEST_FATTN_KERNEL_ONEDNN)  kname = "ONEDNN";
-        if (k == BEST_FATTN_KERNEL_VEC)  kname = "VEC";
-        if (k == BEST_FATTN_KERNEL_DPAS) kname = "DPAS";
+        const char * kname = "?";
+        switch (k) {
+            case BEST_FATTN_KERNEL_NONE:   kname = "NONE";   break;
+            case BEST_FATTN_KERNEL_VEC:    kname = "VEC";    break;
+            case BEST_FATTN_KERNEL_ONEDNN: kname = "ONEDNN"; break;
+            case BEST_FATTN_KERNEL_TILE:   kname = "TILE";   break;
+            case BEST_FATTN_KERNEL_MKL:    kname = "MKL";    break;
+            case BEST_FATTN_KERNEL_DPAS:   kname = "DPAS";   break;
+        }
         int64_t delta = 0;
         if (Dk == 256) {
             delta = cur_nkv - last_nkv_d256;
@@ -325,9 +343,12 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
             delta = cur_nkv - last_nkv_d512;
             last_nkv_d512 = cur_nkv;
         }
-        GGML_LOG_INFO("[FA-DISP] #%d %s D=%d n_kv=%lld delta=%lld "
+        // n_q is Q->ne[1]: the quantity BEST_FATTN_KERNEL_ONEDNN is gated on, so the line
+        // has to carry it for the log to explain its own verdict.
+        GGML_LOG_INFO("[FA-DISP] #%d %s D=%d n_q=%lld n_kv=%lld delta=%lld "
                 "V_ne1=%lld\n",
                 fa_call_seq, kname, Dk,
+                (long long)dst->src[0]->ne[1],
                 (long long)cur_nkv, (long long)delta,
                 (long long)V_dbg->ne[1]);
     }

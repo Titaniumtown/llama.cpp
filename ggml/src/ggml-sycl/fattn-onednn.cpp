@@ -12,8 +12,44 @@
 #include "fattn-tile.hpp"
 #include "convert.hpp"
 
-// set minimum query length to treat as prefill (32)
-#define GGML_SYCL_FA_ONEDNN_MIN_Q 32
+// Minimum query length treated as prefill. 32 is the historical default and is kept, and
+// it stays an INHERITANCE, not a result: the gate that admits oneDNN IS this floor, so
+// at decode width (n_q = 1, or 1 + draft = 5 with --spec-draft-n-max 4) the predicate
+// is false before anything else is consulted and no oneDNN-at-decode number exists or
+// can. What 32 WAS is a value the shipped knob could not move at all: both width gates
+// of ggml_sycl_flash_attn_ext_onednn_supported() carried their own copy of it, and the
+// dequant branch's `Q->ne[1] < 32` returned before this read was ever reached, so a
+// GGML_SYCL_FA_ONEDNN_MIN_Q sweep could not touch quantised KV. Resolved once below.
+#define GGML_SYCL_FA_ONEDNN_MIN_Q_DEFAULT 32
+
+// [[maybe_unused]] because this file-static sits ABOVE the `#if !GGML_SYCL_DNNL` split,
+// so a GGML_SYCL_DNNL=0 build compiles it with no caller at all. The build-wide
+// -Wno-unused-function is not a substitute: it lives inside `if (GGML_ALL_WARNINGS)`
+// (ggml/src/CMakeLists.txt:37-39) and the campaign sets no warning options, so the
+// suppression is not in effect under the campaign's own build. The attribute is what
+// makes this clean under any warning configuration, not just the one that sets the flag.
+[[maybe_unused]] static int ggml_sycl_fa_onednn_min_q() {
+    static const int min_q = [] () {
+        const int v = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_MIN_Q",
+                                        GGML_SYCL_FA_ONEDNN_MIN_Q_DEFAULT);
+        // ggml_sycl_get_env parses " %u" into an unsigned and returns (int) n, so
+        // strtoul semantics apply at both ends: a leading sign is accepted (MIN_Q=-1)
+        // and anything >= 2^31 wraps (MIN_Q=4294967295 -> -1). Either way min_q comes
+        // back negative, `Q->ne[1] < min_q` becomes vacuously false at BOTH width gates,
+        // and the floor this knob exists to expose is silently deleted -- oneDNN is then
+        // selected at every query width on quantised KV, with nothing logged. The
+        // parser's bounds do not protect its callers, so the clamp is done here: a
+        // minimum has domain [0, +inf), and a value outside it is a typo, not a setting.
+        const int resolved = v >= 0 ? v : GGML_SYCL_FA_ONEDNN_MIN_Q_DEFAULT;
+        // Reported once per process, on the first FA dispatch, in the two-space
+        // "  GGML_SYCL_<NAME>: <n>" form every knob echo in this backend already uses
+        // (the adjacent FA_ONEDNN_MAX_KV one, in ggml_check_sycl() at ggml-sycl.cpp:495).
+        GGML_LOG_INFO("  GGML_SYCL_FA_ONEDNN_MIN_Q: %d%s\n", resolved,
+                      resolved != v ? " (rejected: outside [0, INT_MAX), using the default)" : "");
+        return resolved;
+    } ();
+    return min_q;
+}
 
 bool ggml_sycl_fattn_onednn_binds_kv(const ggml_tensor * K, const ggml_tensor * V) {
     if (K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16) {
@@ -59,6 +95,9 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
 
+    // One resolution of the query-width floor, read once, ahead of every width gate.
+    const int min_q = ggml_sycl_fa_onednn_min_q();
+
     // F16 KV: native SDPA at any KV length.
     // Non-F16: dequant to F16 then SDPA at prefill lengths. Only the
     // standard quantized KV cache types (Q4_0-Q8_0) and F32 are accepted
@@ -75,7 +114,12 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
         if (!k_ok || !v_ok) {
             return false;
         }
-        if (use_shape_limit && (Q->ne[1] < 32 || K->ne[1] < 1024)) {
+        // The KV-depth floor of 1024 is a separate, un-knobbed threshold and is
+        // deliberately left alone here. Query width is NOT re-tested here either: this
+        // branch's shape limit is depth only, and the single `Q->ne[1] < min_q` gate in
+        // the common tail below covers BOTH branches. Testing the same floor at two
+        // sites is the drift this patch exists to remove, not a second safety net.
+        if (use_shape_limit && K->ne[1] < 1024) {
             return false;
         }
         for (const ggml_tensor * t : {K, V}) {
@@ -116,8 +160,13 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
     if (K->ne[2] == 0 || Q->ne[2] % K->ne[2] != 0) {
         return false;
     }
-    // Prefill only.
-    if (use_shape_limit && Q->ne[1] < GGML_SYCL_FA_ONEDNN_MIN_Q) {
+    // Prefill only -- the ONE place the query-width floor is applied, for the dequant
+    // branch above as well as the native-F16 one. The two branches used to answer one
+    // env knob with two literals (this one and the dequant branch's own `Q->ne[1] < 32`),
+    // so only the F16 half of any sweep could move. Since this gate precedes the
+    // predicate's only `return true`, `_supported() == true` implies Q->ne[1] >= min_q
+    // by construction -- which is what lets fattn.cpp drop its copy of the floor.
+    if (use_shape_limit && Q->ne[1] < min_q) {
         return false;
     }
     return true;

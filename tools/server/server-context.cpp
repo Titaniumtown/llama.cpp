@@ -277,6 +277,35 @@ struct server_batch {
     }
 };
 
+static bool task_can_split(const server_task & task, llama_context * ctx_tgt) {
+    // a decision over a non-causal context reads the whole prompt in one batch
+    if (task.type == SERVER_TASK_TYPE_DECISION && !llama_get_causal_attn(ctx_tgt)) {
+        return false;
+    }
+    // MTP supports splitting - uses task.need_embd() not need_embd()
+    if (!task.need_embd()) {
+        return true;
+    }
+    // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
+    if (!llama_get_memory(ctx_tgt)) {
+        return false;
+    }
+    // context can be chunked/split if the pooling type is LAST
+    const auto pooling = llama_pooling_type(ctx_tgt);
+    if (pooling == LLAMA_POOLING_TYPE_LAST) {
+        return true;
+    }
+    // causal rerankers read the last token and have a KV cache, so they can also be chunked/split.
+    if (pooling == LLAMA_POOLING_TYPE_RANK && llama_get_causal_attn(ctx_tgt)) {
+        return true;
+    }
+    // a decision task reads its outputs from the last batch
+    if (task.type == SERVER_TASK_TYPE_DECISION) {
+        return true;
+    }
+    return false;
+}
+
 struct server_slot {
     int id;
 
@@ -563,32 +592,7 @@ struct server_slot {
 
     bool can_split() const {
         GGML_ASSERT(task);
-        // a decision over a non-causal context reads the whole prompt in one batch
-        if (task->type == SERVER_TASK_TYPE_DECISION && !llama_get_causal_attn(ctx_tgt)) {
-            return false;
-        }
-        // MTP supports splitting - uses task->need_embd() not need_embd()
-        if (!task->need_embd()) {
-            return true;
-        }
-        // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
-        if (!llama_get_memory(ctx_tgt)) {
-            return false;
-        }
-        // context can be chunked/split if the pooling type is LAST
-        const auto pooling = llama_pooling_type(ctx_tgt);
-        if (pooling == LLAMA_POOLING_TYPE_LAST) {
-            return true;
-        }
-        // causal rerankers read the last token and have a KV cache, so they can also be chunked/split.
-        if (pooling == LLAMA_POOLING_TYPE_RANK && llama_get_causal_attn(ctx_tgt)) {
-            return true;
-        }
-        // a decision task reads its outputs from the last batch
-        if (task->type == SERVER_TASK_TYPE_DECISION) {
-            return true;
-        }
-        return false;
+        return task_can_split(*task, ctx_tgt);
     }
 
     bool can_batch_with(server_slot & other_slot) const {
@@ -4224,6 +4228,14 @@ private:
                     // a read this task waited for is taken whatever the pick keeps of the slot
                     if (slot && read_ready && !task.is_stateless()) {
                         plan.update_cache = true;
+                    }
+
+                    // a task that cannot fit the slot's context is rejected when the prompt starts;
+                    // do not save the slot's state and load a match into it for a request that never
+                    // runs (in production 8 of 15 oversize requests spilled a conversation to disk first)
+                    if (task_can_split(task, ctx_tgt) ? task.n_tokens() >= n_ctx_slot()
+                                                      : task.n_tokens() > llama_n_ubatch(ctx_tgt) || task.n_tokens() > n_ctx_slot()) {
+                        plan.update_cache = false;
                     }
 
                     //

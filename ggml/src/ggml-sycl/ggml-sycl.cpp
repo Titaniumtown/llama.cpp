@@ -10884,6 +10884,15 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         }
         case GGML_OP_POOL_2D:
         case GGML_OP_POOL_1D:
+            // pool2d_nchw_kernel and pool1d_ncw_kernel index src0 with dense
+            // ne-derived strides (src + nc*I_HW, then i_ptr[i*iw + j]) and
+            // never read nb[], while the CPU reference walks src->nb[1] and
+            // src->nb[2] (ggml-cpu/ops.cpp:7705, 7824, 7849). A strided src is
+            // therefore valid input that we misread, not a malformed graph.
+            // Measured: ERR 2.27-3.83 on permuted src, where >1.0 is
+            // uncorrelated output. Decline it so it falls back, the same
+            // treatment ROLL gets.
+            return ggml_is_contiguous(op->src[0]);
         case GGML_OP_ACC:
             return true;
         case GGML_OP_PAD:

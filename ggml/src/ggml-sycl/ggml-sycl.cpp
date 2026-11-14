@@ -5530,21 +5530,25 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
     }
 }
 
-// widest batch mul_mat_vec_q takes for a type as several launches, the widest measured faster than dequantize + GEMM
+// widest batch mul_mat_vec_q takes for a type as several launches, the widest measured faster than dequantize + GEMM;
+// the 16-column kernels move the k-quant and iq4_xs limits
 static int64_t ggml_sycl_mmvq_type_max_cols(ggml_type type) {
+    const bool wide16 = ggml_sycl_mmvq_wide_batch_size() > MMVQ_MAX_BATCH_SIZE;
     switch (type) {
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
             return GGML_SYCL_MMVQ_TYPE_MAX_COLS;
-        case GGML_TYPE_IQ3_S:
-            return 24;
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
-            return 16;
+            return wide16 ? GGML_SYCL_MMVQ_TYPE_MAX_COLS : 16;
+        case GGML_TYPE_Q6_K:
+            return wide16 ? GGML_SYCL_MMVQ_TYPE_MAX_COLS : 14;
+        case GGML_TYPE_IQ3_S:
+            return 24;
+        case GGML_TYPE_IQ4_XS:
+            return wide16 ? 16 : MMVQ_MAX_BATCH_SIZE;
         case GGML_TYPE_IQ4_NL:
             return 15;
-        case GGML_TYPE_Q6_K:
-            return 14;
         default:
             return MMVQ_MAX_BATCH_SIZE;
     }

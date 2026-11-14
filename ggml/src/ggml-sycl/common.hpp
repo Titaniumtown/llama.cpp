@@ -979,6 +979,79 @@ inline bool ggml_sycl_dnnl_has_optimized_gemm(int device) {
 
 int ggml_sycl_get_env(const char *env_name, int default_val);
 
+// Widest SINGLE mat-vec launch. The plain reorder switches for Q4_K/Q5_K/Q6_K also
+// instantiate ncols_dst == 16; every other type, and the GLU-epilogue and glu-fused
+// twins, stop at MMVQ_MAX_BATCH_SIZE.
+//
+// Why 16 is worth its own instantiation: a group's cost is dominated by reading the
+// weight, and one 16-column launch reads it ONCE where two 8-column launches read it
+// twice. Measured per decode step at COLS=32, the cost is exactly linear in the number
+// of groups -- 55.9 / 109.4 / 163.3 / 217.6 ms for 1/2/3/4 groups of 8, i.e. increments
+// of 53.5 / 53.9 / 54.3 -- and the 16.85 GiB weight read alone is 30.2 ms of each 53.9.
+// So halving the group count should remove ~30 ms per pair of groups, while the marginal
+// per-column term (~2.7 ms, itself ~10x its own arithmetic floor) is paid either way.
+//
+// The risk is register pressure: the kernels hold `float partial[ncols_dst]` live across
+// the whole block loop, so 16 columns is 16 accumulators per lane against a 32-float
+// SIMD32 budget. GGML_SYCL_MMVQ_WIDE16=0 backs the whole thing out to groups of 8, which
+// is the A/B control -- one binary, both arms.
+static inline int ggml_sycl_mmvq_wide_batch_size() {
+    static const int on = ggml_sycl_get_env("GGML_SYCL_MMVQ_WIDE16", 1);
+    return on ? 16 : MMVQ_MAX_BATCH_SIZE;
+}
+
+// Which plain reorder switch serves a wide group. One table: the wide path reads the
+// launch width from it and the partial-wide launch reads the kernel from it, so a type
+// that reaches the wide path always reaches the kernel that reads its own layout.
+enum ggml_sycl_mmvq_wide_kind {
+    GGML_SYCL_MMVQ_WIDE_NONE = 0,
+    GGML_SYCL_MMVQ_WIDE_Q4_K,
+    GGML_SYCL_MMVQ_WIDE_Q5_K,
+    GGML_SYCL_MMVQ_WIDE_Q6_K,
+    GGML_SYCL_MMVQ_WIDE_IQ4_XS,
+};
+
+static inline enum ggml_sycl_mmvq_wide_kind ggml_sycl_mmvq_type_wide_kind(enum ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_Q4_K:   return GGML_SYCL_MMVQ_WIDE_Q4_K;
+        case GGML_TYPE_Q5_K:   return GGML_SYCL_MMVQ_WIDE_Q5_K;
+        case GGML_TYPE_Q6_K:   return GGML_SYCL_MMVQ_WIDE_Q6_K;
+        case GGML_TYPE_IQ4_XS: return GGML_SYCL_MMVQ_WIDE_IQ4_XS;
+        default:               return GGML_SYCL_MMVQ_WIDE_NONE;
+    }
+}
+
+// The widest group the type's plain reorder switch is instantiated for. The Q4_K/Q5_K/Q6_K
+// switches carry the 16-column case; the IQ4_XS one carries every width from 9 to 16, so a
+// partial remainder is served by an exact instantiation instead of a 16-wide kernel with a
+// runtime act count.
+static inline int ggml_sycl_mmvq_type_max_group_cols(enum ggml_type t) {
+    return ggml_sycl_mmvq_type_wide_kind(t) == GGML_SYCL_MMVQ_WIDE_NONE
+               ? MMVQ_MAX_BATCH_SIZE
+               : ggml_sycl_mmvq_wide_batch_size();
+}
+
+// Interleaved activation staging for the 16-column reorder mat-vec.
+//
+// The instruction budget put the 16-wide kernels at their source-level floor:
+// ~55 instructions per column for 8 dp4a, the rest being three strided per-lane
+// loads per column (columns sit stride_col_y_bytes ~ 5.7 KB apart, so every column
+// is its own gather with its own address). The fix is a layout, not a rewrite: a
+// tiny repack kernel stages the 16 columns' q8_1 into [block][lane-slot][col]
+// order, which makes a lane's u0||u1 for column c 32 contiguous bytes at
+// col*32, and its (ds0,ds1) pair 8 bytes at col*8. Same bytes, permuted; the
+// column loop's loads become base + small-immediate addresses.
+//
+// Applies to Q4_K/Q5_K plain and SPLIT wide kernels at ncols_dst == 16 only (Q6_K
+// has a different lane map and keeps the strided path). The repack traffic is
+// 16 columns x ~K*9/8 bytes vs the ~nrows x that the kernel reads back -- three
+// orders down. GGML_SYCL_MMVQ_INTERLEAVE=0 restores the strided reads exactly.
+static inline bool ggml_sycl_mmvq_interleave() {
+    static const int on = ggml_sycl_get_env("GGML_SYCL_MMVQ_INTERLEAVE", 1);
+    return on != 0;
+}
+
+
 char * ggml_sycl_src1_q8_store_ext(ggml_backend_sycl_context & ctx, const void * key, const void * strm,
                                    size_t bytes, size_t src_ne, int variant, const ggml_tensor * out,
                                    bool self_reading = false);

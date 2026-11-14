@@ -12664,6 +12664,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1023, n, 4096, { 1, 1 }, { 1, 1 }));
         }
     }
+    // Widths 9..16 are the ones the chunker can serve with a single PARTIAL wide
+    // launch (a 16-column instantiation storing fewer columns) rather than two narrow
+    // groups, so the store loop's `col < ncols_act` bound is what keeps them correct.
+    // Every n in that range is its own ncols_act; n=16 is the full instantiation and
+    // pins the boundary. m=1023 is below the split target, so the K-split twins are
+    // reached too.
+    for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
+        for (int n = 9; n <= 16; ++n) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1023, n, 4096, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 1024, { 1, 1 }, { 1, 1 }));
+        }
+    }
 
     // both sides of the per-type width up to which the SYCL mat-vec splits a batch, short rows and 2D-load rows
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
@@ -14451,6 +14463,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {65, 1, 1, 1}, 2, 10000));
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {65, 1, 1, 1}, 7, 1000));
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {65, 1, 1, 1}, 256, 10000));
+    // production decode mat-vecs: decode (1), one slot's MTP verify (5), the widest single
+    // group (8), the paired verify (10) and a full wide group (16)
+    for (ggml_type type : { GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS }) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
+                 { 17408, 5120 }, { 5120, 17408 }, { 10240, 5120 }, { 6144, 5120 }, { 5120, 6144 } }) {
+            for (int n : { 1, 2, 5, 8, 10, 16 }) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+            }
+        }
+    }
+    for (int n : { 1, 2, 5, 8, 10, 16 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, n, 5120, { 1, 1 }, { 1, 1 }));
+    }
     for (float n : {128.0f, 4096.0f, 32768.0f, 1048576.0f}) {
         test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, n, 1.0f));
     }

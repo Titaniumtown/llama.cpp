@@ -1847,6 +1847,33 @@ private:
         }
     }
 
+    // with a unified KV cache the prompt has to fit next to the sequences already in flight,
+    // otherwise decode() cannot find free cells for it, halves the batch on every chunk and
+    // finally aborts every slot. idle slots are not counted: they are cleared to make room.
+    // a prompt that is rejected at slot start anyway (n_ctx_slot) is not held back
+    bool fits_unified_kv(const server_task & task) const {
+        if (!params_base.kv_unified || task.n_tokens() >= n_ctx_slot()) {
+            return true;
+        }
+
+        int32_t n_in_flight = 0;
+        for (const auto & slot : slots) {
+            if (slot.is_processing()) {
+                // a slot still processing its prompt will grow to the full prompt
+                n_in_flight += std::max(slot.prompt.n_tokens(), slot.task->n_tokens());
+            }
+        }
+
+        // >=: the prompt also needs a cell for its first generated token
+        if (n_in_flight + task.n_tokens() >= (int32_t) llama_n_ctx(ctx_tgt)) {
+            SRV_DBG("prompt (%d tokens) does not fit next to the %d tokens in flight (n_ctx = %u), defer task, id_task = %d\n",
+                    task.n_tokens(), n_in_flight, llama_n_ctx(ctx_tgt), task.id);
+            return false;
+        }
+
+        return true;
+    }
+
     // call only when the task is sure to launch on the slot
     void update_prompt_cache(server_slot & slot, const server_task & task) {
         SRV_TRC("%s", "updating prompt cache\n");
@@ -3020,7 +3047,7 @@ private:
 
                     const int id_task = task.id;
 
-                    const auto plan = slot_sched.select(get_slot_infos(), task, get_task_lora(task), prompt_cache.get());
+                    const auto plan = fits_unified_kv(task) ? slot_sched.select(get_slot_infos(), task, get_task_lora(task), prompt_cache.get()) : server_slot_plan {};
 
                     server_slot * slot = plan.id_slot == -1 ? nullptr : get_slot_by_id(plan.id_slot);
 

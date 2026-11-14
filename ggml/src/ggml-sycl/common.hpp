@@ -20,6 +20,7 @@
 #include <optional>
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
 
 #include "base.hpp"
 #include "dpct/helper.hpp"
@@ -561,23 +562,32 @@ struct ggml_backend_sycl_context {
     } src1_f16;
 
     // Dead f32 store elision. A producer that has just written the f16 mirror of an f32
-    // activation whose ONLY reader in this graph is the adjacent f16 GEMM skips the f32
-    // store itself: at pp2048 the GLU's is 142.6 MB of writes per call that nothing reads.
-    // The bytes are then never written, and ggml-alloc hands that buffer to a later
-    // tensor, so a consumer that missed the mirror and fell back to converting the f32
-    // would read garbage silently -- the failure mode this campaign has already met once
-    // through a recycled buffer. This registry turns every such miss into an abort: the
-    // producer records the range; the consumer must hit the mirror and clear it; the
-    // graph loop aborts if the range is still registered one node past its consumer.
+    // activation whose ONLY readers in this graph are f16 GEMMs taking it as src1 skips
+    // the f32 store itself: at pp2048 the GLU's is 142.6 MB of writes per call that
+    // nothing reads, the fused ADD+RMS_NORM+MUL's 41.94 MB x2 consumers and the gated
+    // UNARY+MUL's 50.33 MB. The bytes are then never written, and ggml-alloc hands that
+    // buffer to a later tensor, so a consumer that missed the mirror and fell back to
+    // converting the f32 would read garbage silently -- the failure mode this campaign
+    // has already met once through a recycled buffer. This registry turns every such
+    // miss into an abort: the producer records the range; every consumer must hit the
+    // mirror and each hit retires one of `remaining`; the graph loop aborts if the range
+    // is still registered past its LAST consumer.
     struct elide_f32_reg {
         const ggml_cgraph * graph = nullptr;
         const void *        key   = nullptr;  // dst->data of the elided tensor
         size_t              bytes = 0;
         int                 node  = -1;       // graph index of the producer
+        int                 last  = -1;       // graph index of the last consumer
+        int                 remaining = 0;    // consumers still to hit before the range retires
     } elide_f32;
-    // per-graph census: producer tensors referenced by exactly one node, that node being
-    // the next one and a MUL_MAT taking them as src1, and not flagged as graph outputs
-    std::unordered_set<const ggml_tensor *> elide_f32_ok;
+    // per-graph census: producer tensors every reference of which is a MUL_MAT src1 within
+    // the f16 cache's lookup window -- n_consumers of them, the last at node `last` -- and
+    // not flagged as graph outputs
+    struct elide_f32_cand {
+        int n_consumers = 0;
+        int last        = -1;
+    };
+    std::unordered_map<const ggml_tensor *, elide_f32_cand> elide_f32_ok;
 
     // The graph the two per-graph censuses last ran on. Both are pure functions
     // of the node list, and llama_context::process_ubatch reuses the SAME ggml_cgraph
@@ -1226,10 +1236,22 @@ sycl::half * ggml_sycl_f16_mirror_for_next_matmul(ggml_backend_sycl_context & ct
                                                   const ggml_tensor * dst, size_t ne);
 
 // Companion to the mirror: true iff the f32 store of `dst` may be skipped because the
-// mirror just taken is its only reader (the per-graph census says so). Registers the
-// range so that any f32 read of it before the consumer clears it aborts. Call only after
-// ggml_sycl_f16_mirror_for_next_matmul returned non-null for the same dst.
+// per-graph census says every reader of the tensor is one of the GEMM consumers that
+// will hit this mirror. Registers the range so that any f32 read of it before the LAST
+// consumer clears it aborts. Call only after ggml_sycl_f16_mirror_for_next_matmul
+// returned non-null for the same dst.
 bool ggml_sycl_elide_f32_arm(ggml_backend_sycl_context & ctx, const ggml_tensor * dst, size_t bytes);
+
+// Per-producer sub-switches under GGML_SYCL_ELIDE_F32, so each new elision site can be
+// isolated in the same-binary A/B. 0 keeps the producer's f32 store.
+static inline bool ggml_sycl_elide_f32_norm_enabled() {
+    static const int e = ggml_sycl_get_env("GGML_SYCL_ELIDE_F32_NORM", 1);
+    return e != 0;
+}
+static inline bool ggml_sycl_elide_f32_unary_enabled() {
+    static const int e = ggml_sycl_get_env("GGML_SYCL_ELIDE_F32_UNARY", 1);
+    return e != 0;
+}
 
 // Decode-side dual of the f16 mirror: if the node after `dst` is a mat-vec that will quantize
 // `dst` to q8_1 as its src1, hand back the SoA q8_1 buffer for the producing kernel to fill and

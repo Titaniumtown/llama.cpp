@@ -1065,7 +1065,7 @@ void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context & ctx, ggml_tenso
 
 // ADD(a, b) -> RMS_NORM -> MUL(w) in one launch. The sum (read by a later residual add) and
 // normed * w are written after a barrier, as mul->data may alias a.
-template <bool do_mirror>
+template <bool do_mirror, bool do_elide>
 static void add_rms_norm_mul_f32(const float *            a,
                                  const float *            b,
                                  float *                  sum,
@@ -1134,7 +1134,9 @@ static void add_rms_norm_mul_f32(const float *            a,
             const sycl::float4 m = m4[i];
             const sycl::float4 u = scale * v[k] * m;
             s4[i]                = v[k];
-            d4[i]                = u;
+            if constexpr (!do_elide) {
+                d4[i] = u;
+            }
             if constexpr (do_mirror) {
                 h4[i] = u.convert<sycl::half, sycl::rounding_mode::automatic>();
             }
@@ -1147,7 +1149,7 @@ static void add_rms_norm_mul_f32(const float *            a,
     }
 }
 
-template <bool do_mirror>
+template <bool do_mirror, bool do_elide>
 static void add_rms_norm_mul_f32_launch(const float * a,
                                         const float * b,
                                         float *       sum,
@@ -1169,7 +1171,7 @@ static void add_rms_norm_mul_f32_launch(const float * a,
         sycl::local_accessor<float, 1> s_sum(sycl::range<1>(work_group_size / WARP_SIZE), cgh);
         cgh.parallel_for(sycl::nd_range<3>(global_dims * block_dims, block_dims),
                          [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             add_rms_norm_mul_f32<do_mirror>(a, b, sum, mul, dst, ncols, eps, item_ct1,
+                             add_rms_norm_mul_f32<do_mirror, do_elide>(a, b, sum, mul, dst, ncols, eps, item_ct1,
                                                              get_pointer(s_sum), work_group_size, mir, q8_out,
                                                              q8_row_stride);
                          });
@@ -1204,11 +1206,19 @@ bool ggml_sycl_op_add_rms_norm_fused(ggml_backend_sycl_context & ctx,
     // Emit its f16 copy from the register rather than letting that GEMM re-read the whole
     // tensor to make one; at decode widths emit the next mat-vec's q8_1 copy instead.
     sycl::half * mir = ggml_sycl_f16_mirror_for_next_matmul(ctx, mul, (size_t) ggml_nelements(mul));
+    // with the mirror taken, the norm-output f32 store is dead IF the census says every reader
+    // is a GEMM that will hit the mirror; the residual sum's store always fires
+    const bool elide = mir != nullptr && ggml_sycl_elide_f32_norm_enabled() &&
+                       ggml_sycl_elide_f32_arm(ctx, mul, (size_t) ggml_nbytes(mul));
+    // a mirror means an f16 GEMM reads this output, so no mat-vec needs the q8_1 copy
     int          q8_kx         = 0;
     int          q8_row_stride = 0;
-    char *       q8_out = norm_q8_emit_target(ctx, mul, ncols, add->ne[1], 1, 1, 1, (const void *) ctx.stream(),
-                                              &q8_kx, &q8_row_stride);
-    const auto   launch = mir != nullptr ? add_rms_norm_mul_f32_launch<true> : add_rms_norm_mul_f32_launch<false>;
+    char *       q8_out = mir == nullptr ? norm_q8_emit_target(ctx, mul, ncols, add->ne[1], 1, 1, 1,
+                                                               (const void *) ctx.stream(), &q8_kx, &q8_row_stride)
+                                         : nullptr;
+    const auto   launch = mir == nullptr ? add_rms_norm_mul_f32_launch<false, false>
+                          : elide        ? add_rms_norm_mul_f32_launch<true, true>
+                                         : add_rms_norm_mul_f32_launch<true, false>;
     launch((const float *) a->data, (const float *) b->data, (float *) add->data, (const float *) w->data,
            (float *) mul->data, mir, q8_out, q8_row_stride, (int) ncols, (int) add->ne[1], eps, ctx.stream(),
            ctx.device);

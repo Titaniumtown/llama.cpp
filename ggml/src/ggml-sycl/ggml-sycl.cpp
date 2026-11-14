@@ -3299,11 +3299,16 @@ static inline bool ggml_sycl_elide_f32_enabled() {
     return e != 0;
 }
 
-// The consumer side of the elision registry. A hit on the mirror retires the entry; a
-// miss that would read the f32 range aborts, because those bytes were never written.
+// The consumer side of the elision registry. A hit on the mirror retires ONE consumer;
+// a miss that would read the f32 range aborts, because those bytes were never written.
+// The entry clears when the LAST of its consumers has hit: an N-consumer producer (the
+// fused norm feeding both ffn gate and up) stays outstanding between its consumers, so
+// a missed second hit still trips check_read instead of reading garbage.
 static inline void ggml_sycl_elide_f32_consumed(ggml_backend_sycl_context & ctx, const void * key) {
     if (ctx.elide_f32.key == key && ctx.elide_f32.graph == ctx.cur_graph) {
-        ctx.elide_f32 = {};
+        if (--ctx.elide_f32.remaining <= 0) {
+            ctx.elide_f32 = {};
+        }
     }
 }
 
@@ -5863,11 +5868,57 @@ sycl::half * ggml_sycl_f16_mirror_for_next_matmul(ggml_backend_sycl_context & ct
     return src1_f16_store(ctx, dst->data, (const void *) ctx.stream(), ne, prod);
 }
 
-// Once per graph: which producers may skip their f32 store. Only the GLU is a candidate
-// today (its output is read by exactly one f16 GEMM, ffn_down, in every block of the
-// production model). The mirror helper already proves the ADJACENT node is that GEMM;
-// this census proves it is the ONLY reader anywhere in the graph and that the tensor is
-// not a graph output -- the two conditions that make the f32 bytes unobservable.
+// Once per graph: which producers may skip their f32 store. Candidate producers: the
+// fused-span outputs the mirror path can already serve. The GLU (ffn_down), the fused
+// UNARY+MUL (element_wise.cpp's ggml_sycl_op_fused_unary_mul: a MUL one of whose srcs is a
+// UNARY node -- the full-attention attn_gated), and the tail of the fused ADD+RMS_NORM+MUL
+// span (norm.cpp's ggml_sycl_op_rms_norm_fused_add: the MUL whose src is the RMS_NORM whose
+// src is the residual ADD -- attn_post_norm). Plain RMS_NORM+MUL spans (attn_norm) are NOT
+// candidates here; MirrorAttnNorm widens this helper when its plain dispatcher learns to
+// mirror. The mirror helper proves the ADJACENT node is an f16 GEMM taking the producer as
+// src1 when it takes the mirror; this census proves the rest of what makes the f32 bytes
+// unobservable: EVERY reference of the tensor is one of those GEMM-src1 reads, all of them
+// inside the f16 cache's lookup window, nothing between the first and the last consumer can
+// evict the single-slot cache, and the tensor is not a graph output. Marking is only a
+// NECESSARY condition -- the producer's dispatcher still arms the elision through
+// ggml_sycl_elide_f32_arm, and that call happens only on the mirror path -- so a candidate
+// the dispatcher never arms (a fused span that declined to fuse, say) simply keeps its
+// store.
+static bool elide_f32_producer(const ggml_tensor * t) {
+    if (t->op == GGML_OP_GLU) {
+        return true;
+    }
+    if (t->op != GGML_OP_MUL) {
+        return false;
+    }
+    for (int s = 0; s < 2; ++s) {
+        const ggml_tensor * u = t->src[s];
+        if (u == nullptr) {
+            continue;
+        }
+        if (u->op == GGML_OP_UNARY) {
+            switch (ggml_get_unary_op(u)) {
+                case GGML_UNARY_OP_SILU:
+                case GGML_UNARY_OP_SIGMOID:
+                case GGML_UNARY_OP_SOFTPLUS:
+                    return true;
+                default: break;
+            }
+        }
+        if (u->op == GGML_OP_RMS_NORM && u->src[0] != nullptr && u->src[0]->op == GGML_OP_ADD) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The census's verdict for one producer: n_consumers GEMMs will read the mirror, the last
+// of them at graph node `last`. The registry retires only after that many mirror hits.
+static void ggml_sycl_elide_f32_register(ggml_backend_sycl_context & ctx, const ggml_tensor * p,
+                                         int n_consumers, int last) {
+    ctx.elide_f32_ok[p] = { n_consumers, last };
+}
+
 static void ggml_sycl_elide_f32_census(ggml_backend_sycl_context & ctx, const ggml_cgraph * g) {
     // Same node list as last time, so elide_f32_ok already holds
     // the answer for this exact graph. Clearing and rebuilding it costs 56.74 us per
@@ -5878,35 +5929,90 @@ static void ggml_sycl_elide_f32_census(ggml_backend_sycl_context & ctx, const gg
         !ggml_sycl_src1_cache_enabled()) {
         return;
     }
-    std::unordered_map<const ggml_tensor *, int> refs;
+    // candidates and everything the graph does to them: the producer's own node index (the
+    // mirror stamps its cache entry there and every window below is relative to it), every
+    // reference, and the indices of the MUL_MAT nodes reading it as src1
+    struct scan {
+        int              prod = -1;
+        int              refs = 0;
+        std::vector<int> cons;
+    };
+    std::unordered_map<const ggml_tensor *, scan> cand;
     for (int i = 0; i < g->n_nodes; ++i) {
         const ggml_tensor * n = g->nodes[i];
+        if (elide_f32_producer(n) && n->type == GGML_TYPE_F32 && !(n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            cand[n].prod = i;
+        }
         for (int s = 0; s < GGML_MAX_SRC; ++s) {
             const ggml_tensor * src = n->src[s];
-            if (src != nullptr && src->op == GGML_OP_GLU) {
-                refs[src]++;
+            if (src == nullptr) {
+                continue;
+            }
+            const auto it = cand.find(src);
+            if (it == cand.end()) {
+                continue;
+            }
+            it->second.refs += 1;
+            if (n->op == GGML_OP_MUL_MAT && s == 1) {
+                it->second.cons.push_back(i);
             }
         }
     }
-    for (int i = 0; i + 1 < g->n_nodes; ++i) {
-        const ggml_tensor * p = g->nodes[i];
-        if (p->op != GGML_OP_GLU || p->type != GGML_TYPE_F32 || (p->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+    for (const auto & e : cand) {
+        const ggml_tensor * p = e.first;
+        const scan        & s = e.second;
+        const int           n = (int) s.cons.size();
+        // every reference is a GEMM src1 -- this is what makes the f32 unobservable
+        if (n < 1 || s.refs != n) {
             continue;
         }
-        const auto it = refs.find(p);
-        if (it == refs.end() || it->second != 1) {
+        const int last = s.cons[n - 1];
+        bool ok = true;
+        for (int j : s.cons) {
+            ggml_tensor * c = g->nodes[j];
+            // every consumer must be an f16 GEMM that will hit the mirror. All consumers
+            // share src1 == p, so ne[1] is uniform; only the weight type can split them.
+            if (j <= s.prod || j - s.prod > 64 || !ggml_sycl_mul_mat_reads_f16_mirror(c)) {
+                ok = false;
+                break;
+            }
+            // the lookup's own walk: nothing between the store and this consumer may
+            // write over the range (the walk re-checks at run time)
+            for (int k = s.prod + 1; ok && k <= j; ++k) {
+                const ggml_tensor * w = g->nodes[k];
+                const char * w0 = (const char *) w->data;
+                const char * p0 = (const char *) p->data;
+                if (w0 != nullptr && p0 != nullptr &&
+                    w0 < p0 + ggml_nbytes(p) && p0 < w0 + ggml_nbytes(w)) {
+                    ok = false;
+                }
+            }
+        }
+        if (!ok) {
             continue;
         }
-        const ggml_tensor * c = g->nodes[i + 1];
-        if (c->op != GGML_OP_MUL_MAT || c->src[1] != p || !ggml_sycl_mul_mat_reads_f16_mirror(g->nodes[i + 1])) {
+        // the single-slot evictor: a GEMM between the producer and the last consumer whose
+        // f32 src1 is a DIFFERENT tensor (f16 src1 is read directly, and the mirror-helper
+        // stores of any producer inside the window surface as exactly such a GEMM node)
+        // stores its own conversion into the cache and every later consumer misses.
+        // MirrorAttnNorm's (b) reuses this clause verbatim.
+        for (int k = s.prod + 1; ok && k <= last; ++k) {
+            const ggml_tensor * m = g->nodes[k];
+            if (m->op == GGML_OP_MUL_MAT && m->src[1] != nullptr && m->src[1] != p &&
+                m->src[1]->type != GGML_TYPE_F16 && m->src[1]->ne[1] > 1) {
+                ok = false;
+            }
+        }
+        if (!ok) {
             continue;
         }
-        ctx.elide_f32_ok.insert(p);
+        ggml_sycl_elide_f32_register(ctx, p, n, last);
     }
 }
 
 bool ggml_sycl_elide_f32_arm(ggml_backend_sycl_context & ctx, const ggml_tensor * dst, size_t bytes) {
-    if (ctx.elide_f32_ok.find(dst) == ctx.elide_f32_ok.end()) {
+    const auto it = ctx.elide_f32_ok.find(dst);
+    if (it == ctx.elide_f32_ok.end()) {
         return false;
     }
     if (ctx.elide_f32.key != nullptr) {
@@ -5921,10 +6027,12 @@ bool ggml_sycl_elide_f32_arm(ggml_backend_sycl_context & ctx, const ggml_tensor 
     if (prod < 0) {
         return false;
     }
-    ctx.elide_f32.graph = g;
-    ctx.elide_f32.key   = dst->data;
-    ctx.elide_f32.bytes = bytes;
-    ctx.elide_f32.node  = prod;
+    ctx.elide_f32.graph     = g;
+    ctx.elide_f32.key       = dst->data;
+    ctx.elide_f32.bytes     = bytes;
+    ctx.elide_f32.node      = prod;
+    ctx.elide_f32.last      = it->second.last;
+    ctx.elide_f32.remaining = it->second.n_consumers;
     ggml_sycl_elided_f32_record(dst);
     return true;
 }
@@ -9196,11 +9304,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         sycl_ctx->cur_node = i;
-        // an elided f32 store must be retired by the very next node; anything else means
-        // its consumer did not take the mirror path, and the unwritten bytes are live
-        if (UNLIKELY(sycl_ctx->elide_f32.key != nullptr && i > sycl_ctx->elide_f32.node + 1)) {
-            GGML_ABORT("ggml-sycl: f32 store elided at node %d was not consumed by node %d; "
-                       "set GGML_SYCL_ELIDE_F32=0", sycl_ctx->elide_f32.node, sycl_ctx->elide_f32.node + 1);
+        // an elided f32 store must be retired by its LAST consumer; anything later means
+        // a consumer did not take the mirror path, and the unwritten bytes are live
+        if (UNLIKELY(sycl_ctx->elide_f32.remaining > 0 && i > sycl_ctx->elide_f32.last)) {
+            GGML_ABORT("ggml-sycl: f32 store elided at node %d still has %d consumer(s) "
+                       "outstanding at node %d (its last consumer is node %d); "
+                       "set GGML_SYCL_ELIDE_F32=0", sycl_ctx->elide_f32.node,
+                       sycl_ctx->elide_f32.remaining, i, sycl_ctx->elide_f32.last);
         }
         // the collapsed conv at the CONCAT above already did all three of these
         if (node == collapse_cpy) {

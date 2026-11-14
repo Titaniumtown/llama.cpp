@@ -1327,17 +1327,21 @@ void ggml_sycl_op_add_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tens
 // unary_src and other_src separate contiguous same-shape tensors. Elides the
 // standalone unary launch and its HBM round-trip of the unary output. Mirrors
 // the fused unary+mul path in ggml-cuda.
-template <bool MIRROR, bool Q8, typename T, typename Op>
+template <bool MIRROR, bool Q8, bool ELIDE, typename T, typename Op>
 static void fused_unary_mul_launch(const T * a, const T * b, T * dst, sycl::half * mir,
                                    char * q8, const int q8_kx,
                                    const int64_t k, queue_ptr stream, Op op) {
+    static_assert(!ELIDE || MIRROR, "an elided f32 store needs the f16 mirror to exist");
+    static_assert(!(ELIDE && Q8), "the q8_1 emission reads dst back out of memory");
     const uint32_t num_blocks = ceil_div((uint32_t) k, SYCL_GLU_BLOCK_SIZE);
     stream->parallel_for(
         sycl::nd_range<1>(num_blocks * sycl::range<1>(SYCL_GLU_BLOCK_SIZE), sycl::range<1>(SYCL_GLU_BLOCK_SIZE)),
         [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
             SYCL_GLOBAL_ID_LOOP(k, item_ct1) {
                 const T v = op(a[i]) * b[i];
-                dst[i]    = v;
+                if constexpr (!ELIDE) {
+                    dst[i] = v;
+                }
                 if constexpr (MIRROR) {
                     mir[i] = static_cast<sycl::half>(v);
                 }
@@ -1353,10 +1357,14 @@ static void fused_unary_mul_launch(const T * a, const T * b, T * dst, sycl::half
 // are mutually exclusive (GEMM consumer vs mat-vec consumer).
 template <typename T, typename Op>
 static void fused_unary_mul_sycl(const T * a, const T * b, T * dst, const int64_t k, queue_ptr stream, Op op,
-                                 sycl::half * mir = nullptr, char * q8 = nullptr, int q8_kx = 0) {
-    if (mir != nullptr)     { fused_unary_mul_launch<true,  false>(a, b, dst, mir, q8, q8_kx, k, stream, op); }
-    else if (q8 != nullptr) { fused_unary_mul_launch<false, true >(a, b, dst, mir, q8, q8_kx, k, stream, op); }
-    else                    { fused_unary_mul_launch<false, false>(a, b, dst, mir, q8, q8_kx, k, stream, op); }
+                                 sycl::half * mir = nullptr, char * q8 = nullptr, int q8_kx = 0,
+                                 bool elide = false) {
+    if (mir != nullptr) {
+        if (elide) { fused_unary_mul_launch<true,  false, true >(a, b, dst, mir, q8, q8_kx, k, stream, op); }
+        else       { fused_unary_mul_launch<true,  false, false>(a, b, dst, mir, q8, q8_kx, k, stream, op); }
+    }
+    else if (q8 != nullptr) { fused_unary_mul_launch<false, true,  false>(a, b, dst, mir, q8, q8_kx, k, stream, op); }
+    else                    { fused_unary_mul_launch<false, false, false>(a, b, dst, mir, q8, q8_kx, k, stream, op); }
 }
 
 // Fused ADD(bias) + UNARY + MUL(scale) with per-ne0 broadcast of bias and scale:
@@ -1424,12 +1432,18 @@ static inline void ggml_sycl_op_fused_unary_mul(ggml_backend_sycl_context & ctx,
             // f16 copy here rather than letting that GEMM re-read the tensor to build one.
             // At decode the consumer is a mat-vec instead: emit the q8_1 copy (the dual of the f16 mirror).
             sycl::half * mir    = ggml_sycl_f16_mirror_for_next_matmul(ctx, mul_node, (size_t) k);
+            bool         elide  = false;
+            if (mir != nullptr && ggml_sycl_elide_f32_unary_enabled()) {
+                // attn_gated's f32 store is dead: the census proved wo is its only reader
+                // and it just took this mirror
+                elide = ggml_sycl_elide_f32_arm(ctx, mul_node, (size_t) k * sizeof(float));
+            }
             int          q8_kx  = 0;
             char *       q8_out = mir == nullptr ? ggml_sycl_q8_emit_for_next_matvec(ctx, mul_node, &q8_kx) : nullptr;
             switch (uop) {
-                case GGML_UNARY_OP_SILU:     fused_unary_mul_sycl<float>(a, b, d, k, stream, [](auto x) { return op_silu(x); }, mir, q8_out, q8_kx); break;
-                case GGML_UNARY_OP_SIGMOID:  fused_unary_mul_sycl<float>(a, b, d, k, stream, [](auto x) { return op_sigmoid(x); }, mir, q8_out, q8_kx); break;
-                case GGML_UNARY_OP_SOFTPLUS: fused_unary_mul_sycl<float>(a, b, d, k, stream, [](auto x) { return op_softplus(x); }, mir, q8_out, q8_kx); break;
+                case GGML_UNARY_OP_SILU:     fused_unary_mul_sycl<float>(a, b, d, k, stream, [](auto x) { return op_silu(x); }, mir, q8_out, q8_kx, elide); break;
+                case GGML_UNARY_OP_SIGMOID:  fused_unary_mul_sycl<float>(a, b, d, k, stream, [](auto x) { return op_sigmoid(x); }, mir, q8_out, q8_kx, elide); break;
+                case GGML_UNARY_OP_SOFTPLUS: fused_unary_mul_sycl<float>(a, b, d, k, stream, [](auto x) { return op_softplus(x); }, mir, q8_out, q8_kx, elide); break;
                 default: GGML_ABORT("fused unary+mul: unsupported unary op");
             }
             break;

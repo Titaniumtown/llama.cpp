@@ -1844,33 +1844,28 @@ dequantize_block_iq4_xs(const void *__restrict__ vx, dst_t *__restrict__ yy,
     }
 }
 
-// reordered IQ4_NL / IQ4_XS: qs bytes iq .. iq + 3 of 32-value group g to y[iq + j] and y[iq + 16 + j], with y the
-// group's first output, in two vec<dst_t, 4> stores as for MXFP4; tail is the first byte after all qs
-template <ggml_type type, typename dst_t>
-static __dpct_inline__ void dequantize_iq4_reorder_quad(const uint8_t * __restrict__ x,
-                                                        const uint8_t * __restrict__ tail, const int64_t g,
-                                                        const int iq, dst_t * __restrict__ y) {
-    const uint8_t * qs = x + 16 * g + iq;
-    const float     d  = ggml_sycl_reordered::iq4_group_scale<type>(tail, g);
-
-    sycl::vec<dst_t, 4> lo, hi;
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        lo[j] = d * kvalues_iq4nl[qs[j] & 0xf];
-        hi[j] = d * kvalues_iq4nl[qs[j] >> 4];
-    }
-    *reinterpret_cast<sycl::vec<dst_t, 4> *>(y + iq)      = lo;
-    *reinterpret_cast<sycl::vec<dst_t, 4> *>(y + iq + 16) = hi;
-}
-
-// flat range over k / 8 items: item i takes group i / 4 from qs byte 4 * (i % 4)
+// reordered IQ4_NL / IQ4_XS, line stores: item i writes the contiguous run y[8 * i, 8 * i + 8). Run r = i % 4 of
+// 32-value group g = i / 4 is nibble plane r / 2 of qs bytes 8 * (r % 2) .. + 7, so each item does one 8-wide store
+// and neighbouring items tile whole 64-byte lines. Splitting a byte's nibbles over two stores 16 apart writes half
+// of every line per store instruction; on the B70 that shape held IQ4_XS to 391 GB/s against 536 for line stores.
 template <ggml_type type, typename dst_t>
 static void dequantize_block_iq4_reorder_wide(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t k,
                                               const sycl::id<1> idx) {
     const int64_t   i = (int64_t) idx[0];
     const int64_t   g = i / 4;
+    const int       r = (int) (i % 4);
     const uint8_t * x = (const uint8_t *) vx;
-    dequantize_iq4_reorder_quad<type>(x, x + k / 2, g, (int) (4 * (i % 4)), yy + 32 * g);
+    const float     d = ggml_sycl_reordered::iq4_group_scale<type>(x + k / 2, g);
+
+    const int                   shift = 4 * (r / 2);
+    const sycl::vec<uint8_t, 8> q     = vec_aligned_load<uint8_t, 8>(x + 16 * g + 8 * (r % 2));
+
+    sycl::vec<dst_t, 8> o;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        o[j] = d * kvalues_iq4nl[(q[j] >> shift) & 0xf];
+    }
+    *reinterpret_cast<sycl::vec<dst_t, 8> *>(yy + 8 * i) = o;
 }
 
 // item t (0..31) of block ib dequantizes four qs bytes of sub-block t/4 into y, the output of block ib

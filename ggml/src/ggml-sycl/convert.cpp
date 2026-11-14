@@ -560,7 +560,7 @@ static void dequantize_row_iq4_nl_sycl(const void *vx, dst_t *y, const int64_t k
 
 template <ggml_type type, typename dst_t>
 static void dequantize_row_iq4_sycl_reorder(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
-    // flat range<1>, four qs bytes (8 outputs) per item
+    // flat range<1>, one contiguous 8-output run per item
     GGML_ASSERT(k % ggml_sycl_reordered::block_q_t<type>::traits::qk == 0);
     stream->parallel_for(sycl::range<1>((size_t) (k / 8)),
         [=](sycl::id<1> idx) {

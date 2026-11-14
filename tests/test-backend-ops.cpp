@@ -10600,6 +10600,174 @@ static std::string var_to_str(const std::array<int32_t, GGML_MAX_OP_PARAMS / siz
 }
 
 
+// =====================================================================
+// Coverage for ops the harness has never built a case for.
+//
+// Thirteen ops that --list-ops reports have no test that constructs them
+// anywhere in this file, so a green sweep has never exercised them. Four
+// more (VIEW, PERMUTE, TRANSPOSE, RESHAPE) move no data and cannot be
+// tested; the rest of the apparent gap is ops that ARE covered but under
+// a sub-op name the --list-ops diff does not see -- ABS, SGN, SWIGLU and
+// friends -- which is why this list was derived by counting ggml_ builder
+// call sites in this file, not by matching op-name sets.
+//
+// Each op gets two ordinary shapes and at least one that hits a boundary
+// or an odd multiple, because a test that only covers the shape its author
+// happened to imagine is how an untested op stays untested.
+struct test_pool_2d_back : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne_input;
+    const std::array<int64_t, 4> ne_grad;
+    const ggml_op_pool op;
+    const int k0, k1, s0, s1, p0, p1;
+
+    std::string vars() override {
+        char b[192];
+        snprintf(b, sizeof(b), "ne_in=[%d,%d,%d,%d] ne_grad=[%d,%d,%d,%d] k=%d,%d s=%d,%d p=%d,%d op=%d",
+                 (int) ne_input[0], (int) ne_input[1], (int) ne_input[2], (int) ne_input[3],
+                 (int) ne_grad[0],  (int) ne_grad[1],  (int) ne_grad[2],  (int) ne_grad[3],
+                 k0, k1, s0, s1, p0, p1, (int) op);
+        return std::string(b);
+    }
+
+    test_pool_2d_back(ggml_type type = GGML_TYPE_F32,
+                      std::array<int64_t, 4> ne_input = {10, 10, 3, 1},
+                      std::array<int64_t, 4> ne_grad  = {10, 10, 3, 1},
+                      ggml_op_pool op = GGML_OP_POOL_AVG,
+                      int k0 = 3, int k1 = 3, int s0 = 1, int s1 = 1, int p0 = 1, int p1 = 1)
+        : type(type), ne_input(ne_input), ne_grad(ne_grad), op(op),
+          k0(k0), k1(k1), s0(s0), s1(s1), p0(p0), p1(p1) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a  = ggml_new_tensor(ctx, type, 4, ne_input.data());
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * af = ggml_new_tensor(ctx, type, 4, ne_grad.data());
+        ggml_set_name(af, "af");
+
+        ggml_tensor * out = ggml_pool_2d_back(ctx, a, af, op, k0, k1, s0, s1, p0, p1);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+struct test_win_part : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int w;
+
+    std::string vars() override {
+        char b[96];
+        snprintf(b, sizeof(b), "ne=[%d,%d,%d,%d] w=%d", (int) ne[0], (int) ne[1], (int) ne[2],
+                 (int) ne[3], w);
+        return std::string(b);
+    }
+
+    test_win_part(std::array<int64_t, 4> ne = {64, 13, 7, 1}, int w = 4)
+        : ne(ne), w(w) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_win_part(ctx, a, w);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+struct test_win_unpart : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int w0, h0, w;
+
+    std::string vars() override {
+        char b[112];
+        snprintf(b, sizeof(b), "ne=[%d,%d,%d,%d] w0=%d h0=%d w=%d", (int) ne[0], (int) ne[1],
+                 (int) ne[2], (int) ne[3], w0, h0, w);
+        return std::string(b);
+    }
+
+    test_win_unpart(std::array<int64_t, 4> ne = {64, 8, 8, 9}, int w0 = 13, int h0 = 7, int w = 4)
+        : ne(ne), w0(w0), h0(h0), w(w) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_win_unpart(ctx, a, w0, h0, w);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+struct test_get_rel_pos : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const int qh, kh;
+
+    std::string vars() override {
+        char b[96];
+        snprintf(b, sizeof(b), "ne=[%d,%d,%d,%d] qh=%d kh=%d", (int) ne[0], (int) ne[1],
+                 (int) ne[2], (int) ne[3], qh, kh);
+        return std::string(b);
+    }
+
+    // ggml asserts qh == kh and 2*max(qh,kh) - 1 == ne[1].
+    test_get_rel_pos(ggml_type type = GGML_TYPE_F16, std::array<int64_t, 4> ne = {64, 127, 8, 2},
+                     int qh = 64, int kh = 64)
+        : type(type), ne(ne), qh(qh), kh(kh) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_get_rel_pos(ctx, a, qh, kh);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+struct test_add_rel_pos : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const int p0, p2;   // pw/ph are [p0, p0, p2, ne[2]] F32
+
+    std::string vars() override {
+        char b[112];
+        snprintf(b, sizeof(b), "ne=[%d,%d,%d,%d] pw=[%d,%d,%d,%d]", (int) ne[0], (int) ne[1],
+                 (int) ne[2], (int) ne[3], p0, p0, p2, (int) ne[2]);
+        return std::string(b);
+    }
+
+    // ggml requires, and asserts: pw and ph same shape and both F32,
+    // contiguous, pw->ne[3] == a->ne[2], pw->ne[0]*pw->ne[0] == a->ne[0], and
+    // pw->ne[1]*pw->ne[2] == a->ne[1]. All five, or GGML_ASSERT aborts the
+    // whole run -- which is how the first attempt at this case took the
+    // sweep down with it.
+    test_add_rel_pos(ggml_type type = GGML_TYPE_F16, std::array<int64_t, 4> ne = {64, 96, 128, 2},
+                     int p0 = 8, int p2 = 12)
+        : type(type), ne(ne), p0(p0), p2(p2) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+
+        const int64_t ne_p[4] = { p0, p0, p2, ne[2] };
+        ggml_tensor * pw = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_p);
+        ggml_set_name(pw, "pw");
+        ggml_tensor * ph = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_p);
+        ggml_set_name(ph, "ph");
+
+        ggml_tensor * out = ggml_add_rel_pos(ctx, a, pw, ph);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_generic_op : public test_case {
     const ggml_op op;
     const ggml_type type;
@@ -13764,6 +13932,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_sum(GGML_TYPE_F32, {11, 5, 6, 3}, {0, 0, 0, 0}, true)); // sliced view (gaps)
     test_cases.emplace_back(new test_sum(GGML_TYPE_F32, {11, 5, 6, 3}, {1, 0, 2, 3}, true)); // sliced + non-contiguous rows
     test_cases.emplace_back(new test_sum_rows());
+
+    // -----------------------------------------------------------------
+    // Ops that --list-ops reports and that this file has never built a
+    // case for. A green sweep has therefore never exercised them.
+    // FLASH_ATTN_BACK, CUSTOM and MAP_CUSTOM1/2/3 are NOT here: each needs
+    // scaffolding this file does not currently have (a full attention
+    // backward graph, and host callbacks), and a half-built case is worse
+    // than an honest omission.
+    // -----------------------------------------------------------------
+    for (ggml_op_pool po : {GGML_OP_POOL_AVG, GGML_OP_POOL_MAX}) {
+        test_cases.emplace_back(new test_pool_2d_back(GGML_TYPE_F32, {10, 10, 3, 1}, {10, 10, 3, 1}, po, 3, 3, 1, 1, 1, 1));
+        test_cases.emplace_back(new test_pool_2d_back(GGML_TYPE_F32, {16, 12, 2, 1}, { 8,  6, 2, 1}, po, 3, 3, 2, 2, 1, 1));
+        test_cases.emplace_back(new test_pool_2d_back(GGML_TYPE_F32, { 9,  9, 1, 1}, { 5,  5, 1, 1}, po, 2, 2, 1, 1, 0, 0));
+    }
+
+    test_cases.emplace_back(new test_win_part({64, 13,  7, 1}, 4));
+    test_cases.emplace_back(new test_win_part({64, 16, 16, 1}, 4));
+    test_cases.emplace_back(new test_win_part({32,  5, 11, 1}, 8));
+    test_cases.emplace_back(new test_win_unpart({64, 8, 8, 9}, 13, 7, 4));
+    test_cases.emplace_back(new test_win_unpart({32, 4, 4, 4},  7, 7, 4));
+
+    test_cases.emplace_back(new test_get_rel_pos(GGML_TYPE_F16, {64, 127, 8, 2}, 64, 64));
+    test_cases.emplace_back(new test_get_rel_pos(GGML_TYPE_F16, {32,  63, 4, 1}, 32, 32));
+
+    // 8*8 == 64 and 8*12 == 96; 4*4 == 16 and 4*12 == 48.
+    test_cases.emplace_back(new test_add_rel_pos(GGML_TYPE_F16, {64, 96, 128, 2},  8, 12));
+    test_cases.emplace_back(new test_add_rel_pos(GGML_TYPE_F16, {16, 48,  64, 1},  4, 12));
     test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 11, 5, 6, 3 }, true, false));
     test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 11, 5, 6, 3 }, false, true));
     test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 11, 5, 6, 3 }, true, true));

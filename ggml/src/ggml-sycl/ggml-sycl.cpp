@@ -10179,12 +10179,44 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_SET_ROWS:
             {
-                if (op->type == GGML_TYPE_TQ2_0 || op->type == GGML_TYPE_TQ1_0) {
-                    return false;
+                // dst must be a type the set_rows dispatch switch actually handles;
+                // anything else (tq1_0/tq2_0, ...) previously passed this check and
+                // then died in the dispatcher's GGML_ABORT("Unsupported tensor type")
+                // -- the same accept-then-abort class as the CPY denylist.
+                switch (op->type) {
+                    case GGML_TYPE_F32:
+                    case GGML_TYPE_F16:
+                    case GGML_TYPE_BF16:
+                    case GGML_TYPE_F8_E4M3:
+                    case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_Q1_0:
+                    case GGML_TYPE_Q2_0:
+                    case GGML_TYPE_Q4_0:
+                    case GGML_TYPE_Q4_1:
+                    case GGML_TYPE_Q5_0:
+                    case GGML_TYPE_Q5_1:
+                    case GGML_TYPE_IQ4_NL:
+                    case GGML_TYPE_MXFP4:
+                    case GGML_TYPE_NVFP4:
+                    case GGML_TYPE_Q2_K:
+                    case GGML_TYPE_Q3_K:
+                    case GGML_TYPE_Q4_K:
+                    case GGML_TYPE_Q5_K:
+                    case GGML_TYPE_Q6_K:
+                    case GGML_TYPE_IQ2_XXS:
+                    case GGML_TYPE_IQ2_XS:
+                    case GGML_TYPE_IQ2_S:
+                    case GGML_TYPE_IQ3_XXS:
+                    case GGML_TYPE_IQ3_S:
+                    case GGML_TYPE_IQ1_S:
+                    case GGML_TYPE_IQ1_M:
+                    case GGML_TYPE_IQ4_XS:
+                        break;
+                    default:
+                        return false;
                 }
-                auto res = (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
-                           (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
-                return res;
+                return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                       (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
             }
         case GGML_OP_DSV4_HC_PRE:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
@@ -10304,6 +10336,16 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                         src1_type == GGML_TYPE_TQ1_0) {
                         return false;
                     }
+                }
+
+                // ggml_sycl_cpy has same-type branches for Q1_0/Q2_0 (enum 41/42) but no
+                // branch AT ALL for the ternary TQ1_0/TQ2_0 (enum 34/35) -- neither as
+                // source nor destination. Accepting any TQ endpoint here ran into its
+                // trailing GGML_ABORT instead of the CPU fallback (test-backend-ops CPY
+                // type_src=tq2_0, then f16->tq2_0 once the same-type case was declined).
+                if (src0_type == GGML_TYPE_TQ1_0 || src0_type == GGML_TYPE_TQ2_0 ||
+                    src1_type == GGML_TYPE_TQ1_0 || src1_type == GGML_TYPE_TQ2_0) {
+                    return false;
                 }
 
                 if (src0_type == GGML_TYPE_TQ2_0 || src1_type == GGML_TYPE_TQ2_0 ||

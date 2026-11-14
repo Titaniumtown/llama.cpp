@@ -613,6 +613,26 @@ void ggml_sycl_op_set_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32 || dst->src[0]->type == GGML_TYPE_F16);
     GGML_ASSERT(dst->src[1]->type == GGML_TYPE_I64 || dst->src[1]->type == GGML_TYPE_I32);
 
+    // The codebook families quantize on the HOST here (set_rows_sycl_iq_host and the
+    // iq3/iq1 _ref quantizers), and those functions GGML_ASSERT that their grid/map
+    // tables exist. Everything else in the process that quantizes these types goes
+    // through ggml_quantize_chunk, which initializes lazily -- this is the one call
+    // site that reaches the raw quantizers directly, and an accepted SET_ROWS to
+    // iq2_xxs aborted the whole process instead of computing. Idempotent and mutexed.
+    switch (dst->type) {
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+            ggml_quantize_init(dst->type);
+            break;
+        default:
+            break;
+    }
+
     // dispatch on the index type (src1) and the source value type (src0)
     if (src0->type == GGML_TYPE_F16) {
         if (src1->type == GGML_TYPE_I64) {

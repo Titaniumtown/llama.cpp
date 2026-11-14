@@ -11,6 +11,8 @@
 #include "server-realtime.h"
 #include "server-schema.h"
 #include "server-slot-sched.h"
+#include "server-step-sched-budget.h"
+#include "server-step-sched-inject.h"
 #include "server-stream.h"
 
 #include "build-info.h"
@@ -338,6 +340,11 @@ struct server_slot {
     bool has_next_token = true;
     bool has_new_line   = false;
     bool truncated      = false;
+    bool sched_hold     = false;   // adaptive step scheduler: token held back this iteration (see pre_decode)
+    bool sched_admit_hold = false; // admission guard: this prompt waits for a floor (see decide_admit)
+    bool sched_admit_bypass = false; // admission guard: admitted as a short prefill (see admit_bypass_ms)
+    int64_t sched_wait_from = 0;   // when the admission hold started (the wait bound runs from here)
+    int64_t sched_n_gen_last = 0;  // tokens emitted at the last step (the MTP luck, see note_emitted)
 
     stop_type stop;
 
@@ -443,6 +450,11 @@ struct server_slot {
         generated      = {};
         has_new_line   = false;
         truncated      = false;
+        sched_hold     = false;
+        sched_admit_hold = false;
+        sched_admit_bypass = false;
+        sched_wait_from  = 0;
+        sched_n_gen_last = 0;
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
         n_sent_text    = 0;
@@ -1028,6 +1040,956 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
     return true;
 }
 
+// adaptive step scheduler
+//
+// The server builds one batch per iteration: the generating slots' pending tokens go
+// in first and a pending prompt takes what is left of n_batch. Measured on the
+// production box (2 slots, 131072 ctx each, -b/-ub 2048, MTP draft;
+// 6857 requests):
+//
+//     prompt step carrying a decoder : 2044 prompt tokens + 4 decode tokens
+//     prompt step alone              : 2048 prompt tokens
+//     decode-only step               : 4-6 tokens
+//
+// A decoder therefore costs a prompt ~4 of 2048 batch slots (0.2% of its tokens), and
+// a prompt chunk is what the decoder's inter-token gap is made of: measured 1.2 s at
+// 8k depth and up to ~3 s at 64k+ against ~77 ms when the decoder runs alone -- a 16x
+// stall the prompt never notices. The two directions are not symmetric:
+//
+//   inject: skip the prompt fill for one iteration so the decoders get a step of their
+//     own. This is the only lever that moves the decoder's gap, and it costs the prompt
+//     the share of step time it takes -- the measured price on this box is 1 decode
+//     token ~= 21-29 prompt tokens (bandwidth-bound decode vs batch-bound prompt), so
+//     the price has to be paid deliberately rather than by a fixed count.
+//
+//   hold: keep the decoders' pending tokens out of the batch so a sibling prompt gets
+//     the whole n_batch. The Pareto test is per step, because a held token is made up
+//     later by a decode-only step:
+//
+//         hold iff  delta < frac * t_dec_only
+//
+//       delta      = what one decoder costs a prompt step (t_with_dec - t_no_dec)
+//       t_dec_only = a make-up step for that decoder
+//       frac <= 1  = the decoder finishes inside the remaining prompt window, in which
+//                    case holding wastes work that the prompt would have carried free
+//
+//     On this box delta ~= 40 ms against t_dec_only ~= 77 ms at every depth, so the
+//     estimate declines to hold: riding along is ~2x cheaper per decode token than
+//     stopping and resuming. That refusal is the point of the knob -- a static "hold
+//     while a prompt waits" policy has no way to notice it, and a static injection
+//     count delivers a share that shrinks as chunks slow down, i.e. least help exactly
+//     where the starvation is worst.
+//
+// MTP: the ITL target is a per-TOKEN budget, while the gap is per step. A decoder that
+// emits k tokens in a step delivers them together, so its wait between two tokens is the
+// gap divided by k, and the step's cost does not move with k (a decode-only step reads
+// 72-75 ms at every acceptance rate). Production measured 2.47-3.89 tokens per step over
+// 66 tasks. ITL_PER_TOKEN makes the target a per-token budget (the gap may be k times
+// it); it is off by default, and the target is enforced by the injection, which is the
+// cheaper lever for the same gap.
+//
+// Both directions are env-gated and off by default. The estimates are collected either
+// way, so the decision the scheduler would make can be watched before arming it:
+// LLAMA_SERVER_STEP_SCHED_LOG=N dumps the state (and the estimate table) every N steps.
+struct server_step_sched {
+    // env:
+    //   LLAMA_SERVER_STEP_SCHED_ITL_MS        inject while the decoder's gap would exceed
+    //                                         this (0 = off)
+    //   LLAMA_SERVER_STEP_SCHED_MAX_SHARE     cap on the injected share of step time, %
+    //                                         (default 33)
+    //   LLAMA_SERVER_STEP_SCHED_HOLD          0 off, 1 estimate-gated, 2 forced
+    //   LLAMA_SERVER_STEP_SCHED_PROBE_EVERY   prompt steps between identification probes
+    //                                         (default 64)
+    //   LLAMA_SERVER_STEP_SCHED_LOG           dump the state every N steps (0 = off)
+    //   LLAMA_SERVER_STEP_SCHED_ITL_PER_TOKEN the ITL target is a per-token budget: a step
+    //                                         that emits k tokens may take k times it
+    //                                         (0 = the target is the step's gap)
+    int itl_ms        = 0;
+    int max_share_pct = 33;
+    int hold_mode     = 0;
+    int probe_every   = 64;
+    int log_every     = 0;
+    int itl_per_token = 0;       // the ITL target is a per-token budget (0 = per step)
+    int pacer_mode    = 0;       // the injected steps are paced by a debt, not by the mean gap
+    int admit_tg_pct  = 0;       // admission floor: the decoder's rate with a prompt admitted, in
+                                 // % of its solo rate (0 = off; 100/n_slots is its fair share)
+    int admit_pp_pct  = 0;       // admission floor: a prompt's own rate while sharing the batch
+                                 // with another prompt, in % of its solo rate (0 = off)
+    int admit_wait_ms = 300000;  // admit a held prompt anyway after this long (0 = never): a
+                                 // client that waits forever is worse than a disturbed decoder
+    int admit_force   = 0;       // hold every newcomer while anything is in flight (bench/tests)
+    int admit_bypass_ms = 2000;    // a newcomer whose own prefill is shorter than this is admitted
+                                 // anyway: the floors protect against sustained competition, and
+                                 // a cache-hit follow-up is one step (0 = no bypass)
+
+    static constexpr int    N_BUCKET    = 4;         // decoder depth: <8k, <32k, <64k, >=64k
+    static constexpr int    MIN_SAMPLES = 8;         // per bucket before the hold estimate acts
+    static constexpr int    MAX_STREAK  = 8;         // consecutive injected steps
+    static constexpr double EWMA_FAST   = 1.0 / 8.0;
+    static constexpr double EWMA_SLOW   = 1.0 / 64.0;
+    static constexpr double HOLD_MARGIN = 0.10;      // the estimate must beat the make-up cost
+
+    // one arm of an estimate: the duration and the token count of a class of steps
+    struct arm_stats {
+        double t_ms  = 0.0;
+        double tok   = 0.0;
+        int    n     = 0;
+        int    n_tok = 0;
+    };
+
+    struct bucket_stats {
+        // prompt arms, filed by the prompt's position. `solo` is the baseline every other arm
+        // is compared against: a prompt step that also carried ANOTHER prompt used to land in
+        // the no-decoder arm and read as a solo step, biasing both the ride cost and the
+        // sharing ratio (measured on a B70: a half-batch shared step is ~1.9x the solo step
+        // time, so it is not a subtle error)
+        arm_stats solo;      // only work in the batch
+        arm_stats shared;    // another prompt in the batch
+        arm_stats with_dec;  // a decoder in the batch
+
+        // decode arm, filed by the decoder's depth. t_dec_only and k_tokens are sampled
+        // on different sets of steps -- t_dec_only only where the step carried no prompt,
+        // k on every step that advanced a decoder -- so one shared counter spends the
+        // WARMUP running mean on samples the other never saw, and can satisfy MIN_SAMPLES
+        // with steps that never measured a decode-only step, which is what admits the tg
+        // floor fires on
+        double t_dec_only = 0.0; // decode-only step: tg alone = k_tokens per t_dec_only
+        int    n_dec      = 0;    // decode-only steps in t_dec_only (the gates read this)
+        double k_tokens   = 0.0; // tokens the decoders advanced in one step
+        int    n_tok      = 0;
+        double gap_wp     = 0.0; // gap while a prompt competed: tg then = k_tokens per gap_wp
+        int    gap_wp_n   = 0;
+    };
+
+    // the ride-vs-hold comparison mixes two arms measured on different axes, so they are
+    // bucketed separately: a prompt step is filed under the position of the PROMPT being
+    // processed (that is what the decoder costs it), a decode-only step under the depth of
+    // the DECODER (that is what its attention costs). Filing both by the decoder's depth --
+    // as the first cut did -- leaves the no-decoder arm with no decoder to measure, so every
+    // one of its samples lands in bucket 0: measured after 95744 steps,
+    // 90 no-decoder samples in bucket 0 against zero with-decoder samples there, so `delta`
+    // could never be formed and the probes never stopped.
+    bucket_stats buck_pre[N_BUCKET]; // prompt arms, by prompt position
+    bucket_stats buck_dec[N_BUCKET]; // decode arm, by decoder depth
+
+    // last computed admission ratios (logged; -1 = not measured yet)
+    double admit_ratio_tg = -1.0;
+    double admit_ratio_pp = -1.0;
+
+    // -1 means either "off this decision" or "no samples yet", and those need different
+    // text in the log, so decide_admit records which instead of leaving the log to guess
+    bool   admit_tg_applies = false;
+    bool   admit_pp_applies = false;
+
+    double t_chunk    = 0.0; // prompt step duration, any composition (logged)
+    double chunk_tok  = 0.0; // prompt tokens added per prompt step (logged)
+    double ms_total   = 0.0; // wall time of the current prompt burst
+    double ms_inject  = 0.0; // of which spent in injected steps (uncapped share)
+    double share_last = 0.0; // share the last completed burst paid (logged)
+    double share_ewma = 0.0; // share completed bursts paid, over the process's bursts
+    int    n_bursts   = 0;
+    double gap_active = 0.0; // EWMA of the decoder's token gap while a prompt competes
+    double gap_debt   = 0.0; // the pacer's debt in ms against the target (see pacer_debt)
+    mutable double prev_debt = 0.0;  // the last dump's debt, for the trend arrow (log_state is const)
+    mutable bool   debt_trend_valid = false;
+    int    full_chunk = 0;   // tokens per full prompt chunk (0 = no guard)
+    double dec_ms_token = 0.0; // EWMA of a decode-only step's ms per token (0 = unmeasured)
+    int    n_dec_tok    = 0;   // sample count for dec_ms_token
+    double ms_per_token = 0.0; // EWMA of total step ms per total token, any composition (0 = unmeasured)
+    int    n_mpt        = 0;   // sample count for ms_per_token
+    double step_time_ms = 0.0; // EWMA of total step duration in ms (0 = unmeasured)
+    int    n_step_time  = 0;   // sample count for step_time_ms
+    double ms_per_prompt_tok = 0.0; // EWMA of ms/token on prompt-dominant steps
+    int    n_mpp           = 0;   // sample count for ms_per_prompt_tok
+
+    // the tokens the most starved decoder emitted in a step, and the sample count
+    double k_emitted       = 0.0; // EWMA of the tokens emitted per step (0 = unmeasured)
+    int    n_k             = 0;   // sample count for k_emitted
+
+    // what the chunk cap did, and what the two shapes of prompt step cost. The arms file a
+    // step by depth only, so a fill the cap cut and a fill that took a whole chunk land in
+    // the same bucket and average into one number; the census counts them apart.
+    struct chunk_census {
+        double  t_ms  = 0.0; // wall time, summed
+        double  p_tok = 0.0; // prompt tokens the step carried, summed
+        double  g_tok = 0.0; // decoder tokens it carried, summed
+        int64_t n     = 0;
+    };
+    chunk_census chunk_part = {}; // a partial fill: under half a chunk
+    chunk_census chunk_full = {}; // a whole chunk, or over half of one
+    int64_t n_cap_applied = 0;    // prompt fills the cap sized
+    int64_t n_cap_dropped = 0;    // prompt fills it left alone
+    double  cap_rate_last = 0.0;  // ms per prompt token the last cap divided by (logged)
+    bool    cap_pays      = false; // the measured pair let the cap run (logged)
+
+    // measured turn length, from the completed turns this process has seen. every turn here is
+    // limitless (no client cap, no --n-predict), so n_remaining() is -1 and this is the only
+    // thing that can price what an incumbent still owes
+    double  turn_tokens = 0.0;
+    int     n_turn      = 0;
+    int64_t turn_peak   = 0; // deepest a generating slot has been seen in the current turn
+
+    // The tokens the decoders emitted in the last step: the MTP luck.
+    //
+    // A decoder that emits k tokens in a step delivers them together, so the wait between
+    // two of its tokens is the step's gap divided by k. The ITL target is a per-token
+    // budget and the gap is per step, so the two differ by k under MTP: production measured
+    // a mean accepted length of 2.47-3.89 tokens per step over 66 tasks, and the step's own
+    // cost does not move with it (a decode-only step reads 72-75 ms at every acceptance
+    // rate, because the draft passes and the verify run either way).
+    //
+    // The number is the MINIMUM over the decoders in the batch: the gate defends the gap of
+    // the decoder that is starved the most, and that is the one with the fewest tokens per
+    // step. 0 means unmeasured (a slot that has not decoded yet, or one that was held out).
+    void note_emitted(int64_t k_min) {
+        if (k_min > 0) {
+            ewma_c(k_emitted, n_k, (double) k_min);
+        }
+    }
+
+    // called once per iteration with the deepest generating slot's token count, 0 when none
+    void note_gen_progress(int64_t deepest_in_turn) {
+        if (deepest_in_turn > turn_peak) {
+            turn_peak = deepest_in_turn;
+        }
+        if (deepest_in_turn == 0 && turn_peak > 0) {
+            ewma_c(turn_tokens, n_turn, (double) turn_peak);
+            turn_peak = 0;
+        }
+    }
+
+    // whether the turn length is measured well enough to price a limitless remainder with it
+    bool turn_known() const {
+        return n_turn >= MIN_SAMPLES && turn_tokens > 0.0;
+    }
+
+    // the cap's own decision, taken from the fill that made it: it either cut this iteration's
+    // prompt fill or it did not. prompt_chunk_cap() returns 0 both for "the budget is under a
+    // minimum chunk" and for "nothing measured yet", and the caller skips the call entirely
+    // when no decoder rides, so a dropped step here is a fill that ran to a whole chunk
+    // the two terms of a prompt-bearing step, from the two shapes the census counts: the small
+    // fill and the whole chunk. Both carry their own decoders, so the fit subtracts them first
+    step_sched::chunk_fit fitted_chunk() const {
+        return step_sched::fit_chunk_fixed(
+            chunk_part.n ? chunk_part.t_ms / (double) chunk_part.n : 0.0,
+            chunk_part.n ? chunk_part.p_tok / (double) chunk_part.n : 0.0,
+            chunk_part.n ? chunk_part.g_tok / (double) chunk_part.n : 0.0,
+            chunk_full.n ? chunk_full.t_ms / (double) chunk_full.n : 0.0,
+            chunk_full.n ? chunk_full.p_tok / (double) chunk_full.n : 0.0,
+            chunk_full.n ? chunk_full.g_tok / (double) chunk_full.n : 0.0,
+            dec_ms_token, (int) chunk_part.n, (int) chunk_full.n);
+    }
+
+    // the chunk under which a capped step is the slower way to move prompt tokens; 0 while the
+    // fit is unusable, which leaves the cap on its floor
+    int cap_break_even() const {
+        const step_sched::chunk_fit f = fitted_chunk();
+        return f.valid ? step_sched::chunk_break_even(f.fixed_ms, f.ms_per_token) : 0;
+    }
+
+    void note_chunk_cap(int cap_tokens) {
+        if (cap_tokens > 0) {
+            n_cap_applied++;
+        } else {
+            n_cap_dropped++;
+        }
+    }
+
+    int64_t t_last_dec    = 0;     // end of the last step that advanced a decoder
+    bool    dec_tick      = false; // a decoder has been batched at least once
+    int     streak        = 0;     // consecutive injected steps
+    bool    arrive_done   = false; // this arrival already had its step
+    int     since_probe   = 0;     // prompt steps since the last held/refresh step
+    int64_t n_steps       = 0;
+    int64_t n_inject_eps  = 0;     // episodes in which the prompt fill was skipped
+    int64_t n_inject_steps = 0;    // injected (decode-only) steps, in total
+    int64_t n_hold        = 0;     // holds: the decoders kept out of the batch
+    bool    prev_inject   = false; // log transitions only
+    bool    prompt_pending = false;
+
+    // sample counts for the warm-up-aware EWMAs (see ewma_c)
+    int n_gap = 0;
+    int n_chunk = 0;
+    int n_chunk_tok = 0;
+
+    // composition of the batch being built/decoded, see note_composition()
+    int cur_gen_tok      = 0;
+    int cur_prompt_tok   = 0;
+    int cur_prompt_slots = 0;
+    int cur_inject     = 0;
+    int cur_bucket_pre = 0;
+    int cur_bucket_dec = 0;
+
+    server_step_sched() {
+        itl_ms        = env_int("LLAMA_SERVER_STEP_SCHED_ITL_MS",      0);
+        max_share_pct = std::clamp(env_int("LLAMA_SERVER_STEP_SCHED_MAX_SHARE", 33), 0, 100);
+        hold_mode     = env_int("LLAMA_SERVER_STEP_SCHED_HOLD",        0);
+        probe_every   = std::max(1, env_int("LLAMA_SERVER_STEP_SCHED_PROBE_EVERY", 64));
+        log_every     = std::max(0, env_int("LLAMA_SERVER_STEP_SCHED_LOG", 0));
+        itl_per_token = env_int("LLAMA_SERVER_STEP_SCHED_ITL_PER_TOKEN", 0) != 0;
+        pacer_mode    = env_int("LLAMA_SERVER_STEP_SCHED_PACER", 0) != 0;
+        admit_tg_pct  = std::clamp(env_int("LLAMA_SERVER_STEP_SCHED_ADMIT_TG_PCT",   0), 0, 100);
+        admit_pp_pct  = std::clamp(env_int("LLAMA_SERVER_STEP_SCHED_ADMIT_PP_PCT",   0), 0, 100);
+        admit_wait_ms = std::max(0, env_int("LLAMA_SERVER_STEP_SCHED_ADMIT_WAIT_MS", 300000));
+        admit_force   = env_int("LLAMA_SERVER_STEP_SCHED_ADMIT_FORCE", 0) != 0;
+        admit_bypass_ms = std::max(0, env_int("LLAMA_SERVER_STEP_SCHED_ADMIT_BYPASS_MS", 2000));
+
+        if (itl_ms > 0 || hold_mode > 0 || admit_tg_pct > 0 || admit_pp_pct > 0) {
+            if (itl_per_token) {
+                SRV_INF("step sched: config: token wait budget = %d ms/token, per-step budget = budget x tokens/step\n",
+                        itl_ms);
+            } else {
+                SRV_INF("step sched: config: token wait budget = %d ms/step\n", itl_ms);
+            }
+            SRV_INF("step sched: config: prompt share cap = %d%%, decoder pause = %s, measure every %d steps\n",
+                    max_share_pct,
+                    hold_mode == 2 ? "forced" : (hold_mode == 1 ? "estimate-gated" : "off"),
+                    probe_every);
+            SRV_INF("step sched: config: new requests: decoder >= %d%% of solo speed, prompt >= %d%% of its own; "
+                    "held up to %d ms; prompts < %d ms admitted anyway\n",
+                    admit_tg_pct, admit_pp_pct, admit_wait_ms, admit_bypass_ms);
+        }
+    }
+
+    static int env_int(const char * name, int def) {
+        const char * v = getenv(name);
+        return v ? atoi(v) : def;
+    }
+
+    static int bucket_of(int32_t depth) {
+        return depth < 8192 ? 0 : depth < 32768 ? 1 : depth < 65536 ? 2 : 3;
+    }
+
+    static constexpr int WARMUP = 8; // samples before an estimate uses the slow EWMA
+
+    // Warm-up aware EWMA. The box reloads the model ~58 times in 19 h (borrow cycles), and
+    // every reload forgets every estimate: a plain EWMA needs 4-8 samples to reach the
+    // starvation level, which on a cold 30-100k prompt is the whole window the scheduler
+    // exists for. For the first WARMUP samples the weight is 1/(n+1), i.e. a running mean.
+    static void ewma_c(double & v, int & n, double x) {
+        if (n == 0) {
+            v = x;
+        } else if (n < WARMUP) {
+            v += (x - v) / (double) (n + 1);
+        } else {
+            v = v * (1.0 - EWMA_FAST) + x * EWMA_FAST;
+        }
+        n++;
+    }
+
+    // one sample into an arm: duration and tokens advance with their own counters
+    static void arm_add(arm_stats & a, double t_ms, double tok) {
+        ewma_c(a.t_ms, a.n,     t_ms);
+        ewma_c(a.tok,  a.n_tok, tok);
+    }
+
+    // what the floors are protecting against is a newcomer's *remaining* prompt work, not the
+    // length of the conversation: a cache-hit follow-up (question, tool call) is the tail of a
+    // prompt whose prefix is already in the slot, so the cost of admitting it is bounded by its
+    // own duration -- one step for a few hundred tokens, which is the same chunk-length hiccup
+    // the incumbent already takes while any prompt runs.
+    static int64_t effective_prompt_tokens(const server_slot & slot) {
+        if (!slot.task) {
+            return 0;
+        }
+        const int64_t n = (int64_t) slot.task->n_tokens();
+        if (!slot.can_split() || !slot.task->params.cache_prompt) {
+            return n;
+        }
+        return std::max<int64_t>(0, n - (int64_t) slot.prompt.tokens.get_common_prefix(slot.task->tokens));
+    }
+
+    // the estimate is in STEPS, because a step is the quantum: even a 4-token prefill costs
+    // one prompt step, and the measured per-step size and duration are what the arms carry.
+    // no work left is not no work: a prompt whose tokens are all in the slot's cache still
+    // costs one step, because the server evaluates one token to get its logits even with
+    // nothing to add, and a step is the quantum the floors are priced in. so 0.0 is
+    // reserved for "not measured yet" (chunk_tok/t_chunk are 0 until the first prompt step)
+    // and the caller's `est_ms > 0.0` test keeps meaning "an estimate exists" -- otherwise
+    // the cheapest arrival this box ever sees is the one that is never taken. the server
+    // runs --slot-prompt-similarity 0.05, so a fully cached prompt is routine here, and the
+    // 2026-09-26 review found 21 of them HELD with ADMIT_TG_PCT=50 armed: mean 71 s, max
+    // 300 s, 2 of them waiting out the whole bound.
+    double estimate_prefill_ms(int64_t tokens) const {
+        if (chunk_tok <= 0.0 || t_chunk <= 0.0) {
+            return 0.0; // nothing measured yet
+        }
+        if (tokens <= 0) {
+            return t_chunk; // no tokens left, but the step is still taken
+        }
+        return std::ceil((double) tokens / chunk_tok) * t_chunk;
+    }
+
+    // the arrival's price is an O(prompt) common-prefix scan, so it is taken only while the
+    // arrival arm can still use it: with the lever off, with no decoder to protect, or once
+    // this arrival has been priced, the scan buys nothing
+    bool arms_arrival(int n_gen) const {
+        return itl_ms > 0 && n_gen > 0 && !arrive_done;
+    }
+
+    static const char * bucket_name(int i) {
+        switch (i) {
+            case 0:  return "<8k";
+            case 1:  return "8-32k";
+            case 2:  return "32-64k";
+            default: return "64k+";
+        }
+    }
+
+    // display width in terminal cells: every glyph this logger emits is East-Asian-Width
+    // Neutral (box drawing, arrows, check, block elements), so codepoint count == cell count
+    static int display_width(const std::string & s) {
+        int w = 0;
+        for (unsigned char c : s) {
+            if ((c & 0xC0) != 0x80) {
+                ++w;
+            }
+        }
+        return w;
+    }
+
+    // repeat a single UTF-8 glyph n times: char literals cannot hold multi-byte codepoints
+    static std::string repeat(const std::string & s, int n) {
+        std::string out;
+        out.reserve((size_t) n * s.size());
+        for (int i = 0; i < n; ++i) {
+            out += s;
+        }
+        return out;
+    }
+
+    static std::string box_top(int width) {
+        return "┌" + repeat("─", width + 2) + "┐";
+    }
+
+    static std::string box_bottom(int width) {
+        return "└" + repeat("─", width + 2) + "┘";
+    }
+
+    static std::string box_row(const std::string & content, int width) {
+        const int pad = width - display_width(content);
+        return "│ " + content + (pad > 0 ? std::string((size_t) pad, ' ') : std::string()) + " │";
+    }
+
+    // 10-cell bar, scaled so a full bar means "at limit"
+    static std::string bar(double value, double limit) {
+        const int cells = 10;
+        const int filled = limit > 0.0 ? std::min(cells, (int) (value / limit * cells + 0.5)) : 0;
+        return repeat("▇", filled) + repeat("░", cells - filled);
+    }
+
+    // admission guard: may a prompt that has not added a token yet enter the batch?
+    //
+    // Two floors, both measured rather than assumed:
+    //   - `admit_tg_pct` of the target that the decoders in the batch may already spend. The
+    //     live cost of a decoder-bearing step is gen_tokens * dec_ms_token. Under the floor
+    //     the budget can still fit a minimum prompt chunk into the target, so the prompt
+    //     rides and the decoder's gap still meets the target; over it, every iteration the
+    //     prompt shares is spent over the target and the only lever left is to let the
+    //     decoders run alone. The batcher is the primary mechanism, this is its fallback,
+    //     and it needs no samples, so admission does not depend on process uptime.
+    //   - `admit_pp_pct` of a prompt's own rate while another prompt shares the batch.
+    //     Measured: two prefills each keep ~95% of their solo rate (the batch splits, and a
+    //     half-batch step takes ~half the time: 0.948 within-task, 0.944-0.952 position
+    //     matched), so a 50% floor does not fire on this box -- the aggregate nearly doubles
+    //     when a second pp job is admitted.
+    //
+    // Both floors are off unless set, because they change who waits for whom: the guard only
+    // ever holds the prompt that has not started, never a task in flight, and the bound
+    // (admit_wait_ms) means a held prompt always enters eventually.
+    bool decide_admit(int n_gen, int n_inflight) {
+        admit_ratio_tg = -1.0;
+        admit_ratio_pp = -1.0;
+
+        if (n_gen == 0 && n_inflight == 0) {
+            return true; // nothing in flight to protect
+        }
+        if (admit_force) {
+            return false; // forced: bench and tests only
+        }
+
+        admit_tg_applies = n_gen      > 0 && admit_tg_pct > 0;
+        admit_pp_applies = n_inflight > 0 && admit_pp_pct > 0;
+
+        // what the decoders in the batch already spend of the target, from the cost of a
+        // decoder-bearing step: this is the quantity the budget is on the other side of
+        const double dec_cost = (double) cur_gen_tok * dec_ms_token;
+        // the target is the step's gap budget, and in the per-token mode it is k times the
+        // configured value (see itl_target_ms): the floor is a share of the same budget the
+        // gate and the chunk cap defend
+        const double target_ms = step_sched::itl_target_ms(itl_ms, k_emitted, itl_per_token != 0);
+        if (admit_tg_applies && target_ms > 0) {
+            admit_ratio_tg = dec_cost / target_ms; // the decoders' share of the target
+        }
+        if (admit_pp_applies) {
+            // the ratio is a property of the batch split, not of the depth: two prompts
+            // sharing a batch each get half of it, whatever the depth costs. the arms are
+            // filed per depth bucket and a long prompt crosses the buckets while it fills, so
+            // a bucket rarely reaches the sample count and the ratio is never measured
+            // (production: the solo arm at n=1, the shared arm at n=0, the floor idle).
+            // pool the arms over the buckets.
+            double solo_tok = 0.0, solo_ms = 0.0, shared_tok = 0.0, shared_ms = 0.0;
+            int    solo_n = 0, shared_n = 0;
+            for (int i = 0; i < N_BUCKET; ++i) {
+                const bucket_stats & b = buck_pre[i];
+                solo_tok   += b.solo.tok;   solo_ms   += b.solo.t_ms;
+                shared_tok += b.shared.tok; shared_ms += b.shared.t_ms;
+                solo_n     += b.solo.n;
+                shared_n   += b.shared.n;
+            }
+            if (solo_n >= MIN_SAMPLES && shared_n >= MIN_SAMPLES && solo_ms > 0.0 && shared_ms > 0.0) {
+                const double r_solo   = solo_tok   / solo_ms;     // tokens per ms for one prompt
+                const double r_shared = shared_tok / shared_ms;   // ... and for each sharer
+                admit_ratio_pp = r_shared / r_solo;
+            }
+        }
+
+        // the share the floor allows is the configured share: the decoder count is priced by
+        // dec_cost, which is what the floor is compared against, so a term scaling the share
+        // with the count would price the same decoders twice. the batcher's chunk cap answers
+        // a hot gap, so that needs no term here either
+        if (admit_tg_applies && step_sched::admit_blocked_by_decoders(target_ms, dec_cost, admit_tg_pct)) {
+            return false; // the decoders already spend more of the target than the floor allows
+        }
+        if (admit_ratio_pp > 0.0 && admit_ratio_pp * 100.0 < (double) admit_pp_pct) {
+            return false;
+        }
+        return true;
+    }
+
+    // skip the prompt fill this iteration so the decoders get a step of their own.
+    // returns false unless a decoder would otherwise wait a whole prompt chunk.
+    bool decide_inject(int n_gen, int n_prompt, int prompt_left, int n_arriving, double arrive_ms, bool cont_batching, int gen_depth) {
+        if (itl_ms <= 0 || !cont_batching || n_gen == 0 || n_prompt == 0) {
+            return false;
+        }
+        // a newcomer is still SLOT_STATE_STARTED at the scan, so it owns none of prompt_left
+        // (that counts what an in-flight prompt has left); asking about the two separately is
+        // what lets its first chunk be met with a step of the decoders' own
+        if (prompt_left <= 0 && n_arriving == 0) {
+            return false;
+        }
+
+        if (n_arriving == 0) {
+            arrive_done = false;
+        }
+
+        // the step the incumbent waits through is the NEWCOMER's prefill, not t_chunk, which is
+        // an EWMA over every prompt step and read 294 ms against this 400 ms target. arrive_ms
+        // is 0 when the newcomer was not priced, and then the arm stays off.
+        // the newcomer's prefill is priced against the step's gap budget, which in the
+        // per-token mode is k times the configured target (see itl_target_ms)
+        const double target_ms = step_sched::itl_target_ms(itl_ms, k_emitted, itl_per_token != 0);
+        const bool arrival = n_arriving > 0 && !arrive_done && arrive_ms > target_ms;
+
+        const int64_t now = ggml_time_ms();
+
+        if (!dec_tick) {
+            // the slot entered SLOT_STATE_GENERATING on the previous iteration, so its
+            // gap starts now rather than at the process start
+            dec_tick   = true;
+            t_last_dec = now;
+            return false;
+        }
+
+        // the decoder's token gap while a prompt competes is what the client sees, and it
+        // is what an injected step moves: the token a prompt step delivers waits for that
+        // step either way, but a decode-only step landing in between shortens the mean gap
+        // the gap to defend is the one the decoders in front of the gate see: their own
+        // depth arm once it is measured, the run-wide mean before that (see the header)
+        const bucket_stats & bd_gate = buck_dec[bucket_of(gen_depth)];
+        const double gap_gate = step_sched::gate_gap_ms(bd_gate.gap_wp, bd_gate.gap_wp_n, gap_active, MIN_SAMPLES);
+        // the pacer reads the debt instead of the mean gap: the same target and the same
+        // decision, without the EWMA's lag (see pacer_debt)
+        const bool gate_open = pacer_mode
+            ? gap_debt > 0.0
+            : step_sched::inject_gate_open(gap_gate, itl_ms, k_emitted, itl_per_token != 0);
+        if (!arrival && !gate_open) {
+            return false; // the gap at the decoders' depth is within target
+        }
+        // the streak cap relaxes as the decoder count grows: each additional
+        // decoder makes it harder for the prompt to finish a chunk between
+        // injection episodes, so the cap rises to keep the decoders fed. at
+        // 0 decoders the cap is halved (the prompt owns the batch); at 8
+        // decoders it doubles
+        const int streak_limit = std::max(MAX_STREAK / 2, std::min(MAX_STREAK * 2, MAX_STREAK + 4 * n_gen / (4 + n_gen)));
+        if (streak >= streak_limit) {
+            return false; // the prompt must make progress
+        }
+        // max_share_pct == 0 is a legal clamp and the plain way to say "never inject", so it
+        // is tested before the measurement: ms_total is 0 until the first step of a burst is
+        // observed, and that short-circuit used to buy exactly one injected step per burst
+        if (max_share_pct <= 0) {
+            return false;
+        }
+        // a prompt with few tokens left is nearly done: stretching it out with
+        // more injected steps delays its completion for marginal decoder benefit.
+        // scale the share down as the prompt approaches its end
+        const double prompt_urgency = prompt_left > 0 ? std::min(1.0, 64.0 / (double) prompt_left) : 0.0;
+        // the cap bounds the PROMPT's loss -- its injected share of step time -- so the
+        // decoder's gap must not scale it: gap_active >= itl_ms would zero the cap,
+        // which is the regime the trigger above fires in and the only lever on that gap
+        const int max_share_eff = itl_ms > 10
+            ? (int)(max_share_pct * (1.0 - 0.5 * prompt_urgency))
+            : max_share_pct;
+        if (ms_total > 0.0 && ms_inject / ms_total * 100.0 >= (double) max_share_eff) {
+            return false; // the prompt has paid enough for now
+        }
+
+        // one step per arrival, never a streak: holding the newcomer for a streak would delay
+        // the very first token this step exists to deliver
+        arrive_done = arrival;
+
+        return true;
+    }
+
+    // keep the decoders' pending tokens out of the batch so the prompt gets all of n_batch
+    bool decide_hold(int n_gen, int n_prompt, int gen_depth, int prompt_depth) {
+        if (hold_mode == 0 || n_gen == 0 || n_prompt == 0) {
+            return false;
+        }
+        if (hold_mode == 2) {
+            return true; // forced: bench and tests only
+        }
+
+        const bucket_stats & bp = buck_pre[bucket_of(prompt_depth)];
+        const bucket_stats & bd = buck_dec[bucket_of(gen_depth)];
+
+        // identification: a decoder that always rides along leaves no counterfactual, so
+        // take a held probe every probe_eff prompt steps until the buckets have both arms.
+        // the prompt arm is what forms the counterfactual; the decode arm prices the
+        // make-up step
+        // the probe interval shrinks as the decoder count grows: each additional
+        // decoder makes the rate estimate stale faster, so probe more often
+        const int probe_eff = std::max(2, (int)(probe_every * 8.0 / (8.0 + (double) n_gen)));
+        if (bp.solo.n < MIN_SAMPLES || bp.with_dec.n < MIN_SAMPLES || bd.n_dec < MIN_SAMPLES) {
+            if (++since_probe >= probe_eff) {
+                since_probe = 0;
+                n_hold++;
+                return true;
+            }
+            return false;
+        }
+
+        // the make-up step is the decoder's own step: it pays the attention the prompt's
+        // step gave up, so the hold costs the prompt no throughput and costs the decoder
+        // one step of latency. what is at risk is the client's wait, so bound that: the
+        // gap the client is sitting in plus the make-up step must stay inside the target.
+        const double t_dec = bd.t_dec_only; // a make-up step for that decoder
+        if (t_dec <= 0.0) {
+            return false;
+        }
+
+        if (++since_probe >= probe_eff) {
+            since_probe = 0;
+            return false; // refresh the decoder-batched estimate
+        }
+
+        const double gap_now = (double) (ggml_time_ms() - t_last_dec);
+        const double target_ms = step_sched::itl_target_ms(itl_ms, k_emitted, itl_per_token != 0);
+        // the margin grows as the decoder count grows: each additional decoder
+        // makes the estimate less reliable, so hold more aggressively
+        const double margin_eff = HOLD_MARGIN * (1.0 + 4.0 * (double) n_gen / (4.0 + (double) n_gen));
+        if (!step_sched::hold_slack_open(gap_now, t_dec, target_ms, margin_eff)) {
+            return false;
+        }
+        n_hold++;
+        return true;
+    }
+
+    void set_batch(int n_batch) {
+        full_chunk = n_batch;
+    }
+
+    void note_composition(int gen_tok, int prompt_tok, int prompt_slots, bool inject, int gen_depth, int prompt_depth, bool prompt_waiting) {
+        cur_gen_tok      = gen_tok;
+        cur_prompt_tok   = prompt_tok;
+        cur_prompt_slots = prompt_slots;
+        cur_inject       = inject ? 1 : 0;
+        cur_bucket_pre   = bucket_of(prompt_depth);
+        cur_bucket_dec   = bucket_of(gen_depth);
+        prompt_pending   = prompt_waiting;
+
+        // the injected share is a per-burst quantity: the cap exists to bound what the PROMPT
+        // loses while a decoder competes, and a decoder running alone cannot cost it
+        // anything. Diluting the share over quiet time -- as the first cut did -- reported
+        // 0-5% while bursts were paying 13-17% (measured, same window). A burst that just
+        // ended is folded into share_ewma so the dump still reports what bursts cost even
+        // when the print lands between two of them.
+        if (!prompt_waiting) {
+            if (ms_total > 0.0) {
+                share_last = ms_inject / ms_total;
+                ewma_c(share_ewma, n_bursts, share_last);
+            }
+            ms_inject = 0.0;
+            ms_total  = 0.0;
+        }
+
+        // The controller hovers around its target, so the ride/inject decision can flip every
+        // iteration: this is a DEBUG line (shown at -lv 5), and the
+        // counts below are what the periodic dump reports. Logging it at INFO spammed the
+        // journal at one line per second per slot on the production box (2026-09-20).
+        if (inject != prev_inject) {
+            prev_inject = inject;
+            if (inject) {
+                n_inject_eps++;
+            }
+            SRV_DBG("step sched: → %s\n", inject
+                ? "prompt fill skipped this iteration: the decoders get a step of their own"
+                : "prompt fill resumes: the decoders ride the prompt step");
+        }
+        if (inject) {
+            n_inject_steps++;
+        }
+    }
+
+    // a decoder that went away must not leave a stale gap behind
+    void note_no_decoders() {
+        dec_tick    = false;
+        streak      = 0;
+        arrive_done = false;
+    }
+
+    void observe(double t_ms) {
+        if (t_ms < 0.0) {
+            return;
+        }
+
+        n_steps++;
+
+        // the adaptive batch size prices the ITL budget in tokens: a step that carried
+        // no tokens (an empty injection) has no ms/token to sample
+        {
+            const int n_total = cur_prompt_tok + cur_gen_tok;
+            if (n_total > 0) {
+                ewma_c(ms_per_token, n_mpt, t_ms / (double) n_total);
+                // only prompt-dominant steps price a prompt token; a decode-dominant step's
+                // ms/token is the decode rate, which the budget pays for separately
+                if (cur_prompt_tok >= cur_gen_tok) {
+                    ewma_c(ms_per_prompt_tok, n_mpp, t_ms / (double) n_total);
+                }
+            }
+            ewma_c(step_time_ms, n_step_time, t_ms);
+        }
+
+        if (prompt_pending) {
+            ms_total += t_ms;
+            if (cur_inject) {
+                ms_inject += t_ms;
+            }
+        }
+
+        if (cur_prompt_tok > 0) {
+            ewma_c(t_chunk,   n_chunk,     t_ms);
+            ewma_c(chunk_tok, n_chunk_tok, (double) cur_prompt_tok);
+
+            // which shape this fill was, and what it cost: the cap's whole job is to make the
+            // partial one, and the whole chunk is what it leaves when it cannot (see the census)
+            chunk_census & cc = (full_chunk > 0 && cur_prompt_tok * 2 < full_chunk) ? chunk_part : chunk_full;
+            cc.t_ms  += t_ms;
+            cc.p_tok += (double) cur_prompt_tok;
+            cc.g_tok += (double) cur_gen_tok;
+            cc.n++;
+
+            // a prompt step enters the hold estimate only as a full chunk: a tail step (the
+            // last few tokens of a prompt) costs a fraction of a chunk and would read as
+            // "a decoder makes prompt steps much slower" in the wrong direction
+            const bool full_step = full_chunk <= 0 || cur_prompt_tok * 4 >= full_chunk;
+            bucket_stats & bp = buck_pre[cur_bucket_pre];
+
+            if (cur_gen_tok > 0) {
+                if (full_step) {
+                    arm_add(bp.with_dec, t_ms, (double) cur_prompt_tok);
+                }
+            } else if (cur_prompt_slots > 1) {
+                if (full_step) {
+                    // the floor is about the rate a PROMPT gets, and a shared step carries
+                    // n_batch/n_prompt_slots for each of them: record the per-slot tokens, or
+                    // the arm reads as the batch's aggregate rate (which is ~parity even when
+                    // each job runs at half speed) and the floor could never fire
+                    arm_add(bp.shared, t_ms, (double) cur_prompt_tok / (double) cur_prompt_slots);
+                }
+            } else if (full_step) {
+                arm_add(bp.solo, t_ms, (double) cur_prompt_tok);
+            }
+
+            streak = 0;
+        } else if (cur_gen_tok > 0) {
+            // a step that carries only decoders: either the server has no prompt pending
+            // or the scheduler skipped the prompt fill. Either way this is what a held
+            // token costs to make up later (t_dec_only in the hold criterion)
+            bucket_stats & bd = buck_dec[cur_bucket_dec];
+            ewma_c(bd.t_dec_only, bd.n_dec, t_ms);
+            ewma_c(dec_ms_token, n_dec_tok, t_ms / (double) cur_gen_tok);
+
+            if (cur_inject) {
+                streak++;
+            }
+        }
+
+        if (cur_gen_tok > 0) {
+            const int64_t now_ms = ggml_time_ms();
+
+            // sample the starved gap only where a prompt was competing for the batch
+            if (t_last_dec > 0 && prompt_pending) {
+                const double gap = (double) (now_ms - t_last_dec);
+                ewma_c(gap_active, n_gap, gap);
+                bucket_stats & bg = buck_dec[cur_bucket_dec];
+                ewma_c(bg.gap_wp, bg.gap_wp_n, gap); // the admission guard's "tg with a prompt" arm
+            }
+
+            // the pacer's debt: every step the decoders advanced adds its excess over the
+            // target, and an injected step -- shorter than the target -- pays the debt back
+            const double target_debt = step_sched::itl_target_ms(itl_ms, k_emitted, itl_per_token != 0);
+            gap_debt = step_sched::pacer_debt(gap_debt, t_ms, target_debt);
+
+            bucket_stats & bd = buck_dec[cur_bucket_dec];
+            ewma_c(bd.k_tokens, bd.n_tok, (double) cur_gen_tok);
+
+            dec_tick   = true;
+            t_last_dec = now_ms;
+        }
+
+        if (log_every > 0 && n_steps % log_every == 0) {
+            log_state();
+        }
+    }
+
+    void log_state() const {
+        // The box is the part to read in two seconds: is the token wait inside budget, is
+        // the prompt's share inside the cap, and which context is starving the decoders.
+        // Everything below the box is the measurement that produced those answers.
+        const double budget_ms = step_sched::itl_target_ms(itl_ms, k_emitted, itl_per_token != 0);
+        const double share_pct = ms_total > 0.0 ? ms_inject / ms_total * 100.0 : 0.0;
+        const bool gap_ok   = budget_ms <= 0.0 || gap_active <= budget_ms;
+        const bool share_ok = share_pct <= (double) max_share_pct;
+        const double gap_ratio = budget_ms > 0.0 ? gap_active / budget_ms * 100.0 : 0.0;
+
+        // the pressure bucket is the warmed decode bucket that keeps the least of its solo
+        // speed while a prompt competes: a new prompt would hurt the decoders there most
+        int hot = -1;
+        double hot_kept = -1.0;
+        for (int i = 0; i < N_BUCKET; ++i) {
+            const bucket_stats & b = buck_dec[i];
+            if (b.n_dec < MIN_SAMPLES || b.gap_wp_n < MIN_SAMPLES || b.gap_wp <= 0.0) {
+                continue;
+            }
+            const double kept = b.t_dec_only / b.gap_wp;
+            if (hot < 0 || kept < hot_kept) {
+                hot = i;
+                hot_kept = kept;
+            }
+        }
+
+        const int width = 96;
+        SRV_INF("%s", ("step sched: " + box_top(width) + "\n").c_str());
+        SRV_INF("%s", ("step sched: " + box_row(std::string("state = ") + (gap_ok && share_ok ? "steady" : "stress")
+                    + ", steps = " + std::to_string(n_steps)
+                    + ", step = " + string_format("%.1f ms", t_chunk)
+                    + ", prompt " + string_format("%.1f tok/step", chunk_tok)
+                    + ", decode " + string_format("%.2f tok/step", k_emitted), width) + "\n").c_str());
+        SRV_INF("%s", ("step sched: " + box_row((budget_ms > 0.0
+                    ? "token wait = " + string_format("%.1f ms (%.0f%% of %.1f ms budget)", gap_active, gap_ratio, budget_ms)
+                    : "token wait = " + string_format("%.1f ms (no budget set)", gap_active))
+                    + (gap_ok ? " \u2713" : " !"), width) + "\n").c_str());
+        SRV_INF("%s", ("step sched: " + box_row("prompt share = " + string_format("%.1f%%", share_pct)
+                    + " of " + std::to_string(max_share_pct) + "% cap " + (share_ok ? "\u2713" : "!")
+                    + ", in flight " + string_format("%.0f ms", ms_total)
+                    + ", last " + string_format("%.1f%%", share_last * 100.0)
+                    + " " + bar(share_pct, (double) max_share_pct), width) + "\n").c_str());
+        const char * trend = !debt_trend_valid ? "n/a"
+            : (gap_debt > prev_debt + 1.0 ? "\u2191" : gap_debt < prev_debt - 1.0 ? "\u2193" : "\u2192");
+        SRV_INF("%s", ("step sched: " + box_row("wait debt = " + string_format("%.0f ms", gap_debt)
+                    + (gap_debt < 0.0 ? " (under budget)" : gap_debt > 0.0 ? " (over budget)" : "")
+                    + " " + trend
+                    + ", decoder pauses = " + std::to_string(n_hold), width) + "\n").c_str());
+        SRV_INF("%s", ("step sched: " + box_row("episodes: " + std::to_string(n_inject_eps)
+                    + " (" + std::to_string(n_inject_steps) + " steps), share mean "
+                    + string_format("%.1f%%", share_ewma * 100.0)
+                    + ", bursts " + std::to_string(n_bursts), width) + "\n").c_str());
+        std::string learn = "learning: prompt";
+        for (int i = 0; i < N_BUCKET; ++i) {
+            const bucket_stats & b = buck_pre[i];
+            const int slowest = std::min(b.solo.n, std::min(b.shared.n, b.with_dec.n));
+            learn += (i > 0 ? ", " : " ") + string_format("%s %d/%d", bucket_name(i), std::min(slowest, MIN_SAMPLES), MIN_SAMPLES);
+        }
+        SRV_INF("%s", ("step sched: " + box_row(learn, width) + "\n").c_str());
+        const std::string pressure = hot < 0
+            ? "pressure: n/a (no decode bucket measured under a prompt)"
+            : std::string("pressure: ") + bucket_name(hot) + " context (decoder keeps "
+              + string_format("%.1f%%", hot_kept * 100.0) + " of solo speed)";
+        SRV_INF("%s", ("step sched: " + box_row(pressure, width) + "\n").c_str());
+        SRV_INF("%s", ("step sched: " + box_bottom(width) + "\n").c_str());
+
+        prev_debt = gap_debt;
+        debt_trend_valid = true;
+
+        // prompt cost by context position: what a step costs alone, sharing another
+        // prompt, and carrying a decoder
+        SRV_INF("%s", "step sched: \u251c\u2500 prompt cost by context position: alone / +prompt / +decoder\n");
+        for (int i = 0; i < N_BUCKET; ++i) {
+            const bucket_stats & b = buck_pre[i];
+            if (b.solo.n == 0 && b.shared.n == 0 && b.with_dec.n == 0) {
+                continue;
+            }
+            SRV_INF("step sched: \u2502   %-7s %8.1f ms / %6.0f tok (n=%d)  %8.1f ms / %6.0f tok (n=%d)  %8.1f ms / %6.0f tok (n=%d)\n",
+                    bucket_name(i),
+                    b.solo.t_ms, b.solo.tok, b.solo.n,
+                    b.shared.t_ms, b.shared.tok, b.shared.n,
+                    b.with_dec.t_ms, b.with_dec.tok, b.with_dec.n);
+            const bool ride_ok  = b.solo.n >= MIN_SAMPLES && b.with_dec.n >= MIN_SAMPLES;
+            const bool share_ok = b.solo.n >= MIN_SAMPLES && b.shared.n >= MIN_SAMPLES;
+            if (ride_ok || share_ok) {
+                const double pp = share_ok && b.shared.t_ms > 0.0 && b.solo.t_ms > 0.0
+                    ? (b.shared.tok / b.shared.t_ms) / (b.solo.tok / b.solo.t_ms) : -1.0;
+                SRV_INF("step sched: \u2502            decoder cost = %s, prompt speed kept = %s\n",
+                        ride_ok ? string_format("%.1f ms", b.with_dec.t_ms - b.solo.t_ms).c_str() : "learning",
+                        pp >= 0.0 ? string_format("%.1f%%", pp * 100.0).c_str() : "learning");
+            }
+        }
+
+        // decoder speed by context length: what a step costs alone, under a prompt, and how
+        // much of the solo speed survives
+        SRV_INF("%s", "step sched: \u251c\u2500 decoder speed by context length: alone (k) / under prompt / speed kept\n");
+        for (int i = 0; i < N_BUCKET; ++i) {
+            const bucket_stats & b = buck_dec[i];
+            if (b.n_dec == 0) {
+                continue;
+            }
+            const bool tg_ok = b.n_dec >= MIN_SAMPLES && b.gap_wp_n >= MIN_SAMPLES && b.gap_wp > 0.0;
+            SRV_INF("step sched: \u2502   %-7s %8.1f ms (n=%d, k %.1f)  %8.1f ms (n=%d)  %s%s\n",
+                    bucket_name(i), b.t_dec_only, b.n_dec, b.k_tokens, b.gap_wp, b.gap_wp_n,
+                    tg_ok ? string_format("%.1f%%", b.t_dec_only / b.gap_wp * 100.0).c_str() : "learning",
+                    hot == i ? " \u25b8" : "");
+        }
+
+        // the chunk census: what partial and full prompt chunks cost, and what the cap saves
+        const step_sched::chunk_fit fitted = fitted_chunk();
+        SRV_INF("%s", "step sched: \u251c\u2500 prompt chunk: partial / full\n");
+        SRV_INF("step sched: \u2502   partial = %8.1f ms / %6.0f tok / %4.1f gen (n=%" PRId64 "), "
+                "full = %8.1f ms / %6.0f tok / %4.1f gen (n=%" PRId64 ")\n",
+                chunk_part.n ? chunk_part.t_ms / (double) chunk_part.n : 0.0,
+                chunk_part.n ? chunk_part.p_tok / (double) chunk_part.n : 0.0,
+                chunk_part.n ? chunk_part.g_tok / (double) chunk_part.n : 0.0, chunk_part.n,
+                chunk_full.n ? chunk_full.t_ms / (double) chunk_full.n : 0.0,
+                chunk_full.n ? chunk_full.p_tok / (double) chunk_full.n : 0.0,
+                chunk_full.n ? chunk_full.g_tok / (double) chunk_full.n : 0.0, chunk_full.n);
+        SRV_INF("step sched: \u2502   cap: used %" PRId64 "x, skipped %" PRId64 "x, saves %.2f ms/tok, "
+                "pays = %s, fixed %s, marginal %s, break-even %d tok\n",
+                n_cap_applied, n_cap_dropped, cap_rate_last, cap_pays ? "yes" : "no",
+                fitted.valid ? string_format("%.0f ms", fitted.fixed_ms).c_str() : "n/a",
+                fitted.valid ? string_format("%.2f ms/tok", fitted.ms_per_token).c_str() : "n/a",
+                cap_break_even());
+
+        // the admission guard's last reading: the floors are the startup config
+        SRV_INF("step sched: \u251c\u2500 new request check: decoder %s (floor %d%%), prompt %s (floor %d%%)\n",
+                admit_ratio_tg < 0.0 ? "n/a" : string_format("%.1f%%", admit_ratio_tg * 100.0).c_str(),
+                admit_tg_pct,
+                admit_ratio_pp < 0.0 ? "n/a" : string_format("%.1f%%", admit_ratio_pp * 100.0).c_str(),
+                admit_pp_pct);
+    }
+};
+
 //
 // server_context_impl (private implementation)
 //
@@ -1124,6 +2086,10 @@ private:
 
     // slots / clients
     std::vector<server_slot> slots;
+
+    // decides, once per iteration, whether the decoders ride the prompt step, are held
+    // out of it, or get a step of their own (see server_step_sched)
+    server_step_sched step_sched;
 
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
@@ -3608,6 +4574,10 @@ private:
     }
 
     void update_slots() {
+        // the scheduler's unit of account is the wall time of one server iteration: this
+        // is what the client's inter-token gap is made of (batch build, decode and the
+        // response of the previous step all land inside it)
+        const int64_t t_sched_step = ggml_time_ms();
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -3736,6 +4706,8 @@ private:
                 break; // stop any further processing
             }
         }
+
+        step_sched.observe((double) (ggml_time_ms() - t_sched_step));
     }
 
     // realtime conversations (SERVER_TASK_TYPE_REALTIME) drive their own decode loop, see server_realtime_slot
@@ -3900,6 +4872,154 @@ private:
         // start populating the batch for this iteration
         batch.clear();
 
+        // pick this iteration's composition before anything is added to the batch: the
+        // scheduler needs to know what is pending, not what has been batched already.
+        // note: pre_decode() is called from update_slots() with the slot states of the
+        // previous iteration, i.e. after any prompt progress and sampling has landed
+        int sched_n_gen         = 0;
+        int sched_n_started     = 0; // prompts that have not added a token yet: "the job coming in"
+        int sched_n_inflight    = 0; // prompts already being processed
+        int sched_gen_depth     = 0;
+        int sched_prompt_depth  = 0;
+        int sched_prompt_left   = 0;
+        int sched_decode_left   = 0;
+
+        int64_t sched_gen_peak = 0; // deepest generating slot, for the turn-length measurement
+        int64_t sched_k_min    = 0; // tokens the most starved decoder emitted in the last step
+
+        iterate(slots, [&](server_slot & slot) {
+            if (slot.state == SLOT_STATE_GENERATING) {
+                sched_n_gen++;
+                sched_gen_depth = std::max(sched_gen_depth, (int) slot.prompt.n_tokens());
+                sched_gen_peak  = std::max<int64_t>(sched_gen_peak, (int64_t) slot.stats.n_gen);
+
+                // the tokens this slot emitted in the last step: the MTP luck (see note_emitted)
+                const int64_t emitted = slot.stats.n_gen - slot.sched_n_gen_last;
+                slot.sched_n_gen_last = slot.stats.n_gen;
+                if (emitted > 0) {
+                    sched_k_min = sched_k_min > 0 ? std::min<int64_t>(sched_k_min, emitted) : emitted;
+                }
+
+                // -1 is a limitless generation: never let it be the binding term
+                const int32_t n_rem = slot.n_remaining();
+                sched_decode_left += n_rem > 0 ? n_rem : 1 << 20;
+            } else if (slot.task && slot.state == SLOT_STATE_STARTED) {
+                sched_n_started++;
+            } else if (slot.task && slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+                sched_n_inflight++;
+                sched_prompt_depth = std::max(sched_prompt_depth, (int) slot.prompt.n_tokens());
+                sched_prompt_left += (int) std::max<int64_t>(0, (int64_t) slot.task->n_tokens() - (int64_t) slot.prompt.n_tokens());
+            }
+        });
+
+        // a turn has no declared length here, so measure how deep its turns run: 0 closes one
+        step_sched.note_gen_progress(sched_gen_peak);
+
+        // the tokens the decoders emitted in the last step: the MTP luck, which is what the
+        // per-token ITL target is scaled by
+        step_sched.note_emitted(sched_k_min);
+
+        if (sched_n_gen == 0) {
+            step_sched.note_no_decoders();
+        }
+        step_sched.set_batch(llama_n_batch(ctx_tgt));
+
+        // admission guard: a prompt that has not started yet waits while an older task would be
+        // pushed below its floor (see decide_admit). The wait is bounded, so a held prompt is
+        // always admitted eventually -- the bound is also what keeps the mixed-step estimate
+        // fresh, since that is the only way anything ever measures what the guard prevents.
+        const int64_t t_now_ms = ggml_time_ms();
+        int sched_n_admitted   = sched_n_inflight;
+        int sched_prompt_slots = 0; // prompt slots that actually contributed to this batch
+        int sched_n_arriving   = 0; // newcomers admitted here, each about to take a chunk
+        double sched_arr_ms    = 0.0; // what the dearest arriving newcomer costs, in ms
+        if (sched_n_started > 0) {
+            const bool admit = step_sched.decide_admit(sched_n_gen, sched_n_inflight);
+
+            // the incumbents' remaining work, in the ms the newcomer's prefill is priced in: a held
+            // prompt is let through early when that remainder is cheaper than its own prefill
+            double sched_remaining_ms = 0.0;
+            bool   sched_remaining_valid = false;
+            if (step_sched.dec_ms_token > 0.0) {
+                const bool turn_known = step_sched.turn_known();
+                iterate(slots, [&](server_slot & slot) {
+                    if (slot.state != SLOT_STATE_GENERATING) return;
+                    const int32_t n_rem = slot.n_remaining();
+                    if (n_rem <= 0 && !turn_known) {
+                        return; // limitless and unmeasured: nothing to price it with
+                    }
+                    const int64_t rem = step_sched::remaining_tokens(
+                        n_rem, (int64_t) slot.stats.n_gen, step_sched.turn_tokens);
+                    sched_remaining_ms += (double) rem * step_sched.dec_ms_token;
+                    sched_remaining_valid = true;
+                });
+            }
+
+            iterate(slots, [&](server_slot & slot) {
+                if (slot.state != SLOT_STATE_STARTED || !slot.task) {
+                    slot.sched_wait_from  = 0;
+                    slot.sched_admit_hold = false;
+                    return;
+                }
+
+                if (slot.sched_wait_from == 0) {
+                    slot.sched_wait_from = t_now_ms;
+                }
+
+                // a short prefill is taken rather than waited out (see effective_prompt_tokens);
+                // a forced hold is bench/test only and does not take the bypass. the estimate is
+                // an O(prompt) scan, read only where a decision prices it, once per arrival.
+                const bool    est_needed = !admit || step_sched.arms_arrival(sched_n_gen);
+                const int64_t eff_tokens = est_needed ? step_sched.effective_prompt_tokens(slot) : 0;
+                const double  est_ms     = est_needed ? step_sched.estimate_prefill_ms(eff_tokens) : 0.0;
+                const bool    bypass     = !admit && est_needed && step_sched.admit_bypass_ms > 0 && est_ms > 0.0 &&
+                                           est_ms <= (double) step_sched.admit_bypass_ms && !step_sched.admit_force;
+
+                bool hold = !admit && !bypass;
+                if (hold && step_sched.admit_wait_ms > 0 && t_now_ms - slot.sched_wait_from >= step_sched.admit_wait_ms) {
+                    hold = false; // the bound: a client must not hang behind a long generation
+                }
+                if (hold && step_sched.admit_tg_pct < 100 && sched_remaining_valid && est_ms > 0.0 && sched_remaining_ms < est_ms) {
+                    hold = false; // the incumbent's remaining work is cheaper than the wait it costs
+                }
+
+                if (bypass && !slot.sched_admit_bypass) {
+                    SLT_INF(slot, "admission bypass: %d tokens still to process (~%.0f ms), under the %d ms floor\n",
+                            (int) eff_tokens, est_ms, step_sched.admit_bypass_ms);
+                }
+                slot.sched_admit_bypass = bypass;
+
+                if (hold) {
+                    if (!slot.sched_admit_hold) {
+                        SLT_INF(slot, "admission hold: decoders spend %s of the target, pp %s; %d tokens (~%.0f ms) of prefill; waiting up to %.0f s\n",
+                                step_sched.admit_ratio_tg < 0.0
+                                    ? (step_sched.admit_tg_applies ? "n/a (target off)" : "n/a (no tg floor applied)")
+                                    : string_format("%.0f%%", step_sched.admit_ratio_tg * 100.0).c_str(),
+                                step_sched.admit_ratio_pp < 0.0
+                                    ? (step_sched.admit_pp_applies ? "n/a (needs both solo and shared)" : "n/a (no pp floor applied)")
+                                    : string_format("%.0f%%", step_sched.admit_ratio_pp * 100.0).c_str(),
+                                (int) eff_tokens, est_ms, step_sched.admit_wait_ms / 1000.0);
+                    }
+                    slot.sched_admit_hold = true;
+                } else {
+                    if (slot.sched_admit_hold) {
+                        SLT_INF(slot, "%s", "admission hold released\n");
+                    }
+                    slot.sched_admit_hold = false;
+                    slot.sched_wait_from  = 0;
+                    sched_n_admitted++;
+                    sched_n_arriving++;
+                    sched_arr_ms = std::max(sched_arr_ms, est_ms);
+                }
+            });
+        }
+
+        // sched_prompt_left stays the in-flight remainder: decide_hold prices its decision with
+        // the prompt whose depth formed the estimate, and a newcomer's whole prompt folded in
+        // would dilute that arm without changing which of the two waits
+        const bool sched_inject = step_sched.decide_inject(sched_n_gen, sched_n_admitted, sched_prompt_left, sched_n_arriving, sched_arr_ms, params_base.cont_batching, sched_gen_depth);
+        const bool sched_hold   = !sched_inject && step_sched.decide_hold(sched_n_gen, sched_n_admitted, sched_gen_depth, sched_prompt_depth);
+
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
 
@@ -3914,6 +5034,21 @@ private:
 
             if (slot.audio_stream && !slot_audio_step(slot)) {
                 return; // waiting for audio, or the stream ended
+            }
+            // adaptive step scheduler: a held slot contributes nothing, so the sibling
+            // prompt gets the whole n_batch. The pending sampled token and any draft are
+            // left untouched (handle_last_sampled_token computes positions at call time),
+            // so the slot resumes exactly where it stopped
+            if (sched_hold) {
+                if (!slot.sched_hold) {
+                    slot.sched_hold = true;
+                    SLT_DBG(slot, "%s", "step sched: holding the pending token while a sibling prompt is processed\n");
+                }
+                return;
+            }
+            if (slot.sched_hold) {
+                slot.sched_hold = false;
+                SLT_DBG(slot, "%s", "step sched: hold released\n");
             }
 
             // check if we can batch this slot with the previous one
@@ -4038,15 +5173,75 @@ private:
             slot.handle_last_sampled_token(batch);
         });
 
+        // scheduler bookkeeping: everything added so far belongs to the decoders
+        const int sched_gen_tok = (int) batch.size();
+
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
+        const int n_dec = std::max(1, sched_gen_tok);
+        const int max_share_eff = std::min(step_sched.max_share_pct, 100 / (n_dec + 1));
+        // the cap exists to keep a decoder's token from waiting on a prompt step, so it applies
+        // only while a decoder rides in the batch: a prefill-only burst has nothing to protect,
+        // and capping it spends the box's prefill on nobody
+        if (step_sched.itl_ms > 0 && max_share_eff > 0 && sched_gen_tok > 0 &&
+            step_sched.ms_per_token > 0.0 && step_sched.n_mpt >= 8) {
+            // a prompt-sharing step pays for the decoders it carries as well as for its own
+            // tokens, and the decode arm prices them: a decode-only step costs its tokens
+            // times dec_ms_token. the budget is what is left of the target once they are paid
+            // for, divided by the prompt's own marginal cost per token -- that rate and not a
+            // blend of the rates, see server-step-sched-budget.h
+            const double dec_cost = sched_gen_tok * step_sched.dec_ms_token;
+            // the divisor is the prompt's own marginal rate at the depth it is filling, from
+            // its solo arm (see server-step-sched-budget.h): the whole-step average prices the
+            // decoders' time as prompt tokens and lands the quotient on a minimum-sized fill
+            const server_step_sched::bucket_stats & bp_rate =
+                step_sched.buck_pre[server_step_sched::bucket_of(sched_prompt_depth)];
+            const double solo_rate = bp_rate.solo.tok > 0.0 ? bp_rate.solo.t_ms / bp_rate.solo.tok : 0.0;
+            const double avg_rate  = step_sched.n_mpp >= 8 ? step_sched.ms_per_prompt_tok : step_sched.ms_per_token;
+            const int    avg_n     = step_sched.n_mpp >= 8 ? step_sched.n_mpp : step_sched.n_mpt;
+            const double rate = step_sched::cap_rate_ms(solo_rate, bp_rate.solo.n, avg_rate, avg_n,
+                                                        server_step_sched::MIN_SAMPLES);
+            // a quota under the break-even chunk is a slower way to move prompt tokens than the
+            // whole chunk, which the gate protects instead (see server-step-sched-budget.h)
+            const int break_even = step_sched.cap_break_even();
+            // the break-even is fitted from the two shapes the census counts, and the small one
+            // is made of the fills the cap itself produced: more capping raises that mean, lowers
+            // the break-even and admits more capping. the measured pair cannot ratchet -- refuse
+            // the cap outright while the capped shape costs more per prompt token than the chunk
+            // it displaces, see server-step-sched-budget.h
+            const double part_rate = step_sched.chunk_part.p_tok > 0.0
+                ? step_sched.chunk_part.t_ms / step_sched.chunk_part.p_tok : 0.0;
+            const double whole_rate = step_sched.chunk_full.p_tok > 0.0
+                ? step_sched.chunk_full.t_ms / step_sched.chunk_full.p_tok : 0.0;
+            step_sched.cap_pays = step_sched::cap_pays_measured(part_rate, whole_rate, step_sched::CAP_PAYS_TOLERANCE);
+            // the "does it pay" gate compares the capped shape against the chunk it displaces,
+            // and the step's fixed cost makes any capped shape the slower way to move prompt
+            // tokens, so the gate refuses every cap that actually caps: production read cap
+            // applied 0, dropped 4058. the injection is the cheaper lever for the same gap --
+            // a decode-only step costs the prompt that step's time, a capped chunk costs it
+            // tokens -- so the cap stays gated and the target is enforced by the injection.
+            const bool cap_allowed = step_sched.cap_pays;
+            // the target is a per-token budget in that mode: a step that emits k tokens may
+            // take k times the target (see itl_target_ms)
+            const double target_ms = step_sched::itl_target_ms(step_sched.itl_ms, step_sched.k_emitted,
+                                                               step_sched.itl_per_token != 0);
+            const int cap = rate > 0.0 && cap_allowed
+                ? step_sched::prompt_chunk_cap_min(target_ms, dec_cost, rate, break_even) : 0;
+            step_sched.cap_rate_last = rate;
+            step_sched.note_chunk_cap(cap);
+            if (cap > 0) {
+                n_batch = std::min(n_batch, cap);
+            }
+        }
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
         // next, batch any pending prompts without exceeding n_batch
-        if (params_base.cont_batching || batch.size() == 0) {
+        // note: the adaptive step scheduler can skip the prompt fill for one iteration, in
+        // which case this batch carries only the decoders (see decide_inject)
+        if (!sched_inject && (params_base.cont_batching || batch.size() == 0)) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             // the remaining batch capacity is shared equally between the pending prompts:
@@ -4055,7 +5250,11 @@ private:
             // iteration are still SLOT_STATE_STARTED here and add their first tokens below
             int32_t n_prompt_slots = 0;
             for (const auto & slot : slots) {
-                if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+                // a slot the admission guard holds stays SLOT_STATE_STARTED but adds no
+                // tokens, and must not take a share of what is left: with 2 slots and
+                // -b 2048 that halves the inflight prompt's prefill (~1022 instead of ~2048
+                // tokens a step) for the whole hold, up to admit_wait_ms (300 s)
+                if ((slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) && !slot.sched_admit_hold) {
                     n_prompt_slots++;
                 }
             }
@@ -4091,6 +5290,20 @@ private:
                     return;
                 }
 
+                // admission guard: a prompt held for a floor contributes nothing this
+                // iteration, and it has to stay SLOT_STATE_STARTED while it waits -- the
+                // admission pass keys on STARTED, so letting it fall through here would
+                // clear the hold on the next iteration. what the skip must not swallow is
+                // the oversize validation below: a task that is going to be rejected has to
+                // be rejected in one iteration whether or not it would have been held, or
+                // the client waits out the hold bound for a 400 it could have been sent at
+                // once.
+                if (slot.sched_admit_hold && slot.task->n_tokens() < slot.n_ctx) {
+                    return;
+                }
+
+                // a held slot contributes no tokens and is excluded from the n_prompt_slots
+                // divisor above, so the share it would have taken goes to the prompt we protect
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
                     const auto & input_tokens = slot.task->tokens;
@@ -4607,6 +5820,10 @@ private:
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
 
+                    if (n_tokens_cur > 0) {
+                        sched_prompt_slots++;
+                    }
+
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
@@ -4671,6 +5888,11 @@ private:
                 }
             });
         }
+
+        // hand the composition of this batch to the scheduler; observe() consumes it when
+        // the step's wall time is known (see update_slots)
+        step_sched.note_composition(sched_gen_tok, (int) batch.size() - sched_gen_tok, sched_prompt_slots,
+                                    sched_inject, sched_gen_depth, sched_prompt_depth, sched_n_admitted > 0);
     }
 
     // see https://github.com/ggml-org/llama.cpp/pull/29969

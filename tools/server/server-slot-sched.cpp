@@ -5,6 +5,7 @@
 #include "log.h"
 
 #include <algorithm>
+#include <thread>
 
 //
 // server_prompt
@@ -55,6 +56,106 @@ server_prompt_reuse server_prompt::get_reuse(int32_t n_prefix, bool has_new_toke
     res.ckpt     = *it;
 
     return res;
+}
+
+void server_state_prefault(void * p, size_t size) {
+    // below this size the copy that follows faults the pages in at no extra cost
+    static constexpr size_t min_size  = 64ull * 1024 * 1024;
+    static constexpr size_t page_size = 4096;
+
+    if (size < min_size) {
+        return;
+    }
+
+    // 8 threads reach the memory bandwidth of the page zeroing; more do not help
+    const size_t n_threads = std::clamp<size_t>(std::thread::hardware_concurrency(), 1, 8);
+    const size_t part      = (size + n_threads - 1) / n_threads;
+
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads);
+    for (size_t t = 0; t < n_threads; ++t) {
+        const size_t beg = std::min(size, t * part);
+        const size_t end = std::min(size, beg + part);
+        try {
+            threads.emplace_back([p, beg, end]() {
+                // one write per page is enough to fault it in
+                for (size_t i = beg; i < end; i += page_size) {
+                    ((volatile uint8_t *) p)[i] = 0;
+                }
+            });
+        } catch (const std::exception &) {
+            break; // prefaulting is best-effort; the copy below faults the rest
+        }
+    }
+    for (auto & t : threads) {
+        t.join();
+    }
+}
+
+// the large state buffers are freed on a thread of their own: unmapping the 2.2 GB state of a
+// 98k entry held the server thread, which every slot waits on, for 0.4-0.5 s (Arc Pro
+// B70). created on first use and never joined: a buffer still queued at exit goes with the
+// process
+struct server_state_reaper {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<std::pair<uint8_t *, size_t>> queue;
+    std::atomic<size_t> n_released { 0 };
+    bool running = false;
+
+    void run() {
+        for (;;) {
+            std::pair<uint8_t *, size_t> item;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv.wait(lock, [this] { return !queue.empty(); });
+                item = queue.front();
+                queue.pop_front();
+            }
+            std::allocator<uint8_t>().deallocate(item.first, item.second);
+            n_released++;
+        }
+    }
+
+    static server_state_reaper & get() {
+        static server_state_reaper * reaper = [] {
+            auto * r = new server_state_reaper();
+            try {
+                std::thread(&server_state_reaper::run, r).detach();
+                r->running = true;
+            } catch (const std::exception &) {
+                // no thread: every buffer is freed by its caller, as before
+            }
+            return r;
+        }();
+        return *reaper;
+    }
+};
+
+void server_state_release(uint8_t * p, size_t size) {
+    // below this size the unmap is cheaper than the hand-off
+    static constexpr size_t min_size = 64ull * 1024 * 1024;
+
+    if (size >= min_size) {
+        auto & reaper = server_state_reaper::get();
+        if (reaper.running) {
+            try {
+                std::lock_guard<std::mutex> lock(reaper.mutex);
+                reaper.queue.emplace_back(p, size);
+            } catch (const std::exception &) {
+                std::allocator<uint8_t>().deallocate(p, size);
+                return;
+            }
+            reaper.cv.notify_one();
+            return;
+        }
+    }
+
+    std::allocator<uint8_t>().deallocate(p, size);
+}
+
+size_t server_state_released() {
+    return server_state_reaper::get().n_released.load();
 }
 
 //
@@ -130,8 +231,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
-    common_state_data state_data_tgt;
-    common_state_data state_data_dft;
+    server_state_buffer state_data_tgt;
+    server_state_buffer state_data_dft;
 
     // check if we can allocate enough memory for the new state
     try {

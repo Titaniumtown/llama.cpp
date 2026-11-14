@@ -4981,6 +4981,7 @@ inline bool ggml_sycl_supports_reorder_mul_mat_sycl(enum ggml_type type) {
             return !g_ggml_sycl_prioritize_dmmv;
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ3_S:
             return true;
         default:
             return false;
@@ -5328,6 +5329,60 @@ static bool reorder_qw_q8_0_moe(uint8_t * data_device, size_t expert_bytes, int6
         }
     }
     return true;
+}
+
+// SoA repack for IQ3_S: [qs][qh][signs][scales][d], planes contiguous over all
+// blocks. Pure byte permutation: the repack is IN PLACE inside ggml_nbytes, so
+// the layout must be exactly size-preserving (a first cut that pre-decoded the
+// 6-bit scales to int8 grew 2 B/block and clobbered the next tensor).
+// block_iq3_s is 256 elements / 110 B (d 2 + qs[QK_K/4=64] + qh[QK_K/32=8] +
+// signs[QK_K/8=32] + scales[IQ3S_N_SCALE=4]) -- NOT the 32-element/18-byte shape
+// of the IQ4 blocks, so every count below comes from this struct. A superblock
+// is 8 PLANES of 32 consecutive elements; plane p holds elements [32p, 32p+32).
+// Each field is ONE flat region whose base is affine in nb = size/110, with NO
+// per-block padding -- 110 B is not a multiple of 64, and padding here is
+// precisely an overflow into the next tensor -- so the regions end at 110*nb == size:
+//
+//   field   base     width   end       plane p of superblock r
+//   qs      0        64 B    64*nb     64*r  + 8*p        (8 B)
+//   qh      64*nb     8 B    72*nb      8*r  + p          (1 B)
+//   signs   72*nb    32 B   104*nb     32*r  + 4*p        (4 B, byte il = 0..3)
+//   scales  104*nb    4 B   108*nb      4*r  + (p >> 1)   (2 nibbles, 4*(p&1))
+//   d       108*nb    2 B   110*nb      2*r                (ggml_half)
+//
+// 108*nb is even for every nb, so the d region always keeps its 2 B alignment,
+// but whole-LINE stores are a PER-PLANE property, not a blanket one: modulo 64
+// the bases are qs 0, qh 0, signs 8*nb, scales 40*nb, d 44*nb. So signs/scales/d
+// only reach 64 B alignment when nb is a multiple of 8 (d: 16), and the +37%
+// measured from whole-line stores does not come free on those three. At the
+// production 17408x5120 shape nb = 17408*20 = 348160, a multiple of 16, all five
+// hold. Within a superblock the source already stores every field in plane
+// order, so the repack's whole job is to make each field contiguous over all
+// superblocks -- the shape the paired readers index (mmvq.cpp's
+// mul_mat_vec_iq3_s_reorder_flat and the dequant at dequantize_block_iq3_s_reorder_wide).
+// qh stays a plane of its own and is NOT merged into qs: the
+// reference reads it with a different shift per grid index, qh[p] << (8 - 2*il)
+// for grid1 and qh[p] << (7 - 2*il) for grid2 (ggml-quants.c:2622-2623), so the
+// repack moves that byte whole and leaves the shift to the reader.
+static bool reorder_qw_iq3_s(uint8_t * data_device, size_t size, size_t offset, dpct::queue_ptr stream) {
+    GGML_ASSERT(offset == 0);
+    return reorder_qw_planar<block_iq3_s>(__func__, data_device, size, offsetof(block_iq3_s, qs), QK_K / 4,
+        [](const block_iq3_s & x, int64_t ib, uint8_t * tail, int64_t nblocks) {
+            uint8_t * qh    = tail;
+            uint8_t * signs = qh + (QK_K / 32) * nblocks;
+            uint8_t * sc    = signs + (QK_K / 8) * nblocks;
+            uint8_t * d     = sc + IQ3S_N_SCALE * nblocks;
+            for (int j = 0; j < QK_K / 32; ++j) {
+                qh[ib * (QK_K / 32) + j] = x.qh[j];
+            }
+            for (int j = 0; j < QK_K / 8; ++j) {
+                signs[ib * (QK_K / 8) + j] = x.signs[j];
+            }
+            for (int j = 0; j < IQ3S_N_SCALE; ++j) {
+                sc[ib * IQ3S_N_SCALE + j] = x.scales[j];
+            }
+            reinterpret_cast<ggml_half *>(d)[ib] = x.d;
+        }, stream);
 }
 
 // Reorder each expert slice into a self-contained SoA layout.
@@ -5704,12 +5759,12 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
             return reorder_qw_q6_k(data_device, size, 0, stream);
         case GGML_TYPE_IQ3_XXS:
             return reorder_qw_iq3_xxs(data_device, size, stream);
-        case GGML_TYPE_IQ3_S:
-            return reorder_qw_iq3_s(data_device, size, stream);
         case GGML_TYPE_IQ4_NL:
             return reorder_qw_iq4<block_iq4_nl>(data_device, size, stream);
         case GGML_TYPE_IQ4_XS:
             return reorder_qw_iq4<block_iq4_xs>(data_device, size, stream);
+        case GGML_TYPE_IQ3_S:
+            return reorder_qw_iq3_s(data_device, size, 0, stream);
         default:
             return false;
     }

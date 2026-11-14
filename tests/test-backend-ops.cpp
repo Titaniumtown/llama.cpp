@@ -12641,6 +12641,61 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 5120, n, 5120, {1, 1}, {1, 1}));
     }
 
+    // IQ3_S reordered mat-vec, at the geometry that actually ships. The generic
+    // all_types MUL_MAT loops below only ever reach IQ3_S at m=1 or m=16 with k=256, or
+    // m=16 with k=16*256 -- so no correctness case of that type exists at a production row
+    // count or k. Two things are therefore untested without these: the
+    // nrows-to-subgroup mapping at 5120 and 17408 rows, and the multi-column path itself,
+    // since every ncols_dst from 1 to 8 is a separate template instantiation and a suite
+    // that only ever runs n=1 cannot detect a broken one. n>=2 is what selects the
+    // multi-column kernel; bs/nr of 1 keeps the weight reorder-eligible, which
+    // should_reorder_tensor requires of src1->ne[2] and src1->ne[3].
+    for (int n = 2; n <= 8; ++n) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 5120, n, 5120, {1, 1}, {1, 1}));
+    }
+    // Both production geometries, written as (m, k) so there is nothing to decode: the
+    // 5120x17408 and 17408x5120 pair every IQ reorder header in this series names. Both
+    // row counts ship, so both are pinned -- at n=1, the width llama-bench decodes, and
+    // n=5, the width MTP verify decodes. These four are the expensive cases (36.5 MiB of
+    // weight each, live one at a time, and the harness initialises that buffer on both
+    // backends per case); the sweep above carries the n coverage for a quarter of the
+    // cost. All 14 come to ~2.3 GMAC of reference work against ~0.2 GMAC for the q4_K
+    // block above -- the production geometry is 3.4x the size of that block's control.
+    for (int n : { 1, 5 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 17408, n,  5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32,  5120, n, 17408, {1, 1}, {1, 1}));
+    }
+    // m=1 and m=47 are the ones that bite: neither divides the rows-per-group, so most
+    // subgroups in the work-group are inactive and must still reach the reduction
+    // barrier. m=16, the only small m the generic loops use, cannot produce that.
+    for (int m : { 1, 47 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32, m, 5, 5120, {1, 1}, {1, 1}));
+    }
+    // n=12 is split into balanced 6+6 launches rather than abandoned to the GEMM:
+    // can_use_mul_mat_vec_q admits IQ3_S up to 24 columns (ggml_sycl_mmvq_type_max_cols) and
+    // the wrapper splits above 8. This pins that route, which n<=8 cannot reach at all.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 5120, 12, 5120, {1, 1}, {1, 1}));
+
+    // The ONE case that reaches dequantize_block_iq3_s_reorder_wide, which is the
+    // wide iq3_s dequant kernel. The cases above are all n <= 12, and every n <= 24 satisfies
+    // can_use_mul_mat_vec_q, so all of them take the MMVQ path and read the layout
+    // through mmvq.cpp's reader -- which was already correct. The wide dequant is a
+    // different reader of the same layout, and nothing in the suite entered it.
+    //
+    // 33 forces the GEMM path: IQ3_S takes the mat-vec only up to 24 columns, and the
+    // 24/25 boundary itself is pinned by the per-type width loop. Above 24 the chain
+    // reaches ggml_sycl_op_mul_mat_sycl, which converts src0 through
+    // ggml_get_to_fp16_sycl and lands on dequantize_row_iq3_s_sycl_reorder ->
+    // dequantize_block_iq3_s_reorder_wide.
+    //
+    // One case and not a sweep, because n does not reach the kernel. The launcher takes
+    // src0's rows as a (row_low, row_high) range and converts with ne = row_diff*ne00,
+    // so the kernel's nb = k/QK_K and every plane offset scaled by it is byte-identical
+    // at n=33 and at a 2048-column prefill. Same launch, same 36.5 MiB of weight,
+    // differing only in the GEMM's N. A sweep in n would multiply the suite's cost for
+    // no additional coverage of the code that was wrong.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 5120, 33, 5120, {1, 1}, {1, 1}));
+
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 1*256, { 1,  1}, {1, 1}));

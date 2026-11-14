@@ -504,14 +504,17 @@ static void dequantize_row_iq3_s_sycl(const void *vx, dst_t *y, const int64_t k,
 template <typename dst_t>
 static void dequantize_row_iq3_s_sycl_reorder(const void * vx, dst_t * y, const int64_t k,
                                               dpct::queue_ptr stream) {
+    // nb counts 256-ELEMENT superblocks, matching dequantize_row_iq3_s_sycl above
+    // (NOT the k/QK4_NL that the iq4_nl reorder twin uses), and 32 lanes per
+    // superblock, matching that same converter's 32 work-items per block. One lane
+    // owns one contiguous 8-element run.
     const int64_t nb = k / QK_K;
     dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
-    stream->parallel_for(
-        sycl::nd_range<3>(sycl::range<3>(1, 1, nb) * sycl::range<3>(1, 1, 32), sycl::range<3>(1, 1, 32)),
-        [=](sycl::nd_item<3> item_ct1) {
-            dequantize_block_iq3_s_reorder(vx, y + item_ct1.get_group(2) * QK_K, item_ct1.get_group(2),
-                                           item_ct1, nb, kmask_iq2xs, iq3s_grid);
-        });
+    const int     wg     = deqk_wg();
+    const int64_t groups = (nb * 32 + wg - 1) / wg;
+    stream->parallel_for(sycl::nd_range<1>(groups * wg, wg), [=](sycl::nd_item<1> it) {
+        dequantize_block_iq3_s_reorder_wide<dst_t>(vx, y, nb, it);
+    });
 }
 
 template <typename dst_t>
@@ -958,7 +961,15 @@ static to_t_sycl_t<dst_t> ggml_get_dequant_sycl(ggml_type type, ggml_tensor * ds
                 return dequantize_row_iq3_xxs_sycl;
             }
         case GGML_TYPE_IQ3_S:
-            if (is_reordered_src0(dst)) {
+            // Reordered plane bases, n = nblocks; full contract in
+            // dequantize_block_iq3_s_reorder_wide. Must match reorder_qw_iq3_s
+            // (ggml-sycl.cpp) and the mmvq.cpp reader byte for byte.
+            //   qs 0 w64 | qh 64n w8 | signs 72n w32 | scales 104n w4 | d 108n w2
+            // plane p (== sub-block p, elements [32p,32p+32)) of row r is at
+            //   qs 64r+8p | qh 8r+p | signs 32r+4p+il | scales 4r+(p>>1) | d 2r
+            //   scales nibble: LOW if p even, HIGH if p odd (byte >> 4*(p&1) & 0xf)
+            // 108n+2n == 110n == n*sizeof(block_iq3_s): size-exact, no per-block padding.
+            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
                 return dequantize_row_iq3_s_sycl_reorder;
             } else {
                 return dequantize_row_iq3_s_sycl;

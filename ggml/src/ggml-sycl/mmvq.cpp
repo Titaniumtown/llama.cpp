@@ -4261,6 +4261,205 @@ bool ggml_sycl_mul_mat_vec_q_glu_xmx(int              device,
 #endif // GGML_SYCL_MMVQ_HAS_XMX
 }
 
+// Dedicated reordered IQ3_S mat-vec, same lane-per-32-elements shape as the reordered IQ4_NL mat-vec:
+// one 32-element plane per lane per iteration -- one aligned 8 B qs load, one qh byte,
+// one 4 B signs word, one scales nibble, and one q8_1 block on the activation side. The
+// point of the twin is the loop nest, not the block shape: the weight-side load + unpack
+// runs ONCE per plane and every ncols_dst column then reuses it, so the weight tensor is
+// read once per mat-vec call instead of once per activation column.
+//
+// IQ3_S is 3.4375 bpw (110 B per 256 elements), NOT the 4.5 bpw of its IQ4_NL twin, so
+// none of IQ4_NL's block constants carry over. A block_iq3_s is 256 elements split into 8
+// planes of 32; the plane is the unit a lane owns, and 32 elements is exactly what an
+// IQ4_NL lane owns, so the lane -> 32-element-block mapping is unchanged from the twin.
+// What differs is only where those 32 elements' bytes live: IQ4_NL has them in one
+// contiguous 16 B run, IQ3_S has them spread over four field planes.
+//
+// SoA plane bases. MUST stay byte-identical to reorder_qw_iq3_s in ggml-sycl.cpp, which
+// writes [qs][qh][signs][scales][d] over nb superblocks with no per-block padding (110 is
+// not a multiple of 64, so a 64 B-aligned per-block stride would need padding, and padding
+// is exactly what overflows ggml_nbytes in an in-place repack). With n = nb superblocks in the tensor,
+// i = this lane's superblock index = row*bpr + u/8, p = this lane's plane in 0..7, the
+// reader expects, for the 32 elements of plane p (elements [32p, 32p+32) of block i):
+//   qs     base     0   width 64   p: 64*i       + 8*p        8 B, byte copy of x[i].qs[8p..8p+7]
+//   qh     base    64n  width  8   p: 64n  + 8*i + p           1 B, x[i].qh[p]
+//   signs  base    72n  width 32   p: 72n + 32*i + 4*p         4 B, x[i].signs[4p..4p+3]
+//   scales base   104n  width  4   p: 104n + 4*i + (p>>1)      1 B, then shift by 4*(p&1) and
+//                                                                  mask 0xf (see below)
+//   d      base   108n  width  2       108n + 2*i             ggml_half, one per superblock,
+//                                                                  shared by its 8 planes
+//   end    110n == nb * sizeof(block_iq3_s), so the repack is size-preserving by construction
+//
+// The per-plane byte map above is the one dequantize_row_iq3_s (ggml/src/ggml-quants.c,
+// upstream, untouched by the patch series) defines, and three of its properties are not
+// byte copies and must not be "simplified" into copies here:
+//   * scales is a NIBBLE plane, read as (scales[p>>1] >> (4*(p&1))) & 0xf -- 4*(p&1) is a
+//     BIT SHIFT, not a nibble index; the nibble taken is the low one for even p and the
+//     high one for odd p. Upstream packs two planes per byte (ib32 and ib32+1 share
+//     scales[ib32/2]), so a byte copy of the plane is wrong. Note the IQ4_NL twin's d
+//     plane sits at 16n and is 16 B aligned for EVERY n; this one sits at 108n
+//     (108n mod 16 == 12n mod 16) and is 16 B aligned only when 4 divides n, so the d read
+//     below is a plain scalar ggml_half load, never a 16 B vector load -- a misaligned
+//     vector load here is a silent corruption, same class as the ggml_sycl_memcpy_1 note.
+//   * signs is indexed by il within the plane, not by p alone -- signs[4*p + il], il
+//     0..3. Indexing by p alone silently reuses plane 0's signs for all eight planes.
+//   * qh cannot be folded into qs, and its shift differs between the two grid indices:
+//     grid1 uses qh << (8 - 2*il), grid2 uses qh << (7 - 2*il).
+//
+// Per-plane tile granularity, stated because it is NOT uniform. Modulo 64 the five plane
+// bases are qs 0, qh 0, signs 8n, scales 40n, d 44n, so for a general nb only the qs and
+// qh planes have a 64 B-aligned base; signs/scales/d only do when nb is a multiple of 8
+// (and d additionally wants a multiple of 16). A lane's 8 B qs load is what actually buys
+// a whole line here -- 8 consecutive lanes cover one superblock's 64 B of qs exactly.
+// The whole-line-store win does not carry over to the other planes by construction.
+template <int ncols_dst>
+static void mul_mat_vec_iq3_s_reorder_flat(const void * __restrict__ vx, const void * __restrict__ vy,
+                                           float * __restrict__ dst, const int ncols, const int nrows,
+                                           const int stride_col_y_bytes, const int stride_col_dst,
+                                           const sycl::nd_item<3> & nd_item) {
+    const auto sg  = nd_item.get_sub_group();
+    const int  row = nd_item.get_group(2) * sg.get_group_linear_range() + sg.get_group_linear_id();
+    if (row >= nrows) {
+        return;
+    }
+    const int lane = sg.get_local_linear_id();
+    const int bpr  = ncols / QK_K;                     // 256-element superblocks per row
+    const int nb   = nrows * bpr;                      // superblocks in the whole tensor
+    const int units = bpr * (QK_K / 32);               // 32-element planes per row
+
+    // SoA plane bases -- see the table above; these five pointers are the whole contract.
+    // d_ptr is read as a scalar ggml_half on purpose: its base 108n is not 16 B aligned for
+    // a general nb, so a vector load there would be a misaligned-source corruption.
+    const uint8_t   * qs_ptr     = static_cast<const uint8_t *>(vx);
+    const uint8_t   * qh_ptr     = qs_ptr + (size_t) nb * 64;
+    const uint8_t   * signs_ptr  = qh_ptr + (size_t) nb * 8;
+    const uint8_t   * scales_ptr = signs_ptr + (size_t) nb * 32;
+    const ggml_half * d_ptr      = reinterpret_cast<const ggml_half *>(scales_ptr + (size_t) nb * 4);
+
+    float acc[ncols_dst] = {};
+
+    // u is the row-local 32-element plane index, so a lane's activation window is
+    // [32u, 32u+32) and u is also its q8_1 block index (QK8_1 == 32).
+    for (int u = lane; u < units; u += WARP_SIZE) {
+        const int i = row * bpr + u / (QK_K / 32);
+        const int p = u % (QK_K / 32);
+
+        const sycl::vec<uint8_t, 8> qs = vec_aligned_load<uint8_t, 8>(qs_ptr + (size_t) i * 64 + 8 * p);
+        const uint8_t qh = qh_ptr[(size_t) i * 8 + p];
+        const uint32_t sgn = *reinterpret_cast<const uint32_t *>(signs_ptr + (size_t) i * 32 + 4 * p);
+        const uint8_t  sc = (scales_ptr[(size_t) i * 4 + (p >> 1)] >> (4 * (p & 1))) & 0xf;
+        const float    d  = (float) d_ptr[i] * (1 + 2 * sc);
+
+        const int col0 = u * QK8_1;
+
+        // one q8_1 block and its ds per column, hoisted out of the l loop
+        float ds[ncols_dst];
+#pragma unroll
+        for (int c = 0; c < ncols_dst; ++c) {
+            const char * ycol = (const char *) vy + (size_t) c * stride_col_y_bytes;
+            ds[c] = (float) (*(const sycl::half2 *) (ycol + ncols + (col0 / QK8_1) * sizeof(sycl::half2)))[0];
+        }
+
+        int sumi[ncols_dst] = {};
+
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            // grid lookup and sign application, once per plane -- the part every column reuses
+            const uint32_t * grid1 = iq3s_grid + (qs[2 * l + 0] | ((qh << (8 - 2 * l)) & 256));
+            const uint32_t * grid2 = iq3s_grid + (qs[2 * l + 1] | ((qh << (7 - 2 * l)) & 256));
+            const uint32_t signs0 = dpct::vectorized_binary<sycl::uchar4>(
+                (((sgn >> (8 * l)) & 0xf) * 0x01010101) & 0x08040201, 0x08040201, std::equal_to<>());
+            const uint32_t signs1 = dpct::vectorized_binary<sycl::uchar4>(
+                (((sgn >> (8 * l + 4)) & 0xf) * 0x01010101) & 0x08040201, 0x08040201, std::equal_to<>());
+            const int grid_l = dpct::vectorized_binary<sycl::uchar4>(grid1[0] ^ signs0, signs0, std::minus<>());
+            const int grid_h = dpct::vectorized_binary<sycl::uchar4>(grid2[0] ^ signs1, signs1, std::minus<>());
+
+#pragma unroll
+            for (int c = 0; c < ncols_dst; ++c) {
+                const char * ycol = (const char *) vy + (size_t) c * stride_col_y_bytes;
+                const int *  q8   = (const int *) (ycol + col0);
+                sumi[c] = dpct::dp4a(grid_l, q8[2 * l + 0], sumi[c]);
+                sumi[c] = dpct::dp4a(grid_h, q8[2 * l + 1], sumi[c]);
+            }
+        }
+
+        // (d * (1 + 2*scales nibble)) * ds * sumi -- identical operand order to
+        // vec_dot_iq3_s_q8_1, so per-term products and per-lane accumulation are
+        // bit-identical; the cross-lane sum is not (see the header's numerics note).
+#pragma unroll
+        for (int c = 0; c < ncols_dst; ++c) {
+            acc[c] += d * ds[c] * sumi[c];
+        }
+    }
+
+#pragma unroll
+    for (int c = 0; c < ncols_dst; ++c) {
+        const float sum = sycl::reduce_over_group(sg, acc[c], std::plus<>());
+        if (sg.leader()) {
+            dst[c * stride_col_dst + row] = sum;
+        }
+    }
+}
+
+static void mul_mat_vec_iq3_s_q8_1_sycl_reorder(const void * vx, const void * vy, float * dst, const int ncols,
+                                                const int nrows, dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    constexpr size_t     num_subgroups = WARP_SIZE;
+    const int            block_num_y   = ceil_div(nrows, (int) num_subgroups);
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, 1, num_subgroups * WARP_SIZE);
+
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_iq3_s_reorder_flat<1>(vx, vy, dst, ncols, nrows, 0, 0, nd_item);
+                         });
+    });
+}
+
+template <int ncols_dst>
+static void mul_mat_vec_iq3_s_q8_1_sycl_reorder_ncols(
+        const void * vx, const void * vy, float * dst,
+        const int ncols, const int nrows,
+        const int stride_col_y_bytes, const int stride_col_dst,
+        dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    constexpr size_t     num_subgroups = WARP_SIZE;
+    const int            block_num_y   = ceil_div(nrows, (int) num_subgroups);
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, 1, num_subgroups * WARP_SIZE);
+
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_iq3_s_reorder_flat<ncols_dst>(vx, vy, dst, ncols, nrows,
+                                                                        stride_col_y_bytes, stride_col_dst, nd_item);
+                         });
+    });
+}
+
+// ncols_dst is deliberately capped at 8 and aborts above it, same as the IQ4_NL twin (and
+// every other reorder switch in this file). Production decode is ncols_dst == 5, which is
+// inside the range; the abort guards an unsupported wide batch, it is not the path
+// production takes.
+static void mul_mat_vec_iq3_s_q8_1_sycl_reorder_switch_ncols(
+        const void * vx, const void * vy, float * dst,
+        const int ncols, const int nrows, const int ncols_dst,
+        const int stride_col_y_bytes, const int stride_col_dst,
+        dpct::queue_ptr stream) {
+    switch (ncols_dst) {
+        case 1: mul_mat_vec_iq3_s_q8_1_sycl_reorder(vx, vy, dst, ncols, nrows, stream); break;
+        case 2: mul_mat_vec_iq3_s_q8_1_sycl_reorder_ncols<2>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 3: mul_mat_vec_iq3_s_q8_1_sycl_reorder_ncols<3>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 4: mul_mat_vec_iq3_s_q8_1_sycl_reorder_ncols<4>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 5: mul_mat_vec_iq3_s_q8_1_sycl_reorder_ncols<5>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 6: mul_mat_vec_iq3_s_q8_1_sycl_reorder_ncols<6>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 7: mul_mat_vec_iq3_s_q8_1_sycl_reorder_ncols<7>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 8: mul_mat_vec_iq3_s_q8_1_sycl_reorder_ncols<8>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
+        default: GGML_ABORT("unsupported ncols_dst=%d for IQ3_S reorder multi-col MMVQ", ncols_dst);
+    }
+}
+
 // Translate a graph-level row limit into this device's slice of the output.
 //
 // The limit counts global output rows. Under a tensor split this device owns global rows
@@ -4730,25 +4929,17 @@ static void mul_mat_vec_q_col_group(ggml_backend_sycl_context & ctx, const ggml_
                     if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
                         const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
                         const int stride_col_dst     = dst->ne[0];
-                        GGML_SYCL_DEBUG("Calling reordered IQ3_S multi-col MMVQ ncols=%d\n", (int) src1_ncols);
-                        reorder_mul_mat_vec_iq_q8_1_sycl_switch_ncols<GGML_TYPE_IQ3_S>(
+                        GGML_SYCL_DEBUG("Calling mul_mat_vec_iq3_s_q8_1_sycl_reorder_switch_ncols ncols=%d\n", (int)src1_ncols);
+                        mul_mat_vec_iq3_s_q8_1_sycl_reorder_switch_ncols(
                             src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
                             src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
                         return;
                     } else {
-                        GGML_SYCL_DEBUG("Calling reordered IQ3_S MMVQ\n");
-                        reorder_mul_mat_vec_iq_q8_1_sycl<GGML_TYPE_IQ3_S>(
-                            src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                        GGML_SYCL_DEBUG("Calling mul_mat_vec_iq3_s_q8_1_sycl_reorder\n");
+                        mul_mat_vec_iq3_s_q8_1_sycl_reorder(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
                     }
-                } else if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                    const int stride_col_y   = src1_padded_col_size / QK8_1;
-                    const int stride_col_dst = dst->ne[0];
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_iq3_s_q8_1_sycl_switch_ncols ncols=%d\n", (int) src1_ncols);
-                    mul_mat_vec_iq3_s_q8_1_sycl_switch_ncols(
-                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                        src1_ncols, stride_col_y, stride_col_dst, stream);
-                    return;
-                } else if (i == 0 || src1_ncols == 1) {
+                } else {
+                    GGML_SYCL_DEBUG("Calling mul_mat_vec_iq3_s_q8_1_sycl\n");
                     mul_mat_vec_iq3_s_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
                 }
                 break;

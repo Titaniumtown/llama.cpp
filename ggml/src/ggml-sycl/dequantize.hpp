@@ -1893,6 +1893,129 @@ static __dpct_inline__ void dequantize_block_iq4_xs_reorder(const void * __restr
     *reinterpret_cast<sycl::vec<dst_t, 4> *>(yb + 16) = hi;
 }
 
+// Reordered-layout IQ3_S dequant, full-line stores. One lane per 8-element run,
+// 32 lanes per 256-element superblock, so the 8-lane-per-PAIR shape the iq4_nl
+// kernel above uses does not apply here: the iq3_s qs plane decodes to
+// CONTIGUOUS element runs, so a lane can cover a whole il pair.
+//
+// PLANE-BASE CONTRACT -- must match reorder_qw_iq3_s in ggml-sycl.cpp and the
+// reader mul_mat_vec_iq3_s_reorder_flat in mmvq.cpp byte for byte. With
+// n = nblocks, the five planes are flat-contiguous off these affine bases, each
+// holding one field of every block, in this order:
+//
+//     qs      base       0   width QK_K/4 = 64   plane p of row r at 64*r + 8*p
+//     qh      base     64n   width QK_K/32 = 8   plane p of row r at 8*r  + p
+//     signs   base     72n   width QK_K/8 = 32   plane p of row r at 32*r + 4*p + il
+//     scales  base    104n   width IQ3S_N_SCALE  plane p of row r at 4*r  + (p>>1);
+//                                       sub-block p's scale is the LOW nibble of that
+//                                       byte if p is even, the HIGH nibble if p is odd
+//                                       -- i.e. byte >> 4*(p&1) & 0xf, NOT nibble index 4*(p&1)
+//     d       base    108n   width 2 (ggml_half) row r at 2*r
+//
+// 108n is even for every n, so the d plane keeps its 2 B alignment, and
+// 108n + 2n == 110n == n*sizeof(block_iq3_s) EXACTLY: the repack is
+// size-preserving with no per-block padding. There must be no per-block stride,
+// because 110 is not a multiple of 64 -- padding the block breaks the layout.
+// Alignment is per plane, not blanket: modulo 64 the bases are qs 0, qh 0,
+// signs 8n, scales 40n, d 44n, so only the qs and qh planes are 64 B aligned for a
+// general nblocks (d would additionally need nblocks a multiple of 16). Read the
+// per-plane granularity off the table above rather than assuming whole-line
+// accesses on all five.
+//
+// Plane p IS sub-block p, i.e. elements [32p, 32p+32): the AoS qs bytes 8p+2il
+// and 8p+2il+1 decode through grid1[0..3] and grid2[0..3] to elements 32p+8il+0..3
+// and 32p+8il+4..7. Those 8 are consecutive, so lane t's 16 B store lands on its
+// own whole 64 B line (the property worth 37% on iq4_xs). The iq4_nl kernel
+// above reaches the same full-line stores by spending an extra lane dimension on its
+// nibble plane, because in block_iq4_nl byte L feeds elements 32b+L (low) and 32b+L+16
+// (high) -- 16 apart, so a plane/half split is what recovers contiguity there. The
+// iq3_s plane is already contiguous within itself, so it needs no such split. (Both
+// kernels are natural-order and correct; only the lane decomposition differs.)
+//
+// Three things a writer on the other side must not get wrong, since each of them
+// yields plausible numbers rather than an obvious failure:
+//   * scales is the only plane that is a REPACK rather than a byte permutation --
+//     two sub-blocks share one byte, so 4*nblocks bytes, not 8 per sub-block, and
+//     the nibble is chosen by a SHIFT of 4*(p&1) (low if p even), not a nibble index.
+//   * signs is indexed 4*p + il, and EVERY sub-block owns its own 4 bytes: 8 x 4 = 32
+//     is the whole plane, so no byte is shared between sub-blocks and none is reserved.
+//     (The reference advances `signs += 4` TWICE per sub-block PAIR -- ggml-quants.c
+//     :2631 and :2643, one between the two l-loops and one at the pair's end -- so the
+//     pointer ends at 32, not 16. Counting that statement once per pair reads as
+//     4*(p>>1) + il and is silently wrong on every odd sub-block. Verified by
+//     transliterating the reference and executing it: 4437 superblocks, 0 mismatches.)
+//     Bit j of the byte is the sign of element 8*il + j within the sub-block, against
+//     kmask_iq2xs[0..7] -- one lane consumes all 8 bits.
+//   * qh cannot be folded into the qs plane: it supplies bit 8 of a 9-bit grid
+//     index under TWO different shifts, 8-2*il for grid1 and 7-2*il for grid2.
+//
+// Note that the four quantised planes do NOT share one index rule, which is why
+// "work it out by analogy with the plane above" is unsafe here:
+//     qs      indexed by p        (8 B per sub-block)
+//     qh      indexed by p        (1 B per sub-block; it ADVANCES 2 per pair, but
+//                                  sub-block 2m reads qh[0] and 2m+1 reads qh[1],
+//                                  so the sub-block index is p, not p>>1)
+//     signs   indexed by p        (4 B per sub-block)
+//     scales  indexed by p >> 1   (1 B per PAIR, two nibbles)
+// Only scales halves the sub-block index. The repack is the plain per-field
+// concatenation for all five, so this only bites a reader deriving its lane map.
+//
+// The decode below is dequantize_block_iq3_s verbatim with il = t & 3,
+// ib = t >> 2 -- only the byte ADDRESSING differs from the AoS kernel above, never
+// the arithmetic.
+template <typename dst_t>
+static void dequantize_block_iq3_s_reorder_wide(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t nb,
+                                                const sycl::nd_item<1> & it) {
+    static_assert(QK_K == 256, "wide iq3_s dequant assumes QK_K == 256");
+    // Compile-time guard for the index rules documented above: a plane's width must
+    // equal the span its index rule actually addresses, or the rule leaves part of the
+    // plane DEAD. The signs plane is the one that bites -- indexing it 4*(p>>1) + il
+    // addresses 4 groups of 4 B = 16 of its 32 bytes, which compiles, benchmarks, and
+    // is silently wrong on every odd sub-block (it is not what the reference does:
+    // ggml-quants.c advances `signs += 4` twice per sub-block pair, :2631 and :2643).
+    // Only scales is genuinely shared by a pair. The regions must also tile the block.
+    static_assert((QK_K / 32) * 4 == (QK_K / 8), "iq3_s signs plane must be addressed per sub-block, not per pair");
+    static_assert((QK_K / 4) + (QK_K / 32) + (QK_K / 8) + IQ3S_N_SCALE + 2 == sizeof(block_iq3_s),
+                  "iq3_s reorder planes must tile sizeof(block_iq3_s) exactly");
+    const int64_t g = it.get_global_id(0);
+    const int64_t b = g >> 5;  // 32 lanes per superblock
+    if (b >= nb) {
+        return;
+    }
+    const int ib = (int) (g & 31) >> 2;  // sub-block / plane, 0...7
+    const int il = (int) (g & 3);         // 0...3
+
+    // Cumulative from `base`, NOT chained off the previous plane. The writer
+    // (ggml-sycl.cpp, reorder_qw_iq3_s) and the decode-side reader (mmvq.cpp) both
+    // compute these as independent sums from base: qs=0, qh=64n, signs=72n,
+    // scales=104n, d=108n for n superblocks of 110 B. A chain that starts at
+    // base+(QK_K/4)*nb drops the leading 0, so every pointer names the base of the
+    // plane that FOLLOWS the one it is used for, and the trailing
+    // +IQ3S_N_SCALE*nb puts d_ptr at 112n -- 2n bytes past a 110n tensor.
+    // The iq4_xs wide dequant above already uses this cumulative form.
+    const uint8_t * base     = static_cast<const uint8_t *>(vx);
+    const uint8_t * qs_plane = base;
+    const uint8_t * qh_plane = qs_plane + (QK_K / 4) * nb;
+    const uint8_t * sg_plane = qh_plane + (QK_K / 32) * nb;
+    const uint8_t * sc_plane = sg_plane + (QK_K / 8) * nb;
+    const ggml_half * d_ptr  = reinterpret_cast<const ggml_half *>(sc_plane + IQ3S_N_SCALE * nb);
+
+    const uint8_t * qs = qs_plane + 64 * b + 8 * ib;
+    const uint8_t   qh = qh_plane[8 * b + ib];
+    const uint8_t * grid1 = (const uint8_t *) (iq3s_grid + (qs[2 * il + 0] | ((qh << (8 - 2 * il)) & 256)));
+    const uint8_t * grid2 = (const uint8_t *) (iq3s_grid + (qs[2 * il + 1] | ((qh << (7 - 2 * il)) & 256)));
+    const float d        = (float) d_ptr[b] * (1 + 2 * ((sc_plane[4 * b + ib / 2] >> 4 * (ib % 2)) & 0xf));
+    const uint8_t signs  = sg_plane[32 * b + 4 * ib + il];
+
+    sycl::vec<dst_t, 8> o;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        o[j + 0] = d * grid1[j] * (signs & kmask_iq2xs[j + 0] ? -1.f : 1.f);
+        o[j + 4] = d * grid2[j] * (signs & kmask_iq2xs[j + 4] ? -1.f : 1.f);
+    }
+    *reinterpret_cast<sycl::vec<dst_t, 8> *>(yy + b * QK_K + 32 * ib + 8 * il) = o;
+}
+
 template<typename dst_t>
 static void dequantize_block_mxfp4(const void * __restrict__ vx, dst_t * __restrict__ yy,
                                    const sycl::nd_item<3> &item_ct1) {

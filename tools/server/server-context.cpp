@@ -1881,8 +1881,6 @@ private:
     // return true if at least one slot has been cleared
     // TODO: improve logic
     //       - smarter decision which slot to clear (LRU or longest prompt?)
-    //       - move slot to level 2 cache instead of removing?
-    //       - instead of purging, try to store and resume later?
     bool try_clear_idle_slots() {
         bool res = false;
 
@@ -1896,7 +1894,19 @@ private:
             }
 
             if (slot.prompt.n_tokens() > 0) {
-                SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
+                // save the state to the prompt cache before purging (same as the
+                // idle-slot flush on task launch), so the conversation restores
+                // from host memory instead of re-prefilling from zero
+                bool saved = false;
+                if (prompt_cache) {
+                    saved = slot.prompt_save(*prompt_cache);
+                    if (saved) {
+                        prompt_cache->update();
+                    }
+                }
+
+                SRV_WRN("purging slot %d with %zu tokens (%s)\n", slot.id, slot.prompt.tokens.size(),
+                        saved ? "saved to prompt cache" : "state lost");
 
                 slot.prompt_clear();
 

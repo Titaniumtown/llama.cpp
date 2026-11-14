@@ -6,6 +6,8 @@
 #include "quants.hpp"
 #include "vecdotq.hpp"
 
+#include <sycl/ext/oneapi/work_group_static.hpp>
+
 #include <algorithm>
 #include <cmath>
 
@@ -3755,6 +3757,54 @@ static void mul_mat_vec_iq3_xxs_q8_1_sycl(const void *vx, const void *vy,
     }
 }
 
+// The IQ4_XS mat-vec reads the nibble -> value table from local memory, not the global-const
+// kvalues_iq4nl: the array-index lookup compiles to 8 divergent per-lane global byte gathers per
+// q-word, which contend with the weight stream on the one pipe this kernel saturates. Probed
+// standalone at 17408x5120: global table 213 GB/s, local table 868, no-table ceiling 997,
+// sub-group-shuffle table 66 (select_from_group with a dynamic index is emulated on Xe).
+static __dpct_inline__ uint8_t * iq4_xs_lut_slm() {
+    // block scope: one allocation per work-group, the same for every call in the kernel
+    sycl::ext::oneapi::experimental::work_group_static<uint8_t[16]> lut;
+    return &lut[0];
+}
+
+struct reorder_vec_dot_iq4_xs_slm : reorder_vec_dot_q_sycl<GGML_TYPE_IQ4_XS> {
+    // the barrier must be reached by the whole work-group, so this runs ahead of the kernel's
+    // row-bound early return (partial trailing work-groups)
+    static __dpct_inline__ void stage(const sycl::nd_item<3> & nd_item) {
+        const size_t t = nd_item.get_local_linear_id();
+        if (t < 16) {
+            iq4_xs_lut_slm()[t] = (uint8_t) kvalues_iq4nl[t];
+        }
+        nd_item.barrier(sycl::access::fence_space::local_space);
+    }
+
+    __dpct_inline__ static weights load(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
+                                        const std::pair<int, int> d_offset, const int & iqs) {
+        const uint8_t *  base   = static_cast<const uint8_t *>(vbq);
+        const sycl::int4 q4     = *reinterpret_cast<const sycl::int4 *>(base + ibx_offset.first + sizeof(int) * iqs);
+        const uint8_t *  values = iq4_xs_lut_slm();
+
+        weights w;
+        get_int_from_table_16((uint32_t) q4.x(), values, w.v[0], w.v[4]);
+        get_int_from_table_16((uint32_t) q4.y(), values, w.v[1], w.v[5]);
+        get_int_from_table_16((uint32_t) q4.z(), values, w.v[2], w.v[6]);
+        get_int_from_table_16((uint32_t) q4.w(), values, w.v[3], w.v[7]);
+        w.d = ggml_sycl_reordered::block_q_t<GGML_TYPE_IQ4_XS>::group_scale(base + d_offset.first, iqs / 4);
+        return w;
+    }
+
+    __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
+                                     const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr,
+                                     const sycl::half2 * q8_1_ds, const int & iqs) {
+        return dot(load(vbq, ibx_offset, d_offset, iqs), q8_1_quant_ptr, q8_1_ds, iqs);
+    }
+};
+
+template <ggml_type type>
+using reorder_iq_vec_dot =
+    std::conditional_t<type == GGML_TYPE_IQ4_XS, reorder_vec_dot_iq4_xs_slm, reorder_vec_dot_q_sycl<type>>;
+
 template <ggml_type type>
 static void reorder_mul_mat_vec_iq_q8_1_sycl(const void * vx, const void * vy, float * dst, const int ncols,
                                              const int nrows, dpct::queue_ptr stream) {
@@ -3769,7 +3819,10 @@ static void reorder_mul_mat_vec_iq_q8_1_sycl(const void * vx, const void * vy, f
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                          [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<type>>(
+                             if constexpr (type == GGML_TYPE_IQ4_XS) {
+                                 reorder_vec_dot_iq4_xs_slm::stage(nd_item);
+                             }
+                             mul_mat_vec_q_reorder<reorder_iq_vec_dot<type>>(
                                  vx, vy, dst, ncols, nrows, nd_item);
                          });
     });
@@ -3792,7 +3845,10 @@ static void reorder_mul_mat_vec_iq_q8_1_sycl_ncols(
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                          [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             mul_mat_vec_q_reorder_ncols<reorder_vec_dot_q_sycl<type>, ncols_dst>(
+                             if constexpr (type == GGML_TYPE_IQ4_XS) {
+                                 reorder_vec_dot_iq4_xs_slm::stage(nd_item);
+                             }
+                             mul_mat_vec_q_reorder_ncols<reorder_iq_vec_dot<type>, ncols_dst>(
                                  vx, /*vgate=*/ nullptr, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst,
                                  /*glu_op=*/ GGML_GLU_OP_SWIGLU, nd_item);
                          });

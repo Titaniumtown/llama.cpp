@@ -71,10 +71,20 @@ int ggml_sycl_get_env(const char *env_name, int default_val) {
     char *user_device_string = getenv(env_name);
     int user_number = default_val;
 
-    unsigned n;
+    // %u ACCEPTS A LEADING MINUS AND NEGATES, and any value above INT_MAX wraps on
+    // the (int) cast. So a typo reaches the caller as a NEGATIVE number: "=-1" and
+    // "=4294967295" both parse to -1 here. Every caller of this function compares the
+    // result against a shape limit, so a negative value makes `if (x < limit)`
+    // vacuously false and SILENTLY DELETES the guard it was meant to set -- no
+    // warning, no log line, and the wrong kernel selected. The parser is the shared
+    // cause, so fix it here rather than per-knob. Reject anything that is not a
+    // non-negative int that fits, and fall back to the default: an out-of-range knob
+    // must read as "unset", never as a poison value.
+    long long n;
     if (user_device_string != NULL &&
-        sscanf(user_device_string, " %u", &n) == 1) {
-        user_number = (int)n;
+        sscanf(user_device_string, " %lld", &n) == 1 &&
+        n >= 0 && n <= static_cast<long long>(std::numeric_limits<int>::max())) {
+        user_number = static_cast<int>(n);
     } else {
         user_number = default_val;
     }

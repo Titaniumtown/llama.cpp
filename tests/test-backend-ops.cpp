@@ -1654,7 +1654,36 @@ struct test_case {
 
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
             if (err > ud->tc->max_err(ud->backend1)) {
-                printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
+                // Report each side's magnitude, because ERR alone cannot tell a
+                // degenerate output from a merely inaccurate one.
+                //
+                // err() is nmse(), which returns mse_a_b / mse_a_0 with NO guard on
+                // either accumulator. Both are sums of non-negative terms, so
+                //     mse_a_b / mse_a_0 == 1.0  <=>  sum((a-b)^2) == sum(a^2)
+                // and for non-negative terms that identity is satisfied by b
+                // identically zero: with b == 0 the numerator is exactly sum(a^2), to
+                // the bit. So a FAIL line reading `ERR = 1.000000000` -- which this
+                // suite has produced, eight times, in RMS_NORM_BACK and
+                // CROSS_ENTROPY_LOSS_BACK -- is not a precision score at all. It is
+                // the exact quotient of two identical doubles, and the most likely
+                // reading is that one side came back entirely zero.
+                //
+                // That failure mode is invisible under the current print. An all-zero
+                // gradient is not "1% error"; it is no answer, and a 1e-6 gate says
+                // nothing about which of the two you are looking at. |max1| and |max2|
+                // settle it at the point of failure, on one line, with no bisect.
+                //
+                // The adjacent hole, named because it is the same guard: nmse() has
+                // no check on mse_a_0 either, so a reference that is identically zero
+                // prints inf or nan rather than a number. That is the mirror image and
+                // is equally uninformative, and |max1| distinguishes it just as well.
+                double m1 = 0.0, m2 = 0.0;
+                for (size_t i = 0; i < f1.size(); i++) {
+                    m1 = std::max(m1, std::fabs((double) f1[i]));
+                    m2 = std::max(m2, std::fabs((double) f2[i]));
+                }
+                printf("[%s] ERR = %.9f > %.9f |max1|=%.6g |max2|=%.6g ", ggml_op_desc(t1), err,
+                       ud->tc->max_err(ud->backend1), m1, m2);
                 //for (int i = 0; i < (int) f1.size(); i++) {
                 //    printf("%5d %9.6f %9.6f, diff = %9.6f\n", i, f1[i], f2[i], f1[i] - f2[i]);
                 //}

@@ -371,10 +371,18 @@ static void print_device_detail(int id, sycl::device &device, std::string device
     name = std::regex_replace(name, std::regex("\\(TM\\)"), "");
 
     auto global_mem_size = prop.get_global_mem_size()/1000000;
-    GGML_LOG_INFO("|%2d|%19s|%39s|%7s|%7d|%8d|%5d|%6luM|%21s|\n", id, device_type.c_str(),
+    // The per-work-group local-memory budget, printed. It gates every
+    // fused kernel in this backend -- it is read once at init (:222) and
+    // compared against a kernel's SLM requirement before the launch
+    // (:2620 and cross_entropy_loss.cpp:170), so print it beside GLOBAL
+    // memory rather than leave the budget every fusion is sized against
+    // inferable only from the source.
+    auto local_mem_size = prop.get_local_mem_size()/1000;
+    GGML_LOG_INFO("|%2d|%19s|%39s|%7s|%7d|%8d|%5d|%6luM|%6luK|%21s|\n", id, device_type.c_str(),
             name.c_str(), version.c_str(), prop.get_max_compute_units(),
             prop.get_max_work_group_size(), prop.get_max_sub_group_size(),
-            global_mem_size, device.get_info<sycl::info::device::driver_version>().c_str());
+            global_mem_size, local_mem_size,
+            device.get_info<sycl::info::device::driver_version>().c_str());
 }
 
 static void print_device_opt_feature(int device_count) {
@@ -409,13 +417,13 @@ void ggml_backend_sycl_print_sycl_devices() {
         " |Max    |        |Max  |Global |                     |\n");
     GGML_LOG_INFO(
         "|  |                   |                                       |      "
-        " |compute|Max work|sub  |mem    |                     |\n");
+        " |compute|Max work|sub  |mem    |local  |                     |\n");
     GGML_LOG_INFO(
         "|ID|        Device Type|                                   "
-        "Name|Version|units  |group   |group|size   |       Driver version|\n");
+        "Name|Version|units  |group   |group|size   |mem   |       Driver version|\n");
     GGML_LOG_INFO(
         "|--|-------------------|---------------------------------------|------"
-        "-|-------|--------|-----|-------|---------------------|\n");
+        "-|-------|--------|-----|-------|--------|-------|---------------------|\n");
 
     for (int id = 0; id < device_count; ++id) {
       sycl::device device = dpct::dev_mgr::instance().get_device(id);

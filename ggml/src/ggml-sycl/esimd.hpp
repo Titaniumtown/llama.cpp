@@ -906,6 +906,7 @@ template <bool SR, int NC_WIDE, xmx_scale_kind KIND> struct xmx_traits_base {
     static constexpr bool has_min    = KIND == xmx_scale_kind::min;
     static constexpr bool plain      = KIND == xmx_scale_kind::plain;
     static constexpr bool min16      = KIND == xmx_scale_kind::min16;
+    static constexpr int  slm_lut    = 0;  // bytes of a codebook at shared memory offset 0, written by store_lut
 };
 
 // The part of a context every quant type shares: the last row (the clamp of 2D loads), this thread's first row and
@@ -1276,6 +1277,98 @@ template <bool SR> struct xmx_traits_q8_0 : xmx_traits_base<SR, 16, xmx_scale_ki
     static ESIMD_INLINE simd<uint32_t, 128> unpack(const part_t & p, int g, int /*part*/) { return p.q[g]; }
 };
 
+// IQ4_XS reorder layout: [qs: nb*128] [per block {d, scales_h, scales_l} as in block_iq4_xs: nb*8]
+// group g of a super-block is sub-block g: byte j of its 16 holds weight j (low nibble) and weight j + 16 (high).
+// The codebook maps whole bytes: a 256 entry table in shared memory holds both nibbles' values, so one gather
+// lane yields two weights. The same table in registers, read by indirect movs of 16 lanes, cost 171-218 us per
+// call at 17408x5120 and 5120x17408 and 2..16 columns against 104-127 us for these gathers.
+template <bool SR> struct xmx_traits_iq4_xs : xmx_traits_base<SR, 16, xmx_scale_kind::plain> {
+    static constexpr int slm_lut = 256 * sizeof(uint16_t);
+
+    struct ctx : xmx_ctx_base {
+        const uint8_t *    qs;
+        const uint32_t *   sl;
+        const uint16_t *   sh;
+        const sycl::half * dh;
+        unsigned           pq;
+    };
+
+    static ESIMD_INLINE ctx make(const void * vx, int nrows, int bpr, int row0) {
+        const size_t nb = (size_t) nrows * bpr;
+        ctx          c;
+        xmx_ctx_init(c, nrows, bpr, row0);
+        c.qs = (const uint8_t *) vx;
+        const uint8_t * rec = c.qs + nb * (QK_K / 2);
+        c.sl = (const uint32_t *) (rec + offsetof(block_iq4_xs, scales_l));
+        c.sh = (const uint16_t *) (rec + offsetof(block_iq4_xs, scales_h));
+        c.dh = (const sycl::half *) (rec + offsetof(block_iq4_xs, d));
+        c.pq = xmx_pitch(bpr, QK_K / 2);
+        return c;
+    }
+
+    // byte b -> kvalues_iq4nl[b & 15] | kvalues_iq4nl[b >> 4] << 8, at shared memory offset 0
+    static ESIMD_INLINE void store_lut() {
+        using namespace sycl::ext::intel::esimd;
+        simd<uint16_t, 16> kv;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            kv[i] = (uint8_t) kvalues_iq4nl[i];
+        }
+        simd<uint16_t, 256> hi = kv.template replicate_vs_w_hs<16, 1, 16, 0>(0);
+        slm_block_store<uint16_t, 256>(0, simd<uint16_t, 256>(kv.template replicate<16>() | (hi << 8)));
+    }
+
+    struct scales_t {
+        xmx_row_scales<8> d;  // d * (scale - 32) of each sub-block
+    };
+
+    static ESIMD_INLINE scales_t load_scales(const ctx & c, int sb, const simd<uint32_t, 16> & rows) {
+        using namespace sycl::ext::intel::esimd;
+        scales_t           s;
+        simd<uint32_t, 16> bi = rows * c.bpr + sb;
+        simd<uint32_t, 16> ro = bi * (uint32_t) offsetof(block_iq4_xs, qs);  // byte offset of block bi's record
+        simd<uint32_t, 16> sl = gather<uint32_t, 16>(c.sl, ro);
+        simd<uint32_t, 16> sh = convert<uint32_t>(gather<uint16_t, 16>(c.sh, ro));
+        simd<float, 16>    d  = convert<float>(gather<sycl::half, 16>(c.dh, ro));
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            simd<int, 16> ls(((sl >> (4 * j)) & 0xFu) | (((sh >> (2 * j)) & 3u) << 4));
+            s.d.v[j]         = convert<float>(ls - 32) * d;
+        }
+        return s;
+    }
+
+    struct part_t {
+        simd<uint32_t, 128> a, b;  // sub-blocks 4 * part + 0, 1 and 4 * part + 2, 3
+    };
+
+    static ESIMD_INLINE part_t load_part(const ctx & c, int sb, int part) {
+        part_t p;
+        p.a = xmx_load_t<8, SR>(c.qs, c.pq, c.h, sb * 32 + part * 16, c.row0);
+        p.b = xmx_load_t<8, SR>(c.qs, c.pq, c.h, sb * 32 + part * 16 + 8, c.row0);
+        return p;
+    }
+
+    // dword (kd, n) of the group: kd 0..3 are the low nibbles of the sub-block's dwords, 4..7 the high ones
+    static ESIMD_INLINE simd<uint32_t, 128> unpack(const part_t & p, int g, int /*part*/) {
+        using namespace sycl::ext::intel::esimd;
+        simd<uint32_t, 128> src = (g < 2) ? p.a : p.b;
+        simd<uint32_t, 64>  q   = src.template select<64, 1>(64 * (g & 1));
+        simd<uint8_t, 256>  qb  = q.template bit_cast_view<uint8_t>();
+        simd<uint32_t, 256> off = convert<uint32_t>(qb) * (uint32_t) sizeof(uint16_t);
+        simd<uint16_t, 256> v;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            v.template select<16, 1>(16 * i) = slm_gather<uint16_t, 16>(off.template select<16, 1>(16 * i));
+        }
+        simd<uint8_t, 512> vb = v.template bit_cast_view<uint8_t>();
+        simd<uint8_t, 512> x;
+        x.template select<256, 1>(0)   = vb.template select<256, 2>(0);
+        x.template select<256, 1>(256) = vb.template select<256, 2>(1);
+        return simd<uint32_t, 128>(x.template bit_cast_view<uint32_t>());
+    }
+};
+
 template <bool SR> using xmx_traits_q4_k = xmx_traits_q45_k<false, SR>;
 template <bool SR> using xmx_traits_q5_k = xmx_traits_q45_k<true, SR>;
 
@@ -1445,6 +1538,13 @@ ESIMD_INLINE void xmx_mul_mat(const void *     vx,
     const auto c    = T::make(vx, nrows, bpr, row0);
     const auto cg   = T::make(FUSED ? vg : vx, nrows, bpr, row0);
 
+    if constexpr (T::slm_lut > 0) {
+        if (lid == 0) {
+            T::store_lut();
+        }
+        barrier();
+    }
+
     simd<uint32_t, NT> rows;
 #pragma unroll
     for (int n = 0; n < NT; ++n) {
@@ -1521,9 +1621,9 @@ ESIMD_INLINE void xmx_mul_mat(const void *     vx,
     }
 
     if constexpr (KS > 1) {
-        slm_block_store<float, NC * NT>(lid * NC * NT * sizeof(float), Cf);
+        slm_block_store<float, NC * NT>(T::slm_lut + lid * NC * NT * sizeof(float), Cf);
         if constexpr (FUSED) {
-            slm_block_store<float, NC * NT>((KS + lid) * NC * NT * sizeof(float), Cfg);
+            slm_block_store<float, NC * NT>(T::slm_lut + (KS + lid) * NC * NT * sizeof(float), Cfg);
         }
         barrier();
         if (lid != 0) {
@@ -1533,9 +1633,9 @@ ESIMD_INLINE void xmx_mul_mat(const void *     vx,
         Cfg = 0.0f;
 #pragma unroll 4
         for (int j = 0; j < ks; ++j) {
-            Cf += slm_block_load<float, NC * NT>(j * NC * NT * sizeof(float));
+            Cf += slm_block_load<float, NC * NT>(T::slm_lut + j * NC * NT * sizeof(float));
             if constexpr (FUSED) {
-                Cfg += slm_block_load<float, NC * NT>((KS + j) * NC * NT * sizeof(float));
+                Cfg += slm_block_load<float, NC * NT>(T::slm_lut + (KS + j) * NC * NT * sizeof(float));
             }
         }
     }
@@ -1591,8 +1691,9 @@ static void xmx_mul_mat_launch_ks(const void *       vx,
             sycl::ext::oneapi::experimental::properties{
                 sycl::ext::intel::experimental::grf_size<xmx_grf<T, NC, FUSED>()> },
             [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                if constexpr (KS_MAX > 1) {
-                    sycl::ext::intel::esimd::slm_init<(FUSED ? 2 : 1) * KS_MAX * NC * XMX_ROWS * sizeof(float)>();
+                if constexpr (KS_MAX > 1 || T::slm_lut > 0) {
+                    sycl::ext::intel::esimd::slm_init<T::slm_lut +
+                                                      (FUSED ? 2 : 1) * KS_MAX * NC * XMX_ROWS * sizeof(float)>();
                 }
                 const int tile = it.get_group(0);
                 const int lid  = it.get_local_id(0);

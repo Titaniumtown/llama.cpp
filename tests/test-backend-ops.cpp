@@ -13501,7 +13501,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n : { 1, 2, 3, 4, 5, 6, 7, 8, 10 }) {
         test_cases.emplace_back(new test_mul_mat_glu_mixed(GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, 17408, n, 5120));
     }
-    for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
+    for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS }) {
         for (int n : { 2, 3, 4, 5, 6, 7, 8, 10, 16 }) {
             test_cases.emplace_back(new test_mul_mat_glu_mixed(t, t, 17408, n, 5120));
         }
@@ -13536,7 +13536,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // warm-reorder mat-vecs at every width the XMX mat-vec takes in decode and verify, on the
     // production row lengths, plus row lengths on both sides of its 2D block load threshold
     for (ggml_type type :
-         { GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0 }) {
+         { GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+           GGML_TYPE_IQ4_XS }) {
         for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 } }) {
             for (int n = 1; n <= 16; ++n) {
                 test_cases.emplace_back(new test_mul_mat_warm(type, m, n, k));
@@ -15167,7 +15168,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Gate and up on the SYCL XMX kernels: rows long enough for 2D block loads, a last tile of 8 rows, and
     // columns on both sides of the 8 and 16 column tiles
     for (ggml_type type : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
-                           GGML_TYPE_Q8_0}) {
+                           GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS}) {
         for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
             for (int64_t m_batch : {1, 2, 3, 5, 8, 9, 16, 17}) {
                 test_cases.emplace_back(new test_mul_mat_fusion(type, glu_op, m_batch, 1000, 1024,

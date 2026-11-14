@@ -267,6 +267,7 @@ static inline bool ggml_sycl_xmx_supports_type(ggml_type type) {
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ4_XS:
             return true;
         default:
             return false;

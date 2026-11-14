@@ -4441,6 +4441,8 @@ static bool ggml_sycl_mul_mat_vec_q_xmx_type(ggml_type                          
             XMX_RUN(xmx_traits_q6_k);
         case GGML_TYPE_Q8_0:
             XMX_RUN(xmx_traits_q8_0);
+        case GGML_TYPE_IQ4_XS:
+            XMX_RUN(xmx_traits_iq4_xs);
         default:
             return false;
     }

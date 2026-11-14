@@ -14,6 +14,24 @@
 #include "fattn-tile.hpp"
 #include "convert.hpp"
 
+// TILE implements a FIXED set of head sizes -- the dispatch in fattn-tile.cpp has
+// cases for 112, 128, 256, 512 and 576 and GGML_ABORTs on anything else. So "fall
+// back to TILE" is only a fallback for those five; for every other head size it
+// converts a recoverable oneDNN build failure into a process abort.
+//
+// This is not hypothetical. test-backend-ops reaches hsk=192, which the oneDNN
+// predicate accepts and TILE does not implement, and aborts on the FIRST case it
+// executes -- so FLASH_ATTN_EXT had no coverage at all, and neither had any head
+// size oneDNN could not build a partition for.
+//
+// MKL is the right destination: its arm is gated on ne[0] % 64 == 0 with ne[0] in
+// [64, 512], which covers 192 (and 64, 128, 256, 320, 384, 448). The sizes TILE lacks
+// and MKL also lacks -- 40, 72, 80, 96 -- were already unreachable before this change
+// and are not made worse by it; that is a separate gap in the chooser, not this one.
+static inline bool ggml_sycl_fattn_tile_handles_head_size(const int64_t h) {
+    return h == 112 || h == 128 || h == 256 || h == 512 || h == 576;
+}
+
 // Minimum query length treated as prefill. 32 is the historical default and is kept, and
 // it stays an INHERITANCE, not a result: the gate that admits oneDNN IS this floor, so
 // at decode width (n_q = 1, or 1 + draft = 5 with --spec-draft-n-max 4) the predicate
@@ -631,7 +649,7 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
         // oneDNN can decline a shape or a stride set that _supported() never sees; build_sdpa warns per key.
         // The sentinel only lands here when the causal partition refused to build; TILE does not
         // understand it, so fall back to the MKL kernel, which computes the boundary in-kernel.
-        if (causal) {
+        if (causal || !ggml_sycl_fattn_tile_handles_head_size(dst->src[0]->ne[0])) {
             ggml_sycl_flash_attn_ext_mkl(ctx, dst);
         } else {
             ggml_sycl_flash_attn_ext_tile(ctx, dst);
@@ -684,9 +702,11 @@ catch (const std::exception & e) {
     const ggml_tensor * mfall = dst->src[3];
     if (!g_ggml_sycl_fa_onednn_failed[ctx.device].exchange(true)) {
         GGML_LOG_WARN("%s: oneDNN SDPA failed (%s); falling back to %s kernel\n", __func__, e.what(),
-                (mfall && mfall->ne[0] == 1) ? "MKL" : "TILE");
+                ((mfall && mfall->ne[0] == 1) ||
+                 !ggml_sycl_fattn_tile_handles_head_size(dst->src[0]->ne[0])) ? "MKL" : "TILE");
     }
-    if (mfall && mfall->ne[0] == 1) {
+    if ((mfall && mfall->ne[0] == 1) ||
+        !ggml_sycl_fattn_tile_handles_head_size(dst->src[0]->ne[0])) {
         ggml_sycl_flash_attn_ext_mkl(ctx, dst);
     } else {
         ggml_sycl_flash_attn_ext_tile(ctx, dst);

@@ -3337,6 +3337,16 @@ static inline bool src1_f16_overlaps(const ggml_backend_sycl_context & ctx, cons
     return a0 < b1 && b0 < a1;
 }
 
+// The pure view ops of the ggml.h op list (ggml.h:521-524, RESHAPE/VIEW/PERMUTE/
+// TRANSPOSE) -- the same four ggml_op_is_empty in ggml-impl.h classifies as
+// kernel-free, minus GGML_OP_NONE which no view constructor produces. They launch
+// no kernel and write no bytes: a node of one of these ops can sit between a cache
+// store and its consumer without ever touching the cached range.
+static inline bool ggml_sycl_op_is_view(enum ggml_op op) {
+    return op == GGML_OP_RESHAPE || op == GGML_OP_VIEW || op == GGML_OP_PERMUTE ||
+           op == GGML_OP_TRANSPOSE;
+}
+
 // Hit only when the same slice was converted earlier in THIS graph and no node between
 // then and now writes over it. The walk is over graph nodes, which is a superset of what
 // executed, so a fused path that skipped nodes cannot hide a write. Bounded because a
@@ -3352,6 +3362,12 @@ static sycl::half * src1_f16_lookup(ggml_backend_sycl_context & ctx, const void 
     if (ctx.cur_node < c.node || ctx.cur_node - c.node > src1_cache_max_dist) { return nullptr; }
     for (int j = c.node + 1; j <= ctx.cur_node; ++j) {
         const ggml_tensor * n = ctx.cur_graph->nodes[j];
+        // View-class nodes launch no kernel and write nothing, and the GDN chain's
+        // RESHAPE between the gating MUL and ssm_out aliases the cached range by
+        // construction (same data pointer) -- it must not read as an intervening
+        // writer. What a view aliases was written before the store node, and a real
+        // later writer over the range is still caught below.
+        if (ggml_sycl_op_is_view(n->op)) { continue; }
         if (n->data != nullptr && src1_f16_overlaps(ctx, n->data, ggml_nbytes(n))) {
             return nullptr;
         }
@@ -3407,6 +3423,10 @@ static char * src1_q8_lookup(ggml_backend_sycl_context & ctx, const void * key, 
     if (ctx.cur_node < c.node || ctx.cur_node - c.node > src1_cache_max_dist) { return nullptr; }
     for (int j = c.node + 1; j <= ctx.cur_node; ++j) {
         const ggml_tensor * n = ctx.cur_graph->nodes[j];
+        // Same view exemption as src1_f16_lookup: the q8 emitter's own hop puts the
+        // RESHAPE/VIEW at store+1, and a view node writes nothing -- its aliased bytes
+        // were written before the store, so only a real writer can reject here.
+        if (ggml_sycl_op_is_view(n->op)) { continue; }
         if (n->data != nullptr && src1_q8_overlaps(ctx, n->data, ggml_nbytes(n))) {
             return nullptr;
         }
@@ -5853,7 +5873,34 @@ sycl::half * ggml_sycl_f16_mirror_for_next_matmul(ggml_backend_sycl_context & ct
     }
     ggml_tensor * nxt = g->nodes[prod + 1];
     if (nxt->op != GGML_OP_MUL_MAT || nxt->src[1] != dst) {
-        return nullptr;
+        // The consumer may sit one contiguous same-data view away: the GDN chain is
+        // MUL -> RESHAPE([head_dim, heads*t] -> [6144, t]) -> MUL_MAT, the exact shape
+        // the q8 emitter has hopped (ggml_sycl_q8_emit_for_next_matvec).
+        // A contiguous view with an identical data pointer addresses the very bytes
+        // dst is about to write, so the mirror write is byte-identical to the CONVERT
+        // the GEMM would have run, and the stored key (dst->data == the view's data)
+        // is the pointer the consumer's lookup hashes. The view itself reads nothing
+        // and writes nothing. Off switch: GGML_SYCL_MIRROR_HOP=0.
+        static const int hop = ggml_sycl_get_env("GGML_SYCL_MIRROR_HOP", 1);
+        ggml_tensor * mm = nullptr;
+        if (hop != 0 && prod + 2 < g->n_nodes &&
+            (nxt->op == GGML_OP_RESHAPE || nxt->op == GGML_OP_VIEW) && nxt->src[0] == dst &&
+            nxt->data == dst->data && ggml_is_contiguous(nxt)) {
+            mm = g->nodes[prod + 2];
+            if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != nxt) { mm = nullptr; }
+        }
+        if (mm == nullptr) {
+            return nullptr;
+        }
+        nxt = mm;
+        // A flat-2D offset-0 PARTIAL view (contiguous, same base pointer, fewer elements)
+        // passes every test above and is still unservable: the consumer's lookup hashes the
+        // view's own ne = ne[0]*ne[1], smaller than the whole-tensor mirror stored here --
+        // every slice misses, the GEMM converts from f32 anyway, and the armed elision
+        // aborts. The hop is sound only when the view covers the producer.
+        if (ggml_nelements(nxt->src[1]) != ggml_nelements(dst)) {
+            return nullptr;
+        }
     }
 
     // Only the f16 GEMM path converts src1. The mat-vec paths quantize to q8_1 or read f32
@@ -5884,6 +5931,9 @@ sycl::half * ggml_sycl_f16_mirror_for_next_matmul(ggml_backend_sycl_context & ct
 // ggml_sycl_elide_f32_arm, and that call happens only on the mirror path -- so a candidate
 // the dispatcher never arms (a fused span that declined to fuse, say) simply keeps its
 // store.
+// One exception to "every reference is a GEMM src1": a contiguous same-data
+// view node between the producer and the GEMM (the GDN chain's RESHAPE before ssm_out)
+// is an alias, not a reader -- see the alias-hop branch below.
 static bool elide_f32_producer(const ggml_tensor * t) {
     if (t->op == GGML_OP_GLU) {
         return true;
@@ -5933,9 +5983,10 @@ static void ggml_sycl_elide_f32_census(ggml_backend_sycl_context & ctx, const gg
     // mirror stamps its cache entry there and every window below is relative to it), every
     // reference, and the indices of the MUL_MAT nodes reading it as src1
     struct scan {
-        int              prod = -1;
-        int              refs = 0;
-        std::vector<int> cons;
+        int                   prod = -1;
+        int                   refs = 0;
+        const ggml_tensor *   ref  = nullptr;  // the (single) referencing node, for the alias hop
+        std::vector<int>      cons;
     };
     std::unordered_map<const ggml_tensor *, scan> cand;
     for (int i = 0; i < g->n_nodes; ++i) {
@@ -5953,6 +6004,7 @@ static void ggml_sycl_elide_f32_census(ggml_backend_sycl_context & ctx, const gg
                 continue;
             }
             it->second.refs += 1;
+            it->second.ref = n;
             if (n->op == GGML_OP_MUL_MAT && s == 1) {
                 it->second.cons.push_back(i);
             }
@@ -5962,8 +6014,71 @@ static void ggml_sycl_elide_f32_census(ggml_backend_sycl_context & ctx, const gg
         const ggml_tensor * p = e.first;
         const scan        & s = e.second;
         const int           n = (int) s.cons.size();
+        // Alias hop: the GDN chain is MUL -> RESHAPE("final_output") -> MUL_MAT.
+        // The view is a reference to p like any other, but it reads nothing and writes
+        // nothing: an alias, not a reader. p is eligible when that view is its ONLY
+        // reference, it sits at prod+1, is contiguous with the same data pointer (so the
+        // mirror key and the GEMM's lookup key coincide), and its only reference anywhere
+        // is the MUL_MAT at prod+2 taking it as src1. The lookup walk exempts view ops,
+        // so the view between the store and the consumer cannot reject the hit at run
+        // time; and no other GEMM sits in (prod, prod+2] to evict the single-slot cache.
+        if (n == 0 && s.refs == 1 && s.ref != nullptr) {
+            const ggml_tensor * v = s.ref;
+            bool hop = v == g->nodes[s.prod + 1] && ggml_sycl_op_is_view(v->op) &&
+                       v->src[0] == p && v->data == p->data && ggml_is_contiguous(v) &&
+                       !(v->flags & GGML_TENSOR_FLAG_OUTPUT) && s.prod + 2 < g->n_nodes;
+            ggml_tensor * mm = hop ? g->nodes[s.prod + 2] : nullptr;
+            // the hopped consumer must be an f16 GEMM that will hit the mirror, the same
+            // tests the adjacent branch applies to its consumers (the mirror helper runs
+            // them again on the TAKEN-hop path; the census stays necessary-only)
+            hop = hop && mm->op == GGML_OP_MUL_MAT && mm->src[1] == v && ggml_sycl_mul_mat_reads_f16_mirror(mm);
+            // The mirror is stored once for the whole tensor, but the consumer's f16
+            // lookup runs per mul_mat src1 SLICE (i0 over src1->ne[2]*ne[3], ne =
+            // ne[0]*ne[1] each). Only a flat-2D src1 makes that lookup serve the whole
+            // tensor: a 3D one -- final_output at n_seqs > 1, which is exactly what
+            // perplexity's n_ctx < n_batch runs build -- misses every slice and would
+            // read the f32 this census is about to elide. Decline; the class cannot be
+            // proven safe, so it keeps its store.
+            hop = hop && v->ne[2] == 1 && v->ne[3] == 1;
+            // the lookup's own walk, mirrored exactly: nothing between the store and the
+            // consumer may write over the range -- view ops exempt, the consumer's own
+            // dst included. The adjacent branch's walk below covers its consumers the
+            // same way; the hop branch owed the run time this half of the criterion.
+            for (int k = s.prod + 1; hop && k <= s.prod + 2; ++k) {
+                const ggml_tensor * w = g->nodes[k];
+                if (ggml_sycl_op_is_view(w->op)) {
+                    continue;
+                }
+                const char * w0 = (const char *) w->data;
+                const char * p0 = (const char *) p->data;
+                if (w0 != nullptr && p0 != nullptr &&
+                    w0 < p0 + ggml_nbytes(p) && p0 < w0 + ggml_nbytes(w)) {
+                    hop = false;
+                }
+            }
+            // the view must be referenced exactly once, by that GEMM's src1 slot
+            for (int j = 0; hop && j < g->n_nodes; ++j) {
+                const ggml_tensor * m = g->nodes[j];
+                for (int t = 0; t < GGML_MAX_SRC; ++t) {
+                    if (m->src[t] == v && !(m == mm && t == 1)) {
+                        hop = false;
+                    }
+                }
+            }
+            if (hop) {
+                ggml_sycl_elide_f32_register(ctx, p, 1, s.prod + 2);
+            }
+            continue;
+        }
         // every reference is a GEMM src1 -- this is what makes the f32 unobservable
         if (n < 1 || s.refs != n) {
+            continue;
+        }
+        // the mirror is one whole-tensor store and the consumer's f16 lookup runs per
+        // mul_mat src1 slice (i0 over src1->ne[2]*ne[3]): only a flat-2D src1 can serve
+        // the whole tensor from one slot. Every consumer here takes src1 == p, so p's own
+        // dims decide; deeper shapes keep their f32 (same criterion as the helper).
+        if (p->ne[2] != 1 || p->ne[3] != 1) {
             continue;
         }
         const int last = s.cons[n - 1];

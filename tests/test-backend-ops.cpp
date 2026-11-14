@@ -12665,6 +12665,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // both sides of the per-type width up to which the SYCL mat-vec splits a batch, short rows and 2D-load rows
+    for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+                              GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS }) {
+        for (int n : {9, 14, 15, 16, 17, 24, 25, 32, 33}) {
+            for (int k : {256, 1024}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, n, k, { 1, 1 }, { 1, 1 }));
+            }
+        }
+    }
+
     // The SYCL backend picks between one and two output rows per subgroup by row count when there
     // are two destination columns (Q4_K_MMVQ_ROW_PAIR_MIN_NROWS in ggml-sycl/mmvq.cpp). Cover both
     // sides of that boundary, including an odd row count above it for the row-pair tail.

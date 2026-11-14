@@ -123,6 +123,7 @@ int g_ggml_sycl_fuse_conv_window = 1;
 int g_ggml_sycl_enable_esimd = 1;
 int g_ggml_sycl_mmid_esimd = 1;
 int g_ggml_sycl_mmvq_wide = 1;
+int g_ggml_sycl_mmvq_max_cols = GGML_SYCL_MMVQ_MAX_COLS_DEFAULT;
 int g_ggml_sycl_f32mm = 2;
 int g_ggml_sycl_enable_xmx_esimd = 1;
 int g_ggml_sycl_xmx_max_cols = GGML_SYCL_XMX_MAX_COLS_DEFAULT;
@@ -460,6 +461,8 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_enable_esimd = ggml_sycl_get_env("GGML_SYCL_ENABLE_ESIMD", 1);
         g_ggml_sycl_mmid_esimd = ggml_sycl_get_env("GGML_SYCL_MMID_ESIMD", 1);
         g_ggml_sycl_mmvq_wide = ggml_sycl_get_env("GGML_SYCL_MMVQ_WIDE", 1);
+        g_ggml_sycl_mmvq_max_cols =
+            std::max(-1, ggml_sycl_get_env("GGML_SYCL_MMVQ_MAX_COLS", GGML_SYCL_MMVQ_MAX_COLS_DEFAULT));
         g_ggml_sycl_f32mm = ggml_sycl_get_env("GGML_SYCL_F32MM", 2);
         g_ggml_sycl_enable_xmx_esimd = ggml_sycl_get_env("GGML_SYCL_ENABLE_XMX_ESIMD", 1);
         g_ggml_sycl_xmx_max_cols = std::max(0, ggml_sycl_get_env("GGML_SYCL_XMX_MAX_COLS", GGML_SYCL_XMX_MAX_COLS_DEFAULT));
@@ -619,6 +622,7 @@ static void ggml_check_sycl() try {
 #endif
 
         GGML_LOG_INFO("  GGML_SYCL_MMVQ_WIDE: %d\n", g_ggml_sycl_mmvq_wide);
+        GGML_LOG_INFO("  GGML_SYCL_MMVQ_MAX_COLS: %d\n", g_ggml_sycl_mmvq_max_cols);
         GGML_LOG_INFO("  GGML_SYCL_F32MM: %d\n", g_ggml_sycl_f32mm);
 
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_XMX_ESIMD: %d\n", g_ggml_sycl_enable_xmx_esimd);
@@ -5526,13 +5530,48 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
     }
 }
 
+// widest batch mul_mat_vec_q takes for a type as several launches, the widest measured faster than dequantize + GEMM
+static int64_t ggml_sycl_mmvq_type_max_cols(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q8_0:
+            return GGML_SYCL_MMVQ_TYPE_MAX_COLS;
+        case GGML_TYPE_IQ3_S:
+            return 24;
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+            return 16;
+        case GGML_TYPE_IQ4_NL:
+            return 15;
+        case GGML_TYPE_Q6_K:
+            return 14;
+        default:
+            return MMVQ_MAX_BATCH_SIZE;
+    }
+}
+
+// wider batches take mul_mat_vec_q as several launches only on the reordered layout and where src1 may become q8_1
+static bool ggml_sycl_mmvq_chunks(int device, const ggml_tensor * src0, const ggml_tensor * src1,
+                                  const ggml_tensor * dst) {
+    const int32_t src1_prec = ggml_sycl_src1_prec(dst);
+    const int64_t type_max  = ggml_sycl_mmvq_type_max_cols(src0->type);
+    const bool    knob_set  = g_ggml_sycl_mmvq_max_cols >= 0 && type_max > MMVQ_MAX_BATCH_SIZE;
+    const int64_t max_cols  = knob_set ? g_ggml_sycl_mmvq_max_cols : type_max;
+    return dst->op == GGML_OP_MUL_MAT && g_ggml_sycl_enable_optimize &&
+           ggml_sycl_info().devices[device].opt_feature.reorder && ggml_sycl_supports_reorder_mmvq(src0->type) &&
+           !ggml_backend_buffer_is_sycl_split(src0->buffer) && ggml_is_contiguous(src1) && src1->ne[2] == 1 &&
+           src1->ne[3] == 1 && (src1_prec == GGML_PREC_UNDEFINED || src1_prec >= GGML_PREC_Q8) &&
+           src1->ne[1] <= max_cols;
+}
+
 static bool should_reorder_tensor(ggml_backend_sycl_context& ctx, const ggml_tensor * dst) {
     return g_ggml_sycl_enable_optimize && //allow optimize, controlled by $GGML_SYCL_ENABLE_OPT
            ctx.opt_feature.reorder &&      //allow this device due to good perf, skip the devices with bad perf.
            dst->op == GGML_OP_MUL_MAT &&   //limit to some supported cases of Q4_0, to do for more cases.
-           // ne[1] <= 8 so multi-column decode (spec / MTP verify) also bootstraps the reorder;
-           // all reorderable types have a _switch_ncols kernel.
-           dst->src[1]->ne[1] <= 8 && dst->src[1]->ne[2]==1 && dst->src[1]->ne[3]==1;
+           // the widths mul_mat_vec_q takes in one launch or as several also bootstrap the reorder
+           (dst->src[1]->ne[1] <= MMVQ_MAX_BATCH_SIZE ||
+            ggml_sycl_mmvq_chunks(ctx.device, dst->src[0], dst->src[1], dst)) &&
+           dst->src[1]->ne[2]==1 && dst->src[1]->ne[3]==1;
 }
 
 static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor * src0, const ggml_tensor * /* src1 */,
@@ -5623,7 +5662,8 @@ static bool can_use_xmx_batch(int device, const ggml_tensor * src0, const ggml_t
 
 static bool can_use_mul_mat_vec_q(int device, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     return ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-           (src1->ne[1] <= MMVQ_MAX_BATCH_SIZE || can_use_xmx_batch(device, src0, src1));
+           (src1->ne[1] <= MMVQ_MAX_BATCH_SIZE || ggml_sycl_mmvq_chunks(device, src0, src1, dst) ||
+            can_use_xmx_batch(device, src0, src1));
 }
 
 static bool can_use_mul_mat_q(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -5746,8 +5786,8 @@ char * ggml_sycl_q8_emit_for_next_matvec(ggml_backend_sycl_context & ctx,
     }
 
     const char * why = nullptr;
-    // The consumer must take the quantizing mat-vec path: not DMMV (reads f32 directly) and
-    // within MMVQ's batch bound -- rows above it take the GEMM path and never look up the
+    // The consumer must take the quantizing mat-vec path: not DMMV (reads f32 directly), and a
+    // width can_use_mul_mat_vec_q admits -- wider rows take the GEMM path and never look up the
     // q8_1 cache. MATRIX_ROW_PADDING-aligned ne00 makes the padded q8_1 row
     // stride equal the natural one, which the emission's flat row math assumes (17408 and
     // 5120 both qualify).
@@ -5760,7 +5800,7 @@ char * ggml_sycl_q8_emit_for_next_matvec(ggml_backend_sycl_context & ctx,
     // consumer never looks up is a harmless 19.5 KB write into a buffer the next op reuses.
     if (!can_use_mul_mat_vec_q(ctx.device, nxt->src[0], tgt, nxt))  { why = "not-mmvq"; }
     else if (g_ggml_sycl_prioritize_dmmv)                           { why = "dmmv-prioritized"; }
-    else if (tgt->ne[1] < 1 || tgt->ne[1] > MMVQ_MAX_BATCH_SIZE)    { why = "rows"; }
+    else if (tgt->ne[1] < 1)                                        { why = "rows"; }
     else if (tgt->ne[2] != 1 || tgt->ne[3] != 1)                    { why = "dims23"; }
     else if (!ggml_is_contiguous(tgt))                              { why = "noncontig"; }
     else if (tgt->ne[0] % MATRIX_ROW_PADDING != 0)                  { why = "ne00%pad"; }
@@ -5881,7 +5921,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     // When reorder is enabled, both ESIMD, MMVQ and DMMV kernels may be used. For
     // best performance use ESIMD when supported, followed by MMVQ, and finally DMMV.
     // But the reordered ESIMD path cannot be used without reordered MMVQ. A later
-    // multi-token call (ne[1] in 2..8) will take the MMVQ path and it would read the
+    // multi-token call (ne[1] > 1) will take the MMVQ path and it would read the
     // reordered bytes as if they were still the unreordered layout.
 
     if (!g_ggml_sycl_prioritize_dmmv && ((should_reorder_tensor(ctx, dst) &&

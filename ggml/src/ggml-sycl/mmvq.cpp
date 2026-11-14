@@ -3875,23 +3875,14 @@ static char * mmvq_glu_epi_q8_target(ggml_backend_sycl_context & ctx, const int 
     return p;
 }
 
-void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+// one launch of at most MMVQ_MAX_BATCH_SIZE columns; ggml_sycl_op_mul_mat_vec_q tries XMX and splits wider batches
+static void mul_mat_vec_q_col_group(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                                 ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
                                 const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low,
                                 const int64_t row_high, const int64_t src1_ncols, const int64_t src1_padded_col_size,
                                 const dpct::queue_ptr & stream) {
-    const int64_t ne10 = src1->ne[0];
-    GGML_ASSERT(ne10 % QK8_1 == 0);
-
     const int64_t ne00     = src0->ne[0];
     const int64_t row_diff = row_high - row_low;
-
-#ifdef GGML_SYCL_MMVQ_HAS_XMX
-    if (ggml_sycl_mul_mat_vec_q_xmx(ctx.device, src0, dst, src0_dd_i, src1_ddq_i, dst_dd_i, row_diff, src1_ncols,
-                                    src1_padded_col_size, stream)) {
-        return;
-    }
-#endif // GGML_SYCL_MMVQ_HAS_XMX
 
     int id;
     SYCL_CHECK(CHECK_TRY_ERROR(id = get_current_device_id()));
@@ -4419,6 +4410,42 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
     GGML_UNUSED(dst);
     GGML_UNUSED(src1_ddf_i);
     GGML_UNUSED(ctx);
+}
+
+void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                                ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
+                                const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low,
+                                const int64_t row_high, const int64_t src1_ncols, const int64_t src1_padded_col_size,
+                                const dpct::queue_ptr & stream) {
+    const int64_t ne10 = src1->ne[0];
+    GGML_ASSERT(ne10 % QK8_1 == 0);
+
+#ifdef GGML_SYCL_MMVQ_HAS_XMX
+    if (ggml_sycl_mul_mat_vec_q_xmx(ctx.device, src0, dst, src0_dd_i, src1_ddq_i, dst_dd_i, row_high - row_low,
+                                    src1_ncols, src1_padded_col_size, stream)) {
+        return;
+    }
+#endif // GGML_SYCL_MMVQ_HAS_XMX
+    if (src1_ncols <= MMVQ_MAX_BATCH_SIZE) {
+        mul_mat_vec_q_col_group(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i, row_low, row_high,
+                                src1_ncols, src1_padded_col_size, stream);
+        return;
+    }
+
+    // the fused epilogues have single-column paths and are only set up for batches of up to MMVQ_MAX_BATCH_SIZE
+    GGML_ASSERT(ctx.mmvq_glu_epi_out == nullptr && ctx.mmvq_pair_other == nullptr && ctx.mmvq_dsa_out == nullptr);
+
+    // launches of up to MMVQ_MAX_BATCH_SIZE columns whose widths differ by at most one
+    const int64_t nlaunch        = ceil_div(src1_ncols, MMVQ_MAX_BATCH_SIZE);
+    const size_t  y_stride_bytes = src1_padded_col_size * sizeof(block_q8_1) / QK8_1;
+
+    for (int64_t l = 0; l < nlaunch; ++l) {
+        const int64_t col0 = l * src1_ncols / nlaunch;
+        const int64_t col1 = (l + 1) * src1_ncols / nlaunch;
+        mul_mat_vec_q_col_group(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i + col0 * y_stride_bytes,
+                                dst_dd_i + col0 * dst->ne[0], row_low, row_high, col1 - col0, src1_padded_col_size,
+                                stream);
+    }
 }
 
 // src1_row_stride: 0 for shared src1 (gate/up proj), else per-expert stride (down proj).

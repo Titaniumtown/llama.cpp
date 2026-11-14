@@ -883,9 +883,13 @@ static char * norm_q8_emit_target(ggml_backend_sycl_context & ctx, const ggml_te
     *q8_row_stride = 0;
     if (emit_q8 != 1) { return nullptr; }
 
-    // Wider than MMVQ_MAX_BATCH_SIZE the mat-mul takes the f16 GEMM path, which never looks up
-    // the q8_1 cache: a -d 8192 prefill emitting there turned decode 26.29 -> 26.23 t/s.
-    if (ne02 != 1 || ne03 != 1 || ne01 > MMVQ_MAX_BATCH_SIZE || ne00 % QK8_1 != 0 ||
+    // Emit only where a mat-vec consumer could use it: up to MMVQ_MAX_BATCH_SIZE columns always, and
+    // up to the widest split width (GGML_SYCL_MMVQ_TYPE_MAX_COLS, or GGML_SYCL_MMVQ_MAX_COLS when set).
+    // A wider batch mostly takes the f16 GEMM, which never looks up the q8_1 cache: a -d 8192
+    // prefill emitting there turned decode 26.29 -> 26.23 t/s.
+    const int max_cols = std::max<int>(MMVQ_MAX_BATCH_SIZE, g_ggml_sycl_mmvq_max_cols >= 0 ? g_ggml_sycl_mmvq_max_cols
+                                                                                      : GGML_SYCL_MMVQ_TYPE_MAX_COLS);
+    if (ne02 != 1 || ne03 != 1 || ne01 > max_cols || ne00 % QK8_1 != 0 ||
         !ggml_is_contiguous(out) || d00 != 1) {
         return nullptr;
     }

@@ -74,6 +74,7 @@ extern int g_ggml_sycl_fuse_conv_window;
 extern int g_ggml_sycl_enable_esimd;
 extern int g_ggml_sycl_mmid_esimd;
 extern int g_ggml_sycl_mmvq_wide;
+extern int g_ggml_sycl_mmvq_max_cols;
 extern int g_ggml_sycl_f32mm;
 extern int g_ggml_sycl_enable_xmx_esimd;
 extern int g_ggml_sycl_xmx_max_cols;
@@ -241,6 +242,11 @@ typedef sycl::float2 dfloat2;
 #endif // GGML_SYCL_F16
 
 #define MMVQ_MAX_BATCH_SIZE  8
+// default of GGML_SYCL_MMVQ_MAX_COLS: -1 keeps the per-type widths mul_mat_vec_q runs as several launches
+#define GGML_SYCL_MMVQ_MAX_COLS_DEFAULT -1
+// widest of the per-type widths (ggml_sycl_mmvq_type_max_cols returns no larger value), the bound for producers
+// that pre-quantize a mat-vec's src1
+#define GGML_SYCL_MMVQ_TYPE_MAX_COLS 32
 
 #if defined(GGML_SYCL_SUPPORT_XMX) && defined(__INTEL_LLVM_COMPILER) && __has_include(<sycl/ext/intel/esimd/xmx/dpas.hpp>)
 #    define GGML_SYCL_MMVQ_HAS_XMX

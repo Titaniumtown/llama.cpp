@@ -679,7 +679,7 @@ static int server_run_instance(common_params & params, server_role & role, commo
     }
 
     // setup clean up function, to be called before exit
-    auto clean_up = [&ctx_http, &ctx_server, &mcp_mgr, &sse_stopping]() {
+    auto clean_up = [&ctx_http, &ctx_server, &mcp_mgr, &sse_stopping, &params]() {
         SRV_INF("%s: cleaning up before exit...\n", __func__);
         // stop the session GC first, it finalizes live sessions and wakes pending readers
         server_stream_session_manager_stop();
@@ -687,6 +687,17 @@ static int server_run_instance(common_params & params, server_role & role, commo
         ctx_http.stop();
         ctx_server.terminate();
         mcp_mgr.shutdown();
+        // flush the prompt cache to the disk tier while the model and contexts are
+        // still alive. best-effort: an exception escaping clean_up() would abort the
+        // process (it also runs from the HTTP-start error path above), and a cache
+        // flush is never worth failing a shutdown over.
+        try {
+            ctx_server.flush_prompt_cache_disk();
+        } catch (const std::exception & e) {
+            SRV_WRN("prompt cache dump failed: %s\n", e.what());
+        } catch (...) {
+            SRV_WRN("%s", "prompt cache dump failed\n");
+        }
         llama_backend_free();
     };
 

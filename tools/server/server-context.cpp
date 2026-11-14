@@ -1630,7 +1630,33 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+
+            // the disk tier is best-effort and must never be able to abort the server:
+            // std::filesystem calls THROW on EACCES (an unreadable dump directory was
+            // enough on 2026-09-13 to turn a cache into std::terminate and a dead model),
+            // so the scan is wrapped and every failure is a WARN
+            if (!params_base.cache_disk_dir.empty()) {
+                if (params_base.cache_disk_mib == 0) {
+                    SRV_WRN("%s", "--cache-disk-mib 0 disables the disk tier, ignoring --cache-disk-dir\n");
+                } else {
+                    try {
+                        prompt_cache->disk_init(params_base.cache_disk_dir,
+                                params_base.cache_disk_mib < 0 ? 0 : 1024ull*1024ull*(size_t) params_base.cache_disk_mib,
+                                params_base.model.path, model_tgt, ctx_tgt,
+                                params_base.cache_type_k, params_base.cache_type_v);
+                    } catch (const std::exception & e) {
+                        SRV_WRN("prompt cache: disk tier '%s' unavailable: %s\n",
+                                params_base.cache_disk_dir.c_str(), e.what());
+                    } catch (...) {
+                        SRV_WRN("prompt cache: disk tier '%s' unavailable\n",
+                                params_base.cache_disk_dir.c_str());
+                    }
+                }
+            }
         } else {
+            if (!params_base.cache_disk_dir.empty()) {
+                SRV_WRN("%s", "--cache-disk-dir requires --cache-ram, ignoring\n");
+            }
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
@@ -1945,6 +1971,32 @@ private:
         }
 
         return res;
+    }
+
+    // --cache-disk-path: save idle slot states into the prompt cache, then dump the cache
+    // to disk. Runs on the main thread from clean_up(), after start_loop() has returned, so
+    // no slot can be processing concurrently. Best-effort: never blocks exit.
+    void flush_prompt_cache_disk() {
+        if (!prompt_cache || !prompt_cache->disk_enabled()) {
+            return;
+        }
+
+        if (!ctx_tgt || !model_tgt) {
+            SRV_WRN("%s", "prompt cache is enabled but the model is unloaded, skipping disk save\n");
+            return;
+        }
+
+        for (auto & slot : slots) {
+            if (slot.is_processing()) {
+                continue;
+            }
+
+            if (slot.prompt_save(*prompt_cache)) {
+                prompt_cache->update();
+            }
+        }
+
+        prompt_cache->disk_flush();
     }
 
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
@@ -5236,6 +5288,10 @@ void server_context::start_loop() {
 
 void server_context::terminate() {
     impl->queue_tasks.terminate();
+}
+
+void server_context::flush_prompt_cache_disk() {
+    impl->flush_prompt_cache_disk();
 }
 
 llama_context * server_context::get_llama_context() const {

@@ -309,6 +309,8 @@ llama_test_cmd(python3
 llama_build_and_test(test-json-schema.cpp  LABEL behavior)
 llama_build_and_test(test-chat-auto-parser.cpp  LABEL behavior  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp  LABEL behavior)
+llama_build_and_test(test-disk-entry-classify.cpp)
+target_include_directories(test-disk-entry-classify PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 # debug tool for chat template differential analysis (not registered as a test, run it manually)
 llama_build(test-chat-analysis.cpp)
 llama_build_and_test(test-log.cpp  LABEL behavior)

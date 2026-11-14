@@ -78,6 +78,11 @@ struct server_context {
     // terminate main loop (will unblock start_loop)
     void terminate();
 
+    // write the prompt cache (plus idle slot states) into the --cache-disk-dir tier,
+    // best-effort under a deadline; called during clean_up before llama_backend_free(),
+    // after start_loop() has returned
+    void flush_prompt_cache_disk();
+
     // get the underlaying llama_context, can return nullptr if sleeping
     // not thread-safe, should only be used from the main thread
     llama_context * get_llama_context() const;

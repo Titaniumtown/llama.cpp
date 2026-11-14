@@ -2,9 +2,13 @@
 
 #include "server-common.h"
 #include "server-task.h"
+#include "server-prompt-cache-disk.h"
 
+#include <condition_variable>
 #include <list>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -122,6 +126,8 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
+    ~server_prompt_cache();
+
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
@@ -152,6 +158,51 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+
+    uint64_t context_fingerprint(const llama_model * model, const std::string & model_path, const llama_context * ctx, ggml_type type_k, ggml_type type_v) const;
+
+    // level 2 on disk (--cache-disk-dir): one file per entry, states live there and
+    // disk_states is the RAM index (tokens + path) that matching runs against
+    struct disk_state {
+        server_tokens tokens;
+        std::string   path;
+        size_t        size        = 0; // bytes on disk
+        int64_t       last_use_us = 0;
+    };
+
+    bool disk_init(const std::string & dir, size_t limit, const std::string & model_path,
+            const llama_model * model, const llama_context * ctx, ggml_type type_k, ggml_type type_v);
+
+    bool disk_enabled() const;
+
+    // write every state the cache still holds (and the writer's backlog) to the disk tier;
+    // best effort under a deadline, meant for shutdown
+    void disk_flush();
+
+    // hand one state to the writer thread; the caller's copy is gone afterwards
+    void disk_spill(server_prompt_cache_state & state);
+
+    // read the best matching entry off the disk into `out` (and remove it: the state then
+    // lives in the slot, not in two places). false when nothing on disk beats the slot
+    bool disk_load(server_prompt_cache_state & out, const server_prompt & prompt_slot, const server_tokens & tokens_new);
+
+    std::string disk_dir;
+    size_t      disk_limit       = 0;
+    size_t      disk_used        = 0;
+    uint64_t    disk_fingerprint = 0;
+
+    std::vector<disk_state> disk_states;
+
+private:
+    void disk_writer();
+    void disk_write(server_prompt_cache_state & state);
+    void disk_prune();
+
+    std::thread             disk_thread;
+    std::mutex              disk_mutex;
+    std::condition_variable disk_cv;
+    std::list<server_prompt_cache_state> disk_queue;
+    bool                    disk_stop = false;
 };
 
 // what the scheduler needs to know about a slot

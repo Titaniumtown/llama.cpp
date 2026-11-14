@@ -83,6 +83,11 @@ json task_params::to_json(bool only_metrics) const {
             {"post_sampling_probs",       post_sampling_probs},
             {"backend_sampling",          sampling.backend_sampling},
             {"lora",                      lora},
+            {"kind",                      kind},
+            {"session",                   session},
+            {"session_name",              session_name},
+            {"agent",                     agent},
+            {"role",                      role},
         };
     }
 
@@ -119,6 +124,11 @@ json task_params::to_json(bool only_metrics) const {
         {"adaptive_target",           sampling.adaptive_target},
         {"adaptive_decay",            sampling.adaptive_decay},
         {"stop",                      antiprompt},
+        {"kind",                      kind},
+        {"session",                   session},
+        {"session_name",              session_name},
+        {"agent",                     agent},
+        {"role",                      role},
         {"max_tokens",                n_predict},
         {"n_predict",                 n_predict}, // TODO: deduplicate?
         {"n_keep",                    n_keep},

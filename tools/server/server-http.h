@@ -7,6 +7,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <unordered_map>
 
@@ -59,6 +61,22 @@ struct server_http_req {
         auto it = params.find(key);
         if (it != params.end()) {
             return it->second;
+        }
+        return def;
+    }
+
+    // low-level header lookup; httplib keeps the client's casing in `headers`,
+    // so the comparison folds case
+    std::string get_header(const std::string & key, const std::string & def = "") const {
+        for (const auto & h : headers) {
+            if (h.first.size() != key.size()) {
+                continue;
+            }
+            const bool match = std::equal(h.first.begin(), h.first.end(), key.begin(),
+                [](unsigned char a, unsigned char b) { return std::tolower(a) == std::tolower(b); });
+            if (match) {
+                return h.second;
+            }
         }
         return def;
     }

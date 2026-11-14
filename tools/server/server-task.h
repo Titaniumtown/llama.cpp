@@ -111,6 +111,15 @@ struct task_params {
     std::string        oaicompat_model;
     std::string        oaicompat_cmpl_id;
 
+    // client-supplied attribution (x-omp-*): the feature behind the request, the root
+    // session with its title, the agent and the model role that issued it. the server
+    // never interprets any of it, it only names the request in the log and on /slots
+    std::string        kind;
+    std::string        session;
+    std::string        session_name;
+    std::string        agent;
+    std::string        role;
+
     // realtime control (SERVER_TASK_TYPE_CONTROL)
     server_control_action control_action = SERVER_CONTROL_ACTION_NONE;
     std::string           control_cmpl_id;

@@ -3191,7 +3191,13 @@ private:
         // reset server kill-switch counter
         n_empty_consecutive = 0;
 
-        SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
+        const task_params & p = slot.task->params;
+        SLT_INF(slot, "processing task, is_child = %d, kind = '%s', session = '%s', session_name = '%s', agent = '%s', role = '%s'\n",
+                slot.task->is_child(), p.kind.empty() ? "-" : p.kind.c_str(),
+                p.session.empty() ? "-" : p.session.c_str(),
+                p.session_name.empty() ? "-" : p.session_name.c_str(),
+                p.agent.empty() ? "-" : p.agent.c_str(),
+                p.role.empty() ? "-" : p.role.c_str());
         return true;
     }
 
@@ -6691,6 +6697,25 @@ void server_context::set_video_decoder(const mtmd_helper_video_decoder * decoder
 // server_routes
 //
 
+// every attribution field arrives in a client header and goes straight into a log
+// line and /slots, so it is reduced to a short token of [a-zA-Z0-9_.-]: a control
+// byte or a megabyte of header would otherwise reach the log verbatim
+static std::string sanitize_attribution(const std::string & raw) {
+    std::string out;
+    out.reserve(32);
+    for (const char c : raw) {
+        if (out.size() >= 32) {
+            break;
+        }
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                        c == '_' || c == '-' || c == '.';
+        if (ok) {
+            out.push_back(c);
+        }
+    }
+    return out;
+}
+
 std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const server_http_req & req,
             server_task_type type,
@@ -6765,6 +6790,15 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
             task.params.oaicompat_model   = meta->model_name;
+
+            // the client names the feature behind the request (a title, a compaction, a live
+            // turn), the root session and agent that issued it; child tasks inherit the params
+            // through add_child(), so every task on the slot carries the same attribution
+            task.params.kind         = sanitize_attribution(req.get_header("x-omp-kind"));
+            task.params.session      = sanitize_attribution(req.get_header("x-omp-session"));
+            task.params.session_name = sanitize_attribution(req.get_header("x-omp-session-name"));
+            task.params.agent        = sanitize_attribution(req.get_header("x-omp-agent"));
+            task.params.role         = sanitize_attribution(req.get_header("x-omp-role"));
 
             // prepare child tasks
             if (task.params.n_cmpl > 1) {

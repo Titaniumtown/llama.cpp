@@ -419,13 +419,16 @@ static __dpct_inline__ void producer_q8_emit(const T * dst, char * q8, const int
     }
 }
 
-template<bool MIRROR, bool Q8, typename T, typename F>
+template<bool MIRROR, bool Q8, bool ELIDE, typename T, typename F>
 static void unary_gated_op_flat_kernel(const T * x, const T * g, T * dst, sycl::half * mir,
                                        char * q8, const int q8_kx,
                                        const uint64_t k, const sycl::nd_item<1> & item_ct1, F func) {
+    static_assert(!ELIDE || MIRROR, "an elided f32 store needs the f16 mirror to exist");
     SYCL_GLOBAL_ID_LOOP(k, item_ct1) {
         const T v = func(x[i]) * g[i];
-        dst[i]    = v;
+        if constexpr (!ELIDE) {
+            dst[i] = v;
+        }
         if constexpr (MIRROR) {
             mir[i] = static_cast<sycl::half>(v);
         }
@@ -455,9 +458,10 @@ static void unary_gated_op_flat_kernel(const T * x, const T * g, T * dst, sycl::
 // four concurrent streams), so the vector form sits on it rather than near it.
 //
 // Every element's arithmetic is untouched, so this is bit-identical by construction.
-template <int W, bool MIRROR, typename T, typename F>
+template <int W, bool MIRROR, bool ELIDE, typename T, typename F>
 static void unary_gated_op_vec_kernel(const T * x, const T * g, T * dst, sycl::half * mir,
                                       const uint64_t nvec, const sycl::nd_item<1> & item_ct1, F func) {
+    static_assert(!ELIDE || MIRROR, "an elided f32 store needs the f16 mirror to exist");
     using vecT = sycl::vec<T, W>;
     SYCL_GLOBAL_ID_LOOP(nvec, item_ct1) {
         const vecT xv = *reinterpret_cast<const vecT *>(x + i * W);
@@ -467,7 +471,9 @@ static void unary_gated_op_vec_kernel(const T * x, const T * g, T * dst, sycl::h
         for (int c = 0; c < W; c++) {
             ov[c] = func(xv[c]) * gv[c];
         }
-        *reinterpret_cast<vecT *>(dst + i * W) = ov;
+        if constexpr (!ELIDE) {
+            *reinterpret_cast<vecT *>(dst + i * W) = ov;
+        }
         if constexpr (MIRROR) {
             sycl::vec<sycl::half, W> hv;
 #pragma unroll
@@ -509,7 +515,7 @@ static bool ew_vec_ok(int W, const T * x, const T * g, const T * dst,
            (mir == nullptr || (uintptr_t) mir % (sizeof(sycl::half) * (size_t) W) == 0);
 }
 
-template<bool MIRROR, bool Q8, typename T, typename F>
+template<bool MIRROR, bool Q8, bool ELIDE, typename T, typename F>
 static void unary_gated_op_generic_kernel(
         const T * x,
         const T * g,
@@ -523,6 +529,7 @@ static void unary_gated_op_generic_kernel(
         const uint64_t o1,
         const sycl::nd_item<1> & item_ct1,
         F func) {
+    static_assert(!ELIDE || MIRROR, "an elided f32 store needs the f16 mirror to exist");
 
     // rows of n columns at strides o0 and o1: two halves of one fused tensor, or two tensors
     SYCL_GLOBAL_ID_LOOP(k, item_ct1) {
@@ -530,7 +537,9 @@ static void unary_gated_op_generic_kernel(
         const int64_t j0 = rc.x() * o0 + rc.y();
         const int64_t j1 = o0 == o1 ? j0 : rc.x() * o1 + rc.y();
         const T v = func(x[j0]) * g[j1];
-        dst[i]    = v;
+        if constexpr (!ELIDE) {
+            dst[i] = v;
+        }
         if constexpr (MIRROR) {
             mir[i] = static_cast<sycl::half>(v);
         }
@@ -855,20 +864,27 @@ static inline void ggml_sycl_op_unary_gated(
             sycl::half * mir    = nullptr;
             char *       q8_out = nullptr;
             int          q8_kx  = 0;
+            bool         elide  = false;
             if constexpr (std::is_same_v<dst_t, float>) {
                 mir = ggml_sycl_f16_mirror_for_next_matmul(ctx, dst, (size_t) k);
                 // Mutually exclusive by construction: the f16 mirror fires only for an f16 GEMM
                 // consumer (prefill), the q8_1 emission only for a mat-vec consumer (decode).
                 if (mir == nullptr) {
                     q8_out = ggml_sycl_q8_emit_for_next_matvec(ctx, dst, &q8_kx);
+                } else {
+                    // With the mirror taken and the per-graph census proving that GEMM is
+                    // the tensor's only reader, the f32 store is dead: skip it. The mirror
+                    // consumer aborts if it ever has to fall back to the f32.
+                    elide = ggml_sycl_elide_f32_arm(ctx, dst, (size_t) k * sizeof(float));
                 }
             }
 
             // o0 == n and o1 == n make the index math the identity, so index flat
             // note: not ggml_is_contiguous - a fused [gate|up] src0 is contiguous with o0 == 2n
-            auto launch = [&](auto mirror_tag, auto q8_tag) {
-                constexpr bool MIR = decltype(mirror_tag)::value;
-                constexpr bool Q8  = decltype(q8_tag)::value;
+            auto launch = [&](auto mirror_tag, auto q8_tag, auto elide_tag) {
+                constexpr bool MIR   = decltype(mirror_tag)::value;
+                constexpr bool Q8    = decltype(q8_tag)::value;
+                constexpr bool ELIDE = decltype(elide_tag)::value;
                 if (o0 == n && o1 == n) {
                     const int W = ggml_sycl_ew_vec_width();
                     if (ew_vec_ok(W, x_ptr, g_ptr, dst_ptr, mir, k, Q8)) {
@@ -879,32 +895,33 @@ static inline void ggml_sycl_op_unary_gated(
                         if (W == 4) {
                             main_stream->parallel_for(vr,
                                 [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                    unary_gated_op_vec_kernel<4, MIR>(x_ptr, g_ptr, dst_ptr, mir, nvec, item_ct1, func);
+                                    unary_gated_op_vec_kernel<4, MIR, ELIDE>(x_ptr, g_ptr, dst_ptr, mir, nvec, item_ct1, func);
                                 });
                         } else {
                             main_stream->parallel_for(vr,
                                 [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                    unary_gated_op_vec_kernel<2, MIR>(x_ptr, g_ptr, dst_ptr, mir, nvec, item_ct1, func);
+                                    unary_gated_op_vec_kernel<2, MIR, ELIDE>(x_ptr, g_ptr, dst_ptr, mir, nvec, item_ct1, func);
                                 });
                         }
                         return;
                     }
                     main_stream->parallel_for(launch_range,
                         [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                            unary_gated_op_flat_kernel<MIR, Q8>(x_ptr, g_ptr, dst_ptr, mir, q8_out, q8_kx, k, item_ct1, func);
+                            unary_gated_op_flat_kernel<MIR, Q8, ELIDE>(x_ptr, g_ptr, dst_ptr, mir, q8_out, q8_kx, k, item_ct1, func);
                         });
                 } else {
                     // launch-invariant divisor, and only this path needs it
                     const sycl::uint3 n_fd = init_fastdiv_values((uint32_t) n);
                     main_stream->parallel_for(launch_range,
                         [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                            unary_gated_op_generic_kernel<MIR, Q8>(x_ptr, g_ptr, dst_ptr, mir, q8_out, q8_kx, k, n_fd, o0, o1, item_ct1, func);
+                            unary_gated_op_generic_kernel<MIR, Q8, ELIDE>(x_ptr, g_ptr, dst_ptr, mir, q8_out, q8_kx, k, n_fd, o0, o1, item_ct1, func);
                         });
                 }
             };
-            if (mir != nullptr)         { launch(std::true_type{},  std::false_type{}); }
-            else if (q8_out != nullptr) { launch(std::false_type{}, std::true_type{}); }
-            else                        { launch(std::false_type{}, std::false_type{}); }
+            if (mir != nullptr && elide) { launch(std::true_type{},  std::false_type{}, std::true_type{});  }
+            else if (mir != nullptr)     { launch(std::true_type{},  std::false_type{}, std::false_type{}); }
+            else if (q8_out != nullptr)  { launch(std::false_type{}, std::true_type{},  std::false_type{}); }
+            else                         { launch(std::false_type{}, std::false_type{}, std::false_type{}); }
         });
 }
 

@@ -19,8 +19,7 @@
 #include <limits>
 #include <optional>
 #include <string>
-#include <type_traits>
-#include <unordered_map>
+#include <unordered_set>
 
 #include "base.hpp"
 #include "dpct/helper.hpp"
@@ -561,6 +560,31 @@ struct ggml_backend_sycl_context {
         std::unique_ptr<ggml_sycl_pool_alloc<sycl::half>> buf;
     } src1_f16;
 
+    // Dead f32 store elision. A producer that has just written the f16 mirror of an f32
+    // activation whose ONLY reader in this graph is the adjacent f16 GEMM skips the f32
+    // store itself: at pp2048 the GLU's is 142.6 MB of writes per call that nothing reads.
+    // The bytes are then never written, and ggml-alloc hands that buffer to a later
+    // tensor, so a consumer that missed the mirror and fell back to converting the f32
+    // would read garbage silently -- the failure mode this campaign has already met once
+    // through a recycled buffer. This registry turns every such miss into an abort: the
+    // producer records the range; the consumer must hit the mirror and clear it; the
+    // graph loop aborts if the range is still registered one node past its consumer.
+    struct elide_f32_reg {
+        const ggml_cgraph * graph = nullptr;
+        const void *        key   = nullptr;  // dst->data of the elided tensor
+        size_t              bytes = 0;
+        int                 node  = -1;       // graph index of the producer
+    } elide_f32;
+    // per-graph census: producer tensors referenced by exactly one node, that node being
+    // the next one and a MUL_MAT taking them as src1, and not flagged as graph outputs
+    std::unordered_set<const ggml_tensor *> elide_f32_ok;
+
+    // The graph the two per-graph censuses last ran on. Both are pure functions
+    // of the node list, and llama_context::process_ubatch reuses the SAME ggml_cgraph
+    // object when it can, so a repeat of this pointer means the answer is already in
+    // place.
+    const ggml_cgraph * census_graph = nullptr;
+
     // The same redundancy on the DECODE side, which the f16 cache above structurally cannot
     // reach: the mat-VEC path quantizes src1 to q8_1 rather than converting it to f16, once
     // per mat-mul. A transformer block feeds ONE normed activation to every projection that
@@ -630,6 +654,15 @@ struct ggml_backend_sycl_context {
         src1_f16.graph = nullptr;
         src1_f16.key   = nullptr;
         src1_f16.node  = -1;
+        // The census is memoised on this stamp, and this is the only place that can
+        // invalidate it: the two maps cleared below are what the stamp stands in
+        // for, so a stamp that survives here suppresses the refill that rebuilds
+        // them. Both consumers run after this and before it is reassigned --
+        // the KV-reorder scan at ggml-sycl.cpp:3374 and the F32-elision census at
+        // ggml-sycl.cpp:6028.
+        census_graph = nullptr;
+        elide_f32 = {};
+        elide_f32_ok.clear();
     }
 
     void src1_q8_reset() {
@@ -1192,6 +1225,12 @@ static constexpr int ggml_sycl_get_max_cpy_bytes() {
 sycl::half * ggml_sycl_f16_mirror_for_next_matmul(ggml_backend_sycl_context & ctx,
                                                   const ggml_tensor * dst, size_t ne);
 
+// Companion to the mirror: true iff the f32 store of `dst` may be skipped because the
+// mirror just taken is its only reader (the per-graph census says so). Registers the
+// range so that any f32 read of it before the consumer clears it aborts. Call only after
+// ggml_sycl_f16_mirror_for_next_matmul returned non-null for the same dst.
+bool ggml_sycl_elide_f32_arm(ggml_backend_sycl_context & ctx, const ggml_tensor * dst, size_t bytes);
+
 // Decode-side dual of the f16 mirror: if the node after `dst` is a mat-vec that will quantize
 // `dst` to q8_1 as its src1, hand back the SoA q8_1 buffer for the producing kernel to fill and
 // register it in the src1 q8_1 cache (the rendezvous -- no consumer detection).
@@ -1217,7 +1256,7 @@ bool ggml_sycl_mul_emit_q8_fast(ggml_backend_sycl_context & ctx, ggml_tensor * d
 // by the cache tensor's base allocation and purged on buffer free.
 // Off switch: GGML_SYCL_KV_REORDER=0.
 bool ggml_sycl_kv_reorder_enabled();
-void ggml_sycl_kv_reorder_scan_graph(const ggml_cgraph * cgraph);
+void ggml_sycl_kv_reorder_scan_graph(ggml_backend_sycl_context & ctx, const ggml_cgraph * cgraph);
 void ggml_sycl_kv_reorder_try_register(const ggml_tensor * t);
 void ggml_sycl_kv_reorder_purge_range(const void * base, size_t bytes);
 // segment length in elements when `t`'s base allocation holds reordered rows, else 0

@@ -115,6 +115,9 @@ inline bool ggml_sycl_xmx_gather_type_enabled(ggml_type src0_type) {
 bool ggml_sycl_fused_dequant_gemm(ggml_type src0_type, bool src0_reordered, const void * src0, const void * src1, ggml_type src1_type,
                                   int32_t src1_prec, float * dst, int64_t M, int64_t N, int64_t K, int64_t ldd,
                                   ggml_sycl_pool & pool, dpct::queue_ptr stream);
+// The type, precision and shape gates of ggml_sycl_fused_dequant_gemm, without the layout and device ones:
+// false means that call declines.
+bool ggml_sycl_fused_dequant_gemm_may_take(ggml_type src0_type, int64_t M, int64_t N, int64_t K, int64_t ldd);
 
 // One launch for every expert of a MUL_MAT_ID: rows of src1/dst are grouped by expert, expert e
 // owns rows [expert_row_offsets[e], expert_row_offsets[e+1]) and reads its weights at

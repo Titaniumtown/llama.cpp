@@ -1172,6 +1172,13 @@ static bool fg_fused_run(ggml_type src0_type, bool src0_reordered, const void * 
     });
 }
 
+bool ggml_sycl_fused_dequant_gemm_may_take(ggml_type src0_type, int64_t M, int64_t N, int64_t K, int64_t ldd) {
+    bool plain_ok = false;
+    fg_visit_type(src0_type, false, [&](auto tag) { plain_ok = fg_plain_ok<typename decltype(tag)::type>(); });
+    return plain_ok && g_ggml_sycl_dynamic_precision != GGML_SYCL_DYNAMIC_PRECISION_F32 &&
+           ggml_sycl_xmx_gather_type_enabled(src0_type) && ggml_sycl_fused_dequant_gemm_shape_ok(src0_type, M, N, K, ldd);
+}
+
 bool ggml_sycl_fused_dequant_gemm(ggml_type src0_type, bool src0_reordered, const void * src0, const void * src1, ggml_type src1_type,
                                   int32_t src1_prec, float * dst, int64_t M, int64_t N, int64_t K, int64_t ldd,
                                   ggml_sycl_pool & pool, dpct::queue_ptr stream) {
@@ -1181,16 +1188,11 @@ bool ggml_sycl_fused_dequant_gemm(ggml_type src0_type, bool src0_reordered, cons
     // SoA layout. Types without an SoA stage (fg_soa<T>::supported == false)
     // decline via fg_visit_layout and the caller falls through to the
     // reorder-aware conversion route.
-    bool plain_ok = false;
-    fg_visit_type(src0_type, src0_reordered, [&](auto tag) { plain_ok = fg_plain_ok<typename decltype(tag)::type>(); });
-    if (g_ggml_sycl_dynamic_precision == GGML_SYCL_DYNAMIC_PRECISION_F32 ||
-        !ggml_sycl_xmx_gather_type_enabled(src0_type) || !plain_ok) {
+    if (!ggml_sycl_fused_dequant_gemm_may_take(src0_type, M, N, K, ldd) ||
+        !fg_visit_type(src0_type, src0_reordered, [](auto) {})) {
         return false;
     }
     if (src1_type != GGML_TYPE_F32 && src1_type != GGML_TYPE_F16 && src1_type != GGML_TYPE_BF16) {
-        return false;
-    }
-    if (!ggml_sycl_fused_dequant_gemm_shape_ok(src0_type, M, N, K, ldd)) {
         return false;
     }
     const int combo = fg_pick_combo(stream, src1_type, src1_prec);

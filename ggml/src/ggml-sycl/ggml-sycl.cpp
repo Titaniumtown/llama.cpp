@@ -205,6 +205,41 @@ static bool ggml_sycl_dnnl_detect_optimized_gemm(int device) {
 }
 #endif
 
+// Tensors whose f32 store was elided in the graph being computed. Retiring the context's
+// registry entry at the consumer proves the GEMM took the f16 mirror; it does not make the
+// f32 bytes readable. The host can still ask for them afterwards -- ggml_backend_sched's
+// eval callback (llama-imatrix collects every MUL_MAT's src1 that way), llama-eval-callback,
+// a cross-backend split copy -- and those entry points carry a buffer, not a backend
+// context, so the record is file-static. Reset when the next graph starts, which is after
+// the sched has issued every read of the previous one. Identity match on the tensor (or its
+// view base), not on the address: ggml-alloc recycles the range for later tensors.
+static std::vector<const ggml_tensor *> g_elided_f32_tensors;
+static std::mutex                       g_elided_f32_mutex;
+
+static void ggml_sycl_elided_f32_reset() {
+    std::lock_guard<std::mutex> lock(g_elided_f32_mutex);
+    g_elided_f32_tensors.clear();
+}
+
+static void ggml_sycl_elided_f32_record(const ggml_tensor * t) {
+    std::lock_guard<std::mutex> lock(g_elided_f32_mutex);
+    g_elided_f32_tensors.push_back(t);
+}
+
+static void ggml_sycl_elided_f32_host_read_check(const ggml_tensor * t, const char * who) {
+    std::lock_guard<std::mutex> lock(g_elided_f32_mutex);
+    if (g_elided_f32_tensors.empty()) {
+        return;
+    }
+    const ggml_tensor * base = t->view_src != nullptr ? t->view_src : t;
+    for (const ggml_tensor * e : g_elided_f32_tensors) {
+        if (e == t || e == base) {
+            GGML_ABORT("ggml-sycl: %s reads %s, whose f32 store was elided this graph (its only "
+                       "reader took the f16 mirror); set GGML_SYCL_ELIDE_F32=0", who, t->name);
+        }
+    }
+}
+
 static ggml_sycl_device_info ggml_sycl_init() {
     GGML_SYCL_DEBUG("[SYCL] call ggml_sycl_init\n");
     ggml_sycl_device_info info = {};
@@ -1007,6 +1042,7 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
+    ggml_sycl_elided_f32_host_read_check(tensor, __func__);
 
     ggml_sycl_set_device(ctx->device);
     auto stream = dpct::dev_mgr::instance().get_device(ctx->device).default_queue();
@@ -1094,6 +1130,7 @@ ggml_backend_sycl_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": dst", dst).c_str());
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(" src", src).c_str());
     GGML_SYCL_DEBUG(" is_cpy_supported=%d\n", is_cpy_supported);
+    ggml_sycl_elided_f32_host_read_check(src, __func__);
     if (is_cpy_supported) {
         ggml_backend_sycl_buffer_context * src_ctx = (ggml_backend_sycl_buffer_context *)src->buffer->context;
         ggml_backend_sycl_buffer_context * dst_ctx = (ggml_backend_sycl_buffer_context *)dst->buffer->context;
@@ -3256,6 +3293,37 @@ static inline bool ggml_sycl_src1_cache_enabled() {
     return e != 0;
 }
 
+// 0 keeps every f32 store; the f16 mirror alone is unchanged. Same-binary A/B switch.
+static inline bool ggml_sycl_elide_f32_enabled() {
+    static const int e = ggml_sycl_get_env("GGML_SYCL_ELIDE_F32", 1);
+    return e != 0;
+}
+
+// The consumer side of the elision registry. A hit on the mirror retires the entry; a
+// miss that would read the f32 range aborts, because those bytes were never written.
+static inline void ggml_sycl_elide_f32_consumed(ggml_backend_sycl_context & ctx, const void * key) {
+    if (ctx.elide_f32.key == key && ctx.elide_f32.graph == ctx.cur_graph) {
+        ctx.elide_f32 = {};
+    }
+}
+
+static inline void ggml_sycl_elide_f32_check_read(const ggml_backend_sycl_context & ctx, const void * p,
+                                                  size_t bytes, const ggml_tensor * t) {
+    const auto & e = ctx.elide_f32;
+    if (e.key == nullptr || e.graph != ctx.cur_graph) {
+        return;
+    }
+    const char * a0 = (const char *) p;
+    const char * a1 = a0 + bytes;
+    const char * b0 = (const char *) e.key;
+    const char * b1 = b0 + e.bytes;
+    if (a0 < b1 && b0 < a1) {
+        GGML_ABORT("ggml-sycl: f32 read of %s at node %d overlaps a store elided at node %d "
+                   "(its f16 mirror lookup missed); set GGML_SYCL_ELIDE_F32=0",
+                   t != nullptr ? t->name : "?", ctx.cur_node, e.node);
+    }
+}
+
 static inline bool src1_f16_overlaps(const ggml_backend_sycl_context & ctx, const void * p, size_t bytes) {
     const char * a0 = (const char *) p;
     const char * a1 = a0 + bytes;
@@ -3416,8 +3484,10 @@ void ggml_sycl_kv_reorder_purge_range(const void * base, size_t bytes) {
 // write requirement is what keeps them -- and any other read-only q8_0 view -- on
 // the AoS path. llama graphs append the new token's K/V in the same graph that
 // attends over it, so the first write is reordered from the very first step.
-void ggml_sycl_kv_reorder_scan_graph(const ggml_cgraph * cgraph) {
+void ggml_sycl_kv_reorder_scan_graph(ggml_backend_sycl_context & ctx, const ggml_cgraph * cgraph) {
     if (!ggml_sycl_kv_reorder_enabled()) { return; }
+    // Same node list as last time means the registry below is already correct.
+    if (ctx.census_graph == cgraph) { return; }
     bool has_fa = false;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (cgraph->nodes[i]->op == GGML_OP_FLASH_ATTN_EXT) { has_fa = true; break; }
@@ -3545,12 +3615,15 @@ inline void ggml_sycl_op_mul_mat_sycl(
 #else
     bool use_fp16 = false;
 #endif
+    // every path but the f16 route's mirror hit reads src1's f32
+    const size_t src1_f32_bytes = src1->type == GGML_TYPE_F32 ? src1_ncols * ne10 * sizeof(float) : 0;
 
 #if GGML_SYCL_DNNL && defined(GGML_SYCL_HAS_BF16)
     // Fast path for bf16 src0
     if (src0->type == GGML_TYPE_BF16 && g_ggml_sycl_enable_dnn &&
         ggml_sycl_dnnl_has_optimized_gemm(ggml_sycl_get_device()) && ggml_is_contiguous(src0) &&
         row_diff == src0->ne[1]) {
+        ggml_sycl_elide_f32_check_read(ctx, src1_ddf_i, src1_f32_bytes, src1);
         using bf16_t = sycl::ext::oneapi::bfloat16;
         ggml_sycl_pool_alloc<bf16_t> src1_as_bf16(ctx.pool(), src1_ncols*ne10);
         if (src1->type != GGML_TYPE_BF16) {
@@ -3581,9 +3654,13 @@ inline void ggml_sycl_op_mul_mat_sycl(
         src0_reordered = src0_extra->optimized_feature.reorder;
     }
     if (ggml_is_quantized(src0->type) && ggml_is_contiguous(src0) && row_diff == src0->ne[1] &&
-        ggml_sycl_fused_dequant_gemm(src0->type, src0_reordered, src0_dd_i, src1_ddf_i, src1->type, ggml_sycl_src1_prec(dst), dst_dd_i,
-                                     row_diff, src1_ncols, ne10, ldc, ctx.pool(), stream)) {
-        return;
+        ggml_sycl_fused_dequant_gemm_may_take(src0->type, row_diff, src1_ncols, ne10, ldc)) {
+        ggml_sycl_elide_f32_check_read(ctx, src1_ddf_i, src1_f32_bytes, src1);
+        if (ggml_sycl_fused_dequant_gemm(src0->type, src0_reordered, src0_dd_i, src1_ddf_i, src1->type,
+                                         ggml_sycl_src1_prec(dst), dst_dd_i, row_diff, src1_ncols, ne10, ldc,
+                                         ctx.pool(), stream)) {
+            return;
+        }
     }
 
     // the f16 route converts src1 to f16 [TAG_GGML_PREC]
@@ -3631,7 +3708,10 @@ inline void ggml_sycl_op_mul_mat_sycl(
                                        : nullptr;
             if (hit != nullptr) {
                 src1_ptr = hit;
+                ggml_sycl_elide_f32_consumed(ctx, src1_ddf_i);
             } else {
+                // never convert from a range whose f32 store was skipped
+                ggml_sycl_elide_f32_check_read(ctx, src1_ddf_i, ne * sizeof(float), src1);
                 scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_sycl", dst, /*num_src=*/2,
                                                      " : converting src1 to fp16");
                 const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src1->type, dst);
@@ -3734,6 +3814,7 @@ inline void ggml_sycl_op_mul_mat_sycl(
                 dpct::library_data_t::real_float)));
         }
     } else {
+        ggml_sycl_elide_f32_check_read(ctx, src1_ddf_i, src1_f32_bytes, src1);
         ggml_sycl_pool_alloc<float> src0_ddq_as_f32(ctx.pool());
         ggml_sycl_pool_alloc<float> src1_ddq_as_f32(ctx.pool());
         if (src0->type != GGML_TYPE_F32) {
@@ -4198,6 +4279,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                 ggml_sycl_prof_mark_gap(src0);
                 scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
                                                      /*num_src=*/2, " : converting src1 to Q8_1");
+                ggml_sycl_elide_f32_check_read(ctx, dev[i].src1_ddf, (size_t) nrows1 * ne10 * sizeof(float), src1);
                 try {
                     quantize_row_q8_1_sycl<quantize_f>(dev[i].src1_ddf, dev[i].src1_ddq, ne10, nrows1, src1_padded_col_size, stream);
                 } catch (sycl::exception const &exc) {
@@ -4321,6 +4403,12 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                 }
                 if (src1->type == GGML_TYPE_F16) {
                     src1_padded_col_size = (i0 * ne11 + src1_col_0) * ne10;
+                }
+                // the f32 mat-vecs read src1 as is; ggml_sycl_op_mul_mat_sycl checks its own paths
+                if constexpr (!quantize_enabled) {
+                    if (op != ggml_sycl_op_mul_mat_sycl && src1->type == GGML_TYPE_F32) {
+                        ggml_sycl_elide_f32_check_read(ctx, src1_ddf_i, src1_ncols * ne10 * sizeof(float), src1);
+                    }
                 }
                 // do the computation
                 SYCL_CHECK(CHECK_TRY_ERROR(op(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i,
@@ -5697,6 +5785,34 @@ static bool can_use_mul_mat_q(const ggml_tensor * src0, const ggml_tensor * src1
     return src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 }
 
+// True when every dispatch of the MUL_MAT mm converts src1 to f16 in ggml_sycl_op_mul_mat_sycl, the only
+// reader of the f16 mirror, and nothing reads src1's f32. Independent of the weight's reorder state: it
+// declines every width a mat-vec, XMX or fused dequant path may take.
+static bool ggml_sycl_mul_mat_reads_f16_mirror(const ggml_tensor * mm) {
+#ifdef GGML_SYCL_F16
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    if (mm->op != GGML_OP_MUL_MAT || ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
+        (src0->type != GGML_TYPE_F16 && !ggml_is_quantized(src0->type)) || src1->type != GGML_TYPE_F32 ||
+        !ggml_sycl_src1_f16_ok(mm) || ggml_prec_get_acc(mm) != GGML_PREC_UNDEFINED || !ggml_is_contiguous(src0) ||
+        ggml_backend_buffer_is_sycl_split(src0->buffer) || src1->ne[1] <= 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+        return false;
+    }
+    if (!ggml_is_quantized(src0->type)) {
+        return true;
+    }
+    int64_t widest = std::max<int64_t>(GGML_SYCL_MMVQ_TYPE_MAX_COLS, g_ggml_sycl_mmvq_max_cols);
+    if (ggml_sycl_xmx_supports_type(src0->type)) {
+        widest = std::max<int64_t>(widest, g_ggml_sycl_xmx_max_cols);
+    }
+    return src1->ne[1] > widest &&
+           !ggml_sycl_fused_dequant_gemm_may_take(src0->type, src0->ne[1], src1->ne[1], src0->ne[0], src0->ne[1]);
+#else
+    GGML_UNUSED(mm);
+    return false;
+#endif
+}
+
 // 0 disables the producer-side f16 mirror, restoring the standalone conversion pass.
 static inline bool ggml_sycl_f16_mirror_enabled() {
     static const int e = ggml_sycl_get_env("GGML_SYCL_F16_MIRROR", 1);
@@ -5738,19 +5854,79 @@ sycl::half * ggml_sycl_f16_mirror_for_next_matmul(ggml_backend_sycl_context & ct
     // Only the f16 GEMM path converts src1. The mat-vec paths quantize to q8_1 or read f32
     // directly, so a mirror written for them is pure extra traffic -- which is exactly the
     // decode case, where ne[1] is 1..a few and this must stay silent.
-    if (nxt->src[1]->ne[1] <= 1) {
-        return nullptr;
-    }
-    if (can_use_dequantize_mul_mat_vec(nxt->src[0], nxt->src[1], nxt)) {
-        return nullptr;
-    }
-    if (can_use_mul_mat_vec_q(ctx.device, nxt->src[0], nxt->src[1], nxt)) {
+    if (!ggml_sycl_mul_mat_reads_f16_mirror(nxt)) {
         return nullptr;
     }
 
     // The lookup re-validates: same graph, bounded node distance, and no node between here
     // and the consumer writing over the f32 source. Storing cannot make a stale hit possible.
     return src1_f16_store(ctx, dst->data, (const void *) ctx.stream(), ne, prod);
+}
+
+// Once per graph: which producers may skip their f32 store. Only the GLU is a candidate
+// today (its output is read by exactly one f16 GEMM, ffn_down, in every block of the
+// production model). The mirror helper already proves the ADJACENT node is that GEMM;
+// this census proves it is the ONLY reader anywhere in the graph and that the tensor is
+// not a graph output -- the two conditions that make the f32 bytes unobservable.
+static void ggml_sycl_elide_f32_census(ggml_backend_sycl_context & ctx, const ggml_cgraph * g) {
+    // Same node list as last time, so elide_f32_ok already holds
+    // the answer for this exact graph. Clearing and rebuilding it costs 56.74 us per
+    // graph and produces identical contents.
+    if (ctx.census_graph == g) { return; }
+    ctx.elide_f32_ok.clear();
+    if (!ggml_sycl_elide_f32_enabled() || !ggml_sycl_f16_mirror_enabled() ||
+        !ggml_sycl_src1_cache_enabled()) {
+        return;
+    }
+    std::unordered_map<const ggml_tensor *, int> refs;
+    for (int i = 0; i < g->n_nodes; ++i) {
+        const ggml_tensor * n = g->nodes[i];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = n->src[s];
+            if (src != nullptr && src->op == GGML_OP_GLU) {
+                refs[src]++;
+            }
+        }
+    }
+    for (int i = 0; i + 1 < g->n_nodes; ++i) {
+        const ggml_tensor * p = g->nodes[i];
+        if (p->op != GGML_OP_GLU || p->type != GGML_TYPE_F32 || (p->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            continue;
+        }
+        const auto it = refs.find(p);
+        if (it == refs.end() || it->second != 1) {
+            continue;
+        }
+        const ggml_tensor * c = g->nodes[i + 1];
+        if (c->op != GGML_OP_MUL_MAT || c->src[1] != p || !ggml_sycl_mul_mat_reads_f16_mirror(g->nodes[i + 1])) {
+            continue;
+        }
+        ctx.elide_f32_ok.insert(p);
+    }
+}
+
+bool ggml_sycl_elide_f32_arm(ggml_backend_sycl_context & ctx, const ggml_tensor * dst, size_t bytes) {
+    if (ctx.elide_f32_ok.find(dst) == ctx.elide_f32_ok.end()) {
+        return false;
+    }
+    if (ctx.elide_f32.key != nullptr) {
+        // an earlier elision is still outstanding; never carry two, decline this one
+        return false;
+    }
+    const ggml_cgraph * g = ctx.cur_graph;
+    int prod = -1;
+    for (int j = ctx.cur_node; j < g->n_nodes && j - ctx.cur_node <= 8; ++j) {
+        if (g->nodes[j] == dst) { prod = j; break; }
+    }
+    if (prod < 0) {
+        return false;
+    }
+    ctx.elide_f32.graph = g;
+    ctx.elide_f32.key   = dst->data;
+    ctx.elide_f32.bytes = bytes;
+    ctx.elide_f32.node  = prod;
+    ggml_sycl_elided_f32_record(dst);
+    return true;
 }
 
 // Decode-side dual of the mirror above. The f16 mirror stays silent for mat-vec consumers
@@ -5895,9 +6071,11 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     // The op check is not redundant: this backend also routes MUL_MAT_ID through here with a
     // stack copy of dst, which carries MUL_MAT_ID's own op_params. ggml_mul_mat_set_hint()
     // asserts GGML_OP_MUL_MAT for the same reason.
-    if (dst->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
-        ggml_sycl_op_fwht(ctx, src1, dst)) {
-        return;
+    if (dst->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        ggml_sycl_elide_f32_check_read(ctx, src1->data, ggml_nbytes(src1), src1);
+        if (ggml_sycl_op_fwht(ctx, src1, dst)) {
+            return;
+        }
     }
 
     const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
@@ -7298,6 +7476,7 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    ggml_sycl_elided_f32_host_read_check(tensor, __func__);
 
     GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
@@ -8966,6 +9145,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // addresses are reused across graphs, so nothing survives the boundary.
     sycl_ctx->src1_f16_reset();
     sycl_ctx->src1_q8_reset();
+    ggml_sycl_elided_f32_reset();
     sycl_ctx->cur_graph = cgraph;
     conv_prefill_fold prefill_fold;
     bool              prefill_fold_live = false;
@@ -8989,13 +9169,16 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // name -- which is what makes the work between begin() and the first node mark
     // attributable at all. Without these two, that whole span arrives in the first
     // HOST/pre-node row of the graph, amortised over one node out of 544.
-    ggml_sycl_kv_reorder_scan_graph(cgraph);
+    ggml_sycl_kv_reorder_scan_graph(*sycl_ctx, cgraph);
     prof.mark_cheap("HOST/kv-reorder-census", 0);
+    ggml_sycl_elide_f32_census(*sycl_ctx, cgraph);
     prof.mark_cheap("HOST/elide-f32-census", 0);
     // The emission ledger describes the graph about to run, not the last one.
     // Tensors are reused across graphs, so a stale entry would be charged to whatever
     // node happened to sit at that address in this graph.
     q8_emit_bytes.clear();
+    // Stamp AFTER both, so the next graph can tell whether they actually ran.
+    sycl_ctx->census_graph = cgraph;
 
     // same, for the causal-conv state's gather and the CONCAT that consumes it
     ggml_tensor * concat_fold_gather = nullptr;
@@ -9013,6 +9196,12 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         sycl_ctx->cur_node = i;
+        // an elided f32 store must be retired by the very next node; anything else means
+        // its consumer did not take the mirror path, and the unwritten bytes are live
+        if (UNLIKELY(sycl_ctx->elide_f32.key != nullptr && i > sycl_ctx->elide_f32.node + 1)) {
+            GGML_ABORT("ggml-sycl: f32 store elided at node %d was not consumed by node %d; "
+                       "set GGML_SYCL_ELIDE_F32=0", sycl_ctx->elide_f32.node, sycl_ctx->elide_f32.node + 1);
+        }
         // the collapsed conv at the CONCAT above already did all three of these
         if (node == collapse_cpy) {
             collapse_cpy = nullptr;
@@ -9529,6 +9718,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     for (const auto & sk : pair_skip_node) {
         GGML_ASSERT(sk == nullptr && "mat-vec pair folded but a node it absorbed was never reached");
     }
+    // the in-loop check above cannot see a consumer that is the graph's last node
+    GGML_ASSERT(sycl_ctx->elide_f32.key == nullptr && "f32 store elided but its consumer never took the mirror");
     prof.flush();
 }
 

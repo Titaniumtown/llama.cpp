@@ -519,6 +519,12 @@ struct ggml_backend_sycl_context {
     const ggml_tensor * mmvq_dsa_out   = nullptr;
     const ggml_tensor * mmvq_dsa_bias  = nullptr;
     const ggml_tensor * mmvq_dsa_scale = nullptr;
+    // Set alongside mmvq_dsa_* when a SECOND, independent mat-vec over the same activation
+    // is folded into this dispatch. mmvq_pair_other is that mat-vec, whose weight is read
+    // here; mmvq_pair_anchor_is_dsa says whether the decay epilogue belongs to the anchor
+    // or to it, since ggml's order between the two is not fixed.
+    const ggml_tensor * mmvq_pair_other = nullptr;
+    bool                mmvq_pair_anchor_is_dsa = false;
 
     // f32->f16 conversion cache for a matmul's src1. Several projections inside one block
     // read the SAME activation tensor -- Qwen3Next builds wq/wk/wv from one `cur` and

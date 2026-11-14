@@ -6,6 +6,9 @@
 #include "quants.hpp"
 #include "vecdotq.hpp"
 
+#include <algorithm>
+#include <cmath>
+
 #ifdef GGML_SYCL_MMVQ_HAS_XMX
 #    include "esimd.hpp"
 #endif // GGML_SYCL_MMVQ_HAS_XMX
@@ -99,6 +102,82 @@ static void mul_mat_vec_q_reorder(const void * __restrict__ vx, const void * __r
 #pragma unroll
         for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
             // x block quant index when casting the quants to int
+            const int iqs = elem + block_traits::vdr_mmvq * (sg.get_local_linear_id() % block_elements_per_subgroup);
+
+            partial_sum += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+        }
+    }
+
+    auto sum = sycl::reduce_over_group(nd_item.get_sub_group(), partial_sum, std::plus<>());
+
+    if (sg.leader()) {
+        dst[row] = sum;
+    }
+}
+
+// Two INDEPENDENT reorder mat-vecs over ONE shared q8_1 activation in one dispatch
+// (decode only, one row per subgroup, ncols_dst==1). Unlike the equal-shape pair
+// kernel below, the two weights may have different row counts: the padded row space
+// is segmented, workgroups below rows1_padded compute tensor 1 rows, the rest
+// compute tensor 2 rows. Both weights MUST share ncols and the reorder (SoA) layout.
+// This exists because the per-op submission cost (~26 us host-side) dwarfs these
+// mat-vecs' GPU time at ncols_dst==1; halving the launches is the entire win.
+template <typename reorder_vec_dot_q_sycl>
+static void mul_mat_vec_q_reorder_grouped2(const void * __restrict__ vx1, float * __restrict__ dst1,
+                                           const int nrows1, const void * __restrict__ vx2,
+                                           float * __restrict__ dst2, const int nrows2,
+                                           const void * __restrict__ vy, const int ncols,
+                                           const int rows1_padded, const sycl::nd_item<3> & nd_item) {
+    using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
+    using block_traits = typename block_type::traits;
+
+    const auto sg           = nd_item.get_sub_group();
+    const int  sg_range     = sg.get_group_linear_range();
+    const int  workgroup_id = nd_item.get_group_linear_id();
+    const int  sg_id        = sg.get_group_linear_id();
+    const int  grow         = workgroup_id * sg_range + sg_id;
+
+    const void * vx;
+    float *      dst;
+    int          nrows;
+    int          row;
+    if (grow < rows1_padded) {
+        vx    = vx1;
+        dst   = dst1;
+        nrows = nrows1;
+        row   = grow;
+    } else {
+        vx    = vx2;
+        dst   = dst2;
+        nrows = nrows2;
+        row   = grow - rows1_padded;
+    }
+    if (row >= nrows) {
+        return;
+    }
+
+    const int     blocks_per_row              = ncols / block_traits::qk;
+    constexpr int blocks_per_subgroup         = ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
+    constexpr int block_elements_per_subgroup = block_traits::qi / block_traits::vdr_mmvq;
+    const int     nblocks                     = nrows * (ncols / block_traits::qk);
+
+    static_assert(blocks_per_subgroup > 0);
+    static_assert(block_elements_per_subgroup > 0);
+
+    float partial_sum = 0.0f;
+#pragma unroll(4)
+    for (int i = sg.get_local_linear_id() / block_elements_per_subgroup; i < blocks_per_row; i += blocks_per_subgroup) {
+        const int ibx = row * blocks_per_row + i;  // x block index
+
+        const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
+        const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+        // Y block index that aligns with ibx
+        const int          iby           = i * block_type::block_to_q8_1_ratio();
+        const int8_t *     q8_1_quant_ptr = (const int8_t *) vy + iby * QK8_1;
+        const sycl::half2 * q8_1_ds_ptr   = (const sycl::half2 *) ((const char *) vy + ncols + iby * sizeof(sycl::half2));
+
+#pragma unroll
+        for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
             const int iqs = elem + block_traits::vdr_mmvq * (sg.get_local_linear_id() % block_elements_per_subgroup);
 
             partial_sum += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
@@ -1631,6 +1710,119 @@ static void mul_mat_vec_q4_K_reorder_wide_glu(const void * __restrict__ vx, cons
     }
 }
 
+// Wide (128-bit load) Q4_K reorder mat-vec serving TWO independent weight matrices over one
+// activation, ncols_dst == 1. The loop is mul_mat_vec_q4_K_reorder_wide_glu's verbatim --
+// identical weight geometry lets the second reuse the first's block offsets, and the q8_1
+// activation is read once for both -- but the sums go to two destinations instead of being
+// combined, one of them carrying the GDN decay epilogue of
+// mul_mat_vec_q4_K_reorder_wide_dsa. DSA_FIRST says which side that is: the anchor of the
+// fusion is whichever mat-vec ggml ordered first, and that is not fixed.
+// Wide (128-bit load) Q4_K reorder mat-vec serving TWO independent weight matrices over one
+// activation, ncols_dst == 1, in a single dispatch.
+//
+// One subgroup owns ONE (weight, row), so the grid is 2*nrows subgroups and each lane does
+// exactly the work it does in the unfused kernel. That is the whole point and it is the
+// opposite of what the SwiGLU pair kernel does: that one must carry both partials per lane
+// because it combines them into one value, and it pays ~2x the per-lane work for it. Two
+// destinations need no combining, so the second weight can be spent on parallelism instead
+// -- which matters precisely here, where nrows is 48 and there is no occupancy to hide a
+// second serial weight stream behind. Measured: the per-lane form cost +3.61 us/call on the
+// absorbing kernel (9.53 -> 13.14) and gave back only +0.14% at the token level.
+//
+// DSA_FIRST says which of the two carries the GDN decay epilogue of
+// mul_mat_vec_q4_K_reorder_wide_dsa; the anchor is whichever mat-vec ggml ordered first,
+// and that is not fixed.
+template <bool DSA_FIRST>
+static void mul_mat_vec_q4_K_reorder_wide_pair_dsa(const void * __restrict__ vx, const void * __restrict__ vx2,
+                                                   const void * __restrict__ vy, float * __restrict__ dst_raw,
+                                                   const float * __restrict__ bias, const float * __restrict__ scale,
+                                                   float * __restrict__ dst_dsa, const int ncols, const int nrows,
+                                                   const sycl::nd_item<3> & nd_item) {
+    using q4_k_block = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q4_K>;
+
+    const auto sg       = nd_item.get_sub_group();
+    const int  sg_range = sg.get_group_linear_range();
+    const int  gid      = nd_item.get_group_linear_id() * sg_range + sg.get_group_linear_id();
+    if (gid >= 2 * nrows) {
+        return;
+    }
+    const int second = gid >= nrows;  // 0 -> vx, 1 -> vx2
+    const int row    = gid - second * nrows;
+
+    const int blocks_per_row  = ncols / QK_K;
+    const int nblocks         = nrows * blocks_per_row;
+    const int lane            = sg.get_local_linear_id();
+    const int blocks_per_wave = WARP_SIZE / 8;
+    const int lb              = lane / 8;
+    const int c               = lane % 8;
+    const int g               = c >> 1;
+    const int uoff            = (c & 1) ? 4 : 0;
+
+    const uint8_t *     base = static_cast<const uint8_t *>(second ? vx2 : vx);
+    const sycl::half2 * vyds = reinterpret_cast<const sycl::half2 *>(static_cast<const char *>(vy) + ncols);
+    const int8_t *      vy8  = static_cast<const int8_t *>(vy);
+
+    float partial = 0.0f;
+
+    for (int blk = lb; blk < blocks_per_row; blk += blocks_per_wave) {
+        const int  ibx     = row * blocks_per_row + blk;
+        const auto ibx_off = q4_k_block::get_block_offset(ibx, nblocks);
+        const auto d_off   = q4_k_block::get_d_offset(nrows, ncols, ibx);
+
+        const int         gq8 = blk * (QK_K / QK8_1) + 2 * g;
+        const sycl::half2 ds0 = vyds[gq8 + 0];
+        const sycl::half2 ds1 = vyds[gq8 + 1];
+        const sycl::int4  u0  = *reinterpret_cast<const sycl::int4 *>(reinterpret_cast<const int *>(vy8 + (gq8 + 0) * QK8_1) + uoff);
+        const sycl::int4  u1  = *reinterpret_cast<const sycl::int4 *>(reinterpret_cast<const int *>(vy8 + (gq8 + 1) * QK8_1) + uoff);
+
+        partial += mul_mat_vec_q4_K_reorder_wide_lane_partial(base + ibx_off.first,
+                                         reinterpret_cast<const uint16_t *>(base + d_off.first),
+                                         reinterpret_cast<const sycl::half2 *>(base + d_off.second), c, u0, u1,
+                                         ds0[0], ds1[0], ds0[1], ds1[1]);
+    }
+
+    const float sum = sycl::reduce_over_group(sg, partial, std::plus<>());
+    if (sg.leader()) {
+        if ((second == 0) == DSA_FIRST) {
+            // identical spelling to mul_mat_vec_q4_K_reorder_wide_dsa, not an approximation
+            const float x  = sum + bias[row];
+            const float ax = sycl::fabs(x);
+            const float m  = sycl::fmax(x, 0.0f);
+            dst_dsa[row]   = (m + sycl::log1p(sycl::exp(-ax))) * scale[row];
+        } else {
+            dst_raw[row] = sum;
+        }
+    }
+}
+
+static void reorder_mul_mat_vec_q4_k_q8_1_pair_dsa_wide_sycl(const void * vx, const void * vx2, const void * vy,
+                                                             float * dst_raw, const float * bias, const float * scale,
+                                                             float * dst_dsa, const int ncols, const int nrows,
+                                                             const bool dsa_first, dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    constexpr size_t     num_subgroups = WARP_SIZE;
+    // 2*nrows subgroups: one per (weight, row)
+    const int            block_num_y   = ceil_div(2 * nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
+    stream->submit([&](sycl::handler & cgh) {
+        if (dsa_first) {
+            cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                             [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                 mul_mat_vec_q4_K_reorder_wide_pair_dsa<true>(vx, vx2, vy, dst_raw, bias, scale,
+                                                                              dst_dsa, ncols, nrows, nd_item);
+                             });
+        } else {
+            cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                             [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                 mul_mat_vec_q4_K_reorder_wide_pair_dsa<false>(vx, vx2, vy, dst_raw, bias, scale,
+                                                                               dst_dsa, ncols, nrows, nd_item);
+                             });
+        }
+    });
+}
+
+
 // Wide (128-bit load) Q4_K reorder mat-vec, ncols_dst == 1, with the GDN decay
 // epilogue folded into the store: out[row] = softplus(sum + bias[row]) * scale[row].
 // softplus is spelled exactly as op_softplus in element_wise.cpp (max(x,0) +
@@ -1736,6 +1928,33 @@ static void reorder_mul_mat_vec_q4_k_q8_1_sycl(const void * vx, const void * vy,
                             [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                                 mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K>>(vx, vy, dst, ncols,
                                                                                             nrows, nd_item);
+                            });
+    });
+}
+
+// One dispatch covering two independent reorder mat-vecs that share an activation.
+// Type-generic: instantiated for the K-quants whose reorder layout the pair fusion
+// accepts (q4_K, q5_K). Row counts may differ; ncols must match.
+template <ggml_type qtype>
+static void reorder_mul_mat_vec_q_grouped2_sycl(const void * vx1, float * dst1, const int nrows1,
+                                                const void * vx2, float * dst2, const int nrows2,
+                                                const void * vy, const int ncols, dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+
+    constexpr size_t num_subgroups = WARP_SIZE;
+    const int        rows_per_wg   = GGML_SYCL_MMV_Y * (int) num_subgroups;
+    const int        b1            = ceil_div(nrows1, rows_per_wg);
+    const int        b2            = ceil_div(nrows2, rows_per_wg);
+    const int        rows1_padded  = b1 * rows_per_wg;
+
+    const sycl::range<3> block_nums(1, 1, b1 + b2);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
+
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                            [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                mul_mat_vec_q_reorder_grouped2<reorder_vec_dot_q_sycl<qtype>>(
+                                    vx1, dst1, nrows1, vx2, dst2, nrows2, vy, ncols, rows1_padded, nd_item);
                             });
     });
 }
@@ -3541,6 +3760,30 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                             src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
                             src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
                         return;
+                    } else if (ctx.mmvq_pair_other != nullptr && ctx.mmvq_dsa_out != nullptr &&
+                               src1_ncols == 1) {
+                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_k_q8_1_pair_dsa_wide_sycl\n");
+                        const ggml_tensor * w2    = ctx.mmvq_pair_other->src[0];
+                        const float *       bias  = (const float *) ctx.mmvq_dsa_bias->data;
+                        const float *       scl   = (const float *) ctx.mmvq_dsa_scale->data;
+                        float *             o_dsa = (float *) ctx.mmvq_dsa_out->data + i * dst->ne[0];
+                        // the raw half lands in whichever of the two is NOT the decay chain
+                        float * o_raw = ctx.mmvq_pair_anchor_is_dsa
+                                            ? (float *) ctx.mmvq_pair_other->data + i * dst->ne[0]
+                                            : dst_dd_i_bs;
+                        reorder_mul_mat_vec_q4_k_q8_1_pair_dsa_wide_sycl(src0_dd_i, (const char *) w2->data,
+                                                                         src1_ddq_i_bs, o_raw, bias, scl, o_dsa, ne00,
+                                                                         row_diff, ctx.mmvq_pair_anchor_is_dsa, stream);
+                    } else if (ctx.mmvq_pair_other != nullptr && src1_ncols == 1) {
+                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q_grouped2_sycl q4_K (plain pair)\n");
+                        // two independent mat-vecs over this activation, one dispatch; the
+                        // paired node never dispatches (skipped in the graph loop). Unequal
+                        // row counts, so this cannot take the equal-shape pair kernel above.
+                        const ggml_tensor * o = ctx.mmvq_pair_other;
+                        reorder_mul_mat_vec_q_grouped2_sycl<GGML_TYPE_Q4_K>(
+                            src0_dd_i, dst_dd_i_bs, row_diff,
+                            o->src[0]->data, (float *) o->data, (int) o->ne[0],
+                            src1_ddq_i_bs, ne00, stream);
                     } else if (ctx.mmvq_dsa_out != nullptr && src1_ncols == 1) {
                         GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_k_q8_1_dsa_wide_sycl\n");
                         // dst is the mat-vec (correct reorder detection); the fused kernel
@@ -3577,6 +3820,15 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                             src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
                             src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
                         return;
+                    } else if (ctx.mmvq_pair_other != nullptr && src1_ncols == 1) {
+                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q_grouped2_sycl q5_K (plain pair)\n");
+                        // two independent mat-vecs over this activation, one dispatch; the
+                        // paired node never dispatches (skipped in the graph loop)
+                        const ggml_tensor * o = ctx.mmvq_pair_other;
+                        reorder_mul_mat_vec_q_grouped2_sycl<GGML_TYPE_Q5_K>(
+                            src0_dd_i, dst_dd_i_bs, row_diff,
+                            o->src[0]->data, (float *) o->data, (int) o->ne[0],
+                            src1_ddq_i_bs, ne00, stream);
                     } else {
                         GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q5_k_q8_1_sycl\n");
                         reorder_mul_mat_vec_q5_k_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);

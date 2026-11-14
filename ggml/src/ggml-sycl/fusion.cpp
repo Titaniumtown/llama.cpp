@@ -2,6 +2,107 @@
 #include "binbcast.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+
+// Two INDEPENDENT mat-vecs over one activation, written to two destinations. Same weight
+// geometry requirement as the GLU pair -- identical shape and row stride in the reorder
+// (SoA) layout, so the second reuses the first's per-block offsets -- but with no combining
+// op, because these two feed unrelated consumers. The delta-net beta and alpha projections
+// are exactly this: two build_lora_mm calls on the same `cur`, q4_K ne=[n_embd, n_v_heads].
+bool ggml_sycl_should_fuse_mul_mat_pair(const ggml_tensor * a, const ggml_tensor * b) {
+    if (a->op != GGML_OP_MUL_MAT || b->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    const ggml_tensor * wa = a->src[0];
+    const ggml_tensor * wb = b->src[0];
+    if (wa == nullptr || wb == nullptr || wa == wb) {
+        return false;
+    }
+    if (wa->type != GGML_TYPE_Q4_K || wb->type != GGML_TYPE_Q4_K) {
+        return false;
+    }
+    if (!ggml_are_same_shape(wa, wb) || wa->nb[1] != wb->nb[1]) {
+        return false;
+    }
+    if (a->src[1] == nullptr || a->src[1] != b->src[1] || a->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (a->src[1]->ne[1] != 1) {
+        return false;
+    }
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || !ggml_are_same_shape(a, b)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b)) {
+        return false;
+    }
+    const auto * ea = (const ggml_tensor_extra_gpu *) wa->extra;
+    const auto * eb = (const ggml_tensor_extra_gpu *) wb->extra;
+    if (!ea || !eb || !ea->optimized_feature.reorder || !eb->optimized_feature.reorder) {
+        return false;
+    }
+    if (ggml_sycl_info().device_count > 1) {
+        return false;
+    }
+    return true;
+}
+
+// The grouped (segmented-dispatch) form of the pair: two independent mat-vecs over
+// one activation whose weights need NOT have the same shape -- only the same quant
+// type, the same ncols and the reorder layout. This is the Q/K projection pair and
+// the GDN qkv/gate pair in qwen3.5/3.6: same src1, 12288-vs-1024 and 10240-vs-6144
+// rows respectively. Kernel: mul_mat_vec_q_reorder_grouped2 (segmented row space).
+bool ggml_sycl_should_fuse_mul_mat_pair_grouped(const ggml_tensor * a, const ggml_tensor * b) {
+    if (a->op != GGML_OP_MUL_MAT || b->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    const ggml_tensor * wa = a->src[0];
+    const ggml_tensor * wb = b->src[0];
+    if (wa == nullptr || wb == nullptr || wa == wb) {
+        return false;
+    }
+    // Q4_K/Q5_K only: qwen3.5/3.6's Q/K and qkv/gate bandwidth pairs. q8_0 was
+    // tried for qwen3.8's ssm_alpha/ssm_beta and attn V and engages ZERO times:
+    // beta's dst arena slot is reused by alpha's own decay-chain scratch (the
+    // region check correctly rejects), and Vcur is the trio's last mat-vec so a
+    // forward scan finds only mismatched types ahead of it. See the series ledger.
+    if (wa->type != wb->type || (wa->type != GGML_TYPE_Q4_K && wa->type != GGML_TYPE_Q5_K)) {
+        return false;
+    }
+    // shared activation implies equal ncols; rows may differ
+    if (wa->ne[0] != wb->ne[0] || wa->ne[0] % QK_K != 0) {
+        return false;
+    }
+    if (wa->ne[2] != 1 || wa->ne[3] != 1 || wb->ne[2] != 1 || wb->ne[3] != 1) {
+        return false;
+    }
+    if (a->src[1] == nullptr || a->src[1] != b->src[1] || a->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (a->src[1]->ne[1] != 1 || a->src[1]->ne[2] != 1 || a->src[1]->ne[3] != 1) {
+        return false;
+    }
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b)) {
+        return false;
+    }
+    // a row-limited mat-vec (the MTP draft head) must keep its own dispatch
+    if (ggml_mul_mat_get_row_limit(a) > 0 || ggml_mul_mat_get_row_limit(b) > 0) {
+        return false;
+    }
+    const auto * ea = (const ggml_tensor_extra_gpu *) wa->extra;
+    const auto * eb = (const ggml_tensor_extra_gpu *) wb->extra;
+    if (!ea || !eb || !ea->optimized_feature.reorder || !eb->optimized_feature.reorder) {
+        return false;
+    }
+    if (ggml_sycl_info().device_count > 1) {
+        return false;
+    }
+    return true;
+}
+
 static bool ggml_sycl_should_fuse_rope_set_rows(const ggml_tensor * rope,
                                                 const ggml_tensor * view,
                                                 const ggml_tensor * set_rows) {

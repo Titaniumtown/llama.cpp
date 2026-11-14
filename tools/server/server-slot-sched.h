@@ -3,6 +3,7 @@
 #include "server-common.h"
 #include "server-task.h"
 #include "server-prompt-cache-disk.h"
+#include "server-prompt-cache-spread.h"
 
 #include <condition_variable>
 #include <list>
@@ -128,9 +129,11 @@ struct server_prompt_cache_state {
 struct server_prompt_cache {
     ~server_prompt_cache();
 
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, int32_t max_checkpoints = 0, int32_t min_step = 8192) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+        this->max_checkpoints = max_checkpoints > 0 ? (size_t) max_checkpoints : 0;
+        this->min_step = min_step > 0 ? (size_t) min_step : 8192;
     }
 
     std::list<server_prompt_cache_state> states;
@@ -140,6 +143,12 @@ struct server_prompt_cache {
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
+
+    // max number of context checkpoints kept in a stored entry, 0 = keep all
+    size_t max_checkpoints = 0;
+
+    // min spacing between context checkpoints, used to place the kept ones
+    size_t min_step = 8192;
 
     size_t size() const;
 

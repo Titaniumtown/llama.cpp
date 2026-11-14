@@ -202,9 +202,35 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
+    // keep checkpoints at fixed token positions, not list indices: the selection and its
+    // rationale live in server-prompt-cache-spread.h. a checkpoint does not change after it
+    // is created, so the entry shares the slot's: a copy is 1.4 GB of memcpy on the server
+    // thread at 98k with 8 checkpoints
+    std::list<std::shared_ptr<const common_prompt_checkpoint>> checkpoints;
+    {
+        const auto & src = prompt.checkpoints;
+
+        std::vector<int64_t> positions;
+        positions.reserve(src.size());
+        for (const auto & cur : src) {
+            positions.push_back(cur->n_tokens);
+        }
+
+        const auto kept = server_prompt_cache_select_checkpoint_positions(positions, max_checkpoints, min_step);
+
+        // kept and positions are both ascending: walk them together
+        size_t ki = 0;
+        for (const auto & cur : src) {
+            if (ki < kept.size() && cur->n_tokens == kept[ki]) {
+                checkpoints.push_back(cur);
+                ki++;
+            }
+        }
+    }
+
     // calculate checkpoints size to see if it will fit with the prompt
     size_t checkpoints_size = 0;
-    for (const auto & ckpt : prompt.checkpoints) {
+    for (const auto & ckpt : checkpoints) {
         checkpoints_size += ckpt->size();
     }
 
@@ -269,7 +295,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
+            /*.checkpoints =*/ std::move(checkpoints),
             /*.lora        =*/ prompt.lora,
         },
         /*.data   =*/ {

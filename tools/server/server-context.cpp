@@ -48,6 +48,15 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// checkpoint spacing ramps with depth: dense through the head, where agentic sessions
+// of one agent diverge (measured shared-head cluster 21-24k tokens), sparse in the
+// tail, where a continuation resumes at the final checkpoint. the 32-checkpoint cap
+// pops the oldest first, so a uniform step lets the head region lose its checkpoints
+// before the tail's do
+static int64_t checkpoint_step_at(int64_t n_tokens, int32_t min_step) {
+    return n_tokens >= (int64_t) min_step * 6 ? (int64_t) min_step * 4 : (int64_t) min_step;
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (!params.mmproj.path.empty()) {
         const auto mcaps = mtmd_get_cap_from_file(params.mmproj.path.c_str());
@@ -2595,7 +2604,8 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, params_base.cache_entry_checkpoints,
+                    params_base.checkpoint_min_step);
 
             // the disk tier is best-effort and must never be able to abort the server:
             // std::filesystem calls THROW on EACCES (an unreadable dump directory was
@@ -5873,7 +5883,8 @@ private:
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end ||
-                            n_tokens_start > slot.prompt.checkpoints.back()->n_tokens + params_base.checkpoint_min_step);
+                            n_tokens_start > slot.prompt.checkpoints.back()->n_tokens
+                            + checkpoint_step_at(slot.prompt.checkpoints.back()->n_tokens, params_base.checkpoint_min_step));
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not

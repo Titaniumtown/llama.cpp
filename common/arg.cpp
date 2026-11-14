@@ -1721,6 +1721,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-entry-checkpoints"}, "N",
+        string_format("max number of context checkpoints kept in a stored prompt state (default: %d, 0 - keep all)", params.cache_entry_checkpoints),
+        [](common_params & params, int value) {
+            params.cache_entry_checkpoints = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_ENTRY_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

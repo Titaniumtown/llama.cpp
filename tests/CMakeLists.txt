@@ -311,6 +311,8 @@ llama_build_and_test(test-chat-auto-parser.cpp  LABEL behavior  WORKING_DIRECTOR
 llama_build_and_test(test-chat-template.cpp  LABEL behavior)
 llama_build_and_test(test-disk-entry-classify.cpp)
 target_include_directories(test-disk-entry-classify PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+llama_build_and_test(test-entry-checkpoint-spread.cpp)
+target_include_directories(test-entry-checkpoint-spread PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 llama_build_and_test(test-step-sched-inject.cpp)
 target_include_directories(test-step-sched-inject PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 llama_build_and_test(test-step-sched-budget.cpp)

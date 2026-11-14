@@ -810,7 +810,7 @@ struct server_slot {
 
         SLT_INF(*this,
                 "      total time = %10.2f ms / %5d tokens\n",
-                t_prompt_total + t_gen_total, (int) (stats.n_prompt_processed + stats.n_gen));
+                stats.t_total_ms(), (int) (stats.n_prompt_processed + stats.n_gen));
 
         SLT_INF(*this,
                 "   graphs reused = %10d\n",
@@ -4602,7 +4602,7 @@ private:
         // the scheduler's unit of account is the wall time of one server iteration: this
         // is what the client's inter-token gap is made of (batch build, decode and the
         // response of the previous step all land inside it)
-        const int64_t t_sched_step = ggml_time_ms();
+        const int64_t t_sched_step = ggml_time_us();
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -4732,7 +4732,16 @@ private:
             }
         }
 
-        step_sched.observe((double) (ggml_time_ms() - t_sched_step));
+        // charge this iteration to the slots whose prompt tokens it carried: the sum of those
+        // iterations is a prompt's evaluation time, and the ones a slot sat out (an admission
+        // hold, an injected decode-only step, another slot's cache fetch) stay out of it.
+        // see server-slot-timer.h
+        const int64_t t_step_us = ggml_time_us() - t_sched_step;
+        iterate(slots, [&](server_slot & slot) {
+            slot.stats.timer.step_done(t_step_us);
+        });
+
+        step_sched.observe((double) t_step_us / 1000.0);
     }
 
     // realtime conversations (SERVER_TASK_TYPE_REALTIME) drive their own decode loop, see server_realtime_slot
@@ -5871,6 +5880,8 @@ private:
 
                     if (n_tokens_cur > 0) {
                         sched_prompt_slots++;
+                        // this iteration is one that the slot's prompt eval time is made of
+                        slot.stats.timer.step_prompt_tokens(n_tokens_cur);
                     }
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
@@ -6007,6 +6018,8 @@ private:
 
             slot.prompt.tokens.push_back_placeholder(chunk.get());
         }
+
+        slot.stats.timer.step_prompt_tokens(batch.size() - n_tokens_prev);
 
         return true;
     }

@@ -9,6 +9,7 @@
 #include "subproc.h"
 
 #include "json.h"
+#include "server-slot-timer.h"
 
 #include <array>
 #include <atomic>
@@ -448,45 +449,50 @@ struct server_slot_stats {
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
 
-    // these are absolute timestamps (in us)
-    // note: must be signed - they are subtracted before the later ones are set
-    int64_t t_start       = 0;
-    int64_t t_prompt_last = 0;
-    int64_t t_gen_last    = 0;
+    // the phase clock; eval time is summed step time, wall time is the clock (rationale
+    // and the measured size of the gap: server-slot-timer.h)
+    slot_timer timer;
 
     // can only move one direction: start -> prompt -> gen
     void update_prompt_start() {
-        GGML_ASSERT(t_start == 0);
-        t_start = ggml_time_us();
+        GGML_ASSERT(timer.t_start == 0);
+        timer.start(ggml_time_us());
     }
     void set_prompt_last(int64_t t_us) {
-        GGML_ASSERT(t_start > 0);
-        t_prompt_last = t_us;
+        GGML_ASSERT(timer.t_start > 0);
+        timer.prompt_done(t_us);
     }
     void update_prompt_last() {
         set_prompt_last(ggml_time_us());
     }
     void update_gen_last() {
-        GGML_ASSERT(t_prompt_last > 0);
-        t_gen_last = ggml_time_us();
+        GGML_ASSERT(timer.t_prompt_last > 0);
+        timer.gen_done(ggml_time_us());
     }
 
     // these are time durations
     int64_t t_elapsed_us() const {
-        return ggml_time_us() - t_start;
+        return ggml_time_us() - timer.t_start;
     }
+    // the prompt's evaluation time: the iterations that carried its tokens, nothing else
     double t_prompt_ms() const {
-        if (t_prompt_last == 0) {
-            return 0.0; // the prompt is not processed yet
-        }
-        return (t_prompt_last - t_start) / 1000.0;
+        return timer.prompt_eval_ms();
+    }
+    // the prompt phase's wall time: the eval time plus every wait in between
+    double t_prompt_wall_ms() const {
+        return timer.prompt_wall_ms();
+    }
+    // the request's wall time so far: the prompt phase, plus the generation phase once it
+    // has started
+    double t_total_ms() const {
+        return timer.total_ms(ggml_time_us());
     }
     int64_t t_gen_us() const {
-        if (t_gen_last == 0) {
+        if (timer.t_gen_last == 0) {
             return 0; // the generation is not started yet
         }
         // clamp to 1 us, the first token can land in the same us as t_prompt_last
-        return std::max<int64_t>(1, t_gen_last - t_prompt_last);
+        return std::max<int64_t>(1, timer.t_gen_last - timer.t_prompt_last);
     }
     double t_gen_ms() const {
         return t_gen_us() / 1000.0;
@@ -517,7 +523,7 @@ struct server_slot_stats {
 
     // false if the slot never started, i.e. the task result carries no stats
     bool is_set() const {
-        return t_start > 0;
+        return timer.t_start > 0;
     }
 
     json to_json() const;

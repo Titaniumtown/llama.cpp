@@ -148,8 +148,12 @@ json server_slot_stats::to_json() const {
     json base = {
         {"cache_n",                n_prompt_cached},
 
+        // prompt_ms is the evaluation time; prompt_wall_ms adds the time the slot sat
+        // through without evaluating (an admission hold, an injected decode-only step for a
+        // competing decoder, another slot's cache fetch), so the wait is visible next to it
         {"prompt_n",               n_prompt_processed},
         {"prompt_ms",              t_prompt_ms()},
+        {"prompt_wall_ms",         t_prompt_wall_ms()},
         {"prompt_per_token_ms",    t_prompt_per_token_ms()},
         {"prompt_per_second",      n_prompt_tps()},
 

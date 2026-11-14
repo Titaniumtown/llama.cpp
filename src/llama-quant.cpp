@@ -284,9 +284,31 @@ static void llama_tensor_dequantize_impl(ggml_type type,
     workers.clear();
 }
 
+//
 // do we allow this tensor to be quantized?
+//
+
+// Is this tensor named explicitly by --tensor-type / --tensor-type-file?
+//
+// Used to exempt it from COPY (--only-copy), which makes "copy every tensor except
+// these" expressible. That is the only way to retype ONE tensor of a GGUF whose
+// others are already quantized: a normal pass dequantizes and requantizes them,
+// which is lossy-on-lossy, and --include-weights/--exclude-weights filter only
+// imatrix entries, not which tensors are converted.
+static bool tensor_type_is_overridden(const llama_model_quantize_params * params, const char * name) {
+    if (params->tt_overrides == nullptr) {
+        return false;
+    }
+    for (const auto * p = params->tt_overrides; p->pattern != nullptr; p++) {
+        if (std::regex_search(name, std::regex(p->pattern))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool tensor_allows_quantization(const llama_model_quantize_params * params, llm_arch arch, const ggml_tensor * tensor) {
-    if (params->only_copy) { return false; }
+    if (params->only_copy && !tensor_type_is_overridden(params, ggml_get_name(tensor))) { return false; }
 
     // quantize only 2D+ tensors (matrices, experts, conv kernels)
     if (ggml_n_dims(tensor) < 2) { return false; }
@@ -795,17 +817,22 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs,
 
     ggml_type new_type = default_type;
 
-    // get more optimal quantization type based on the tensor shape, layer, etc.
-    if (ggml_is_quantized(default_type)) {
-        // if the user provided tensor types, use those
-        const ggml_type manual_type = tensor_type_override_for(qs, tensor->name);
-        const bool manual = manual_type != GGML_TYPE_COUNT;
-        if (manual && manual_type != new_type) {
-            LLAMA_LOG_WARN("%s: %-36s - applying manual override: %s -> %s\n",
-                __func__, tensor->name, ggml_type_name(new_type), ggml_type_name(manual_type));
-            new_type = manual_type;
-        }
+    // An explicit --tensor-type override is honoured whatever the default type is.
+    // This used to sit inside the ggml_is_quantized(default_type) branch below, so a
+    // COPY pass -- whose ftype is ALL_F32 -- skipped it entirely and silently emitted
+    // F32 for a tensor the user had asked to be q6_K.
+    const ggml_type manual_type = tensor_type_override_for(qs, tensor->name);
+    const bool manual = manual_type != GGML_TYPE_COUNT;
+    if (manual && manual_type != new_type) {
+        LLAMA_LOG_WARN("%s: %-36s - applying manual override: %s -> %s\n",
+            __func__, tensor->name, ggml_type_name(new_type), ggml_type_name(manual_type));
+        new_type = manual_type;
+    }
 
+    // get more optimal quantization type based on the tensor shape, layer, etc.
+    // `|| manual` so an overridden tensor still reaches tensor_type_fallback below,
+    // which is what rejects a type the tensor's shape cannot represent.
+    if (ggml_is_quantized(default_type) || manual) {
         // otherwise, use the standard logic
         if (!manual && !params->pure) { new_type = llama_tensor_get_type_impl(qs, new_type, tensor, params->ftype, tm.category); }
 

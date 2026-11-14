@@ -125,13 +125,17 @@ struct common_sampler {
     // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
 
+    // k of the chain's top-k when every sampler before it is a no-op, else 0
+    int32_t top_k_first = 0;
+
     void reset() {
         prev.clear();
 
         llama_sampler_reset(chain);
     }
 
-    void set_logits(struct llama_context * ctx, int idx) {
+    // top_k: the chain's top-k may be taken from the logits directly
+    void set_logits(struct llama_context * ctx, int idx, bool top_k = false) {
         const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
         const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
         const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
@@ -156,6 +160,11 @@ struct common_sampler {
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
+            // the k candidates are exactly what the chain's top-k leaves of the full array
+            if (top_k && top_k_first > 0 && common_sampler_top_k_logits(logits, n_vocab, top_k_first, cur)) {
+                cur_p = { cur.data(), cur.size(), -1, true };
+                return;
+            }
             cur.resize(n_vocab);
             for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
                 cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
@@ -219,6 +228,7 @@ struct common_sampler * common_sampler_init(
     llama_sampler * chain = llama_sampler_chain_init(lparams);
 
     std::vector<llama_sampler *> samplers;
+    llama_sampler * smpl_top_k = nullptr;
 
     const std::string & grammar_str = common_grammar_value(params.grammar);
     if (grammar_str.compare(0, 11, "%llguidance") == 0) {
@@ -367,6 +377,7 @@ struct common_sampler * common_sampler_init(
                     break;
                 case COMMON_SAMPLER_TYPE_TOP_K:
                     samplers.push_back(llama_sampler_init_top_k(params.top_k));
+                    smpl_top_k = samplers.back();
                     break;
                 case COMMON_SAMPLER_TYPE_TOP_P:
                     samplers.push_back(llama_sampler_init_top_p(params.top_p, params.min_keep));
@@ -439,6 +450,20 @@ struct common_sampler * common_sampler_init(
         params.backend_sampling = false;
     }
 
+    // the disabled samplers are the "?"-named empty ones, which leave the candidates untouched
+    int32_t top_k_first = 0;
+    if (smpl_top_k && params.top_k > 0 && !params.backend_sampling) {
+        for (const auto * smpl : samplers) {
+            if (smpl == smpl_top_k) {
+                top_k_first = params.top_k;
+                break;
+            }
+            if (llama_sampler_name(smpl)[0] != '?') {
+                break;
+            }
+        }
+    }
+
     auto * result = new common_sampler {
         /* .params  = */ params,
         /* .grmr    = */ grmr,
@@ -449,6 +474,7 @@ struct common_sampler * common_sampler_init(
         /* .cur_p   = */ {},
         // mix it, the chain and the draft are seeded from this one too
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
+        /* .top_k_first = */ top_k_first,
     };
 
     return result;
@@ -533,6 +559,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
         /* .rng     = */ gsmpl->rng,
+        /* .top_k_first = */ gsmpl->top_k_first,
     };
 }
 
@@ -554,6 +581,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->rng        = src->rng;
+    dst->top_k_first = src->top_k_first;
     dst->t_total_us = src->t_total_us;
 }
 
@@ -624,7 +652,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
+    // the reasoning budget changes logits only while forcing, the grammar only when applied first
+    const bool top_k = common_reasoning_budget_get_state(rbudget) != REASONING_BUDGET_FORCING &&
+                       !(grammar_first && grammar_should_apply(gsmpl));
+
+    gsmpl->set_logits(ctx, idx, top_k);
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
@@ -899,6 +931,77 @@ llama_token_data_array * common_sampler_get_candidates(struct common_sampler * g
 
 llama_token common_sampler_last(const struct common_sampler * gsmpl) {
     return gsmpl->prev.rat(0);
+}
+
+bool common_sampler_top_k_logits(const float * logits, int32_t n_vocab, int32_t k, std::vector<llama_token_data> & out) {
+    if (k < 1 || k > 128 || k >= n_vocab) {
+        return false;
+    }
+
+    // a bit test, so that it holds under -ffinite-math-only too
+    const auto is_nan = [](float v) {
+        uint32_t u;
+        memcpy(&u, &v, sizeof(u));
+        return (u & 0x7fffffffu) > 0x7f800000u;
+    };
+
+    // the k + 1 largest so far, by descending logit: the extra one exposes a tie at the k-th
+    const int32_t m = k + 1;
+
+    out.resize(m);
+
+    // inserts into the first n entries, dropping the last one when n == m - 1 holds a full list
+    const auto insert = [&](int32_t n, int32_t id, float v) {
+        int32_t j = n;
+        for (; j > 0 && out[j - 1].logit < v; --j) {
+            out[j] = out[j - 1];
+        }
+        out[j] = { id, v, 0.0f };
+    };
+
+    for (int32_t i = 0; i < m; ++i) {
+        if (is_nan(logits[i])) {
+            return false;
+        }
+        insert(i, i, logits[i]);
+    }
+
+    float thr = out[m - 1].logit;
+
+    constexpr int32_t nb = 64;
+
+    for (int32_t i = m; i < n_vocab; i += nb) {
+        const int32_t ie = std::min(i + nb, n_vocab);
+
+        int hit = 0;
+        for (int32_t j = i; j < ie; ++j) {
+            hit |= (logits[j] > thr) | is_nan(logits[j]);
+        }
+        if (!hit) {
+            continue;
+        }
+
+        for (int32_t j = i; j < ie; ++j) {
+            const float v = logits[j];
+            if (is_nan(v)) {
+                return false;
+            }
+            if (v > thr) {
+                insert(m - 1, j, v);
+                thr = out[m - 1].logit;
+            }
+        }
+    }
+
+    for (int32_t j = 0; j < k; ++j) {
+        if (!(out[j].logit > out[j + 1].logit)) {
+            return false;
+        }
+    }
+
+    out.resize(k);
+
+    return true;
 }
 
 std::string common_sampler_print(const struct common_sampler * gsmpl) {

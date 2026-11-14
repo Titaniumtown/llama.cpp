@@ -1639,6 +1639,15 @@ json oaicompat_chat_params_parse(
         throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
     }
 
+    // parse the top-level "enable_thinking" field sent by Qwen/DeepSeek clients
+    if (body.contains("enable_thinking")) {
+        auto enable_thinking = body.at("enable_thinking");
+        if (!enable_thinking.is_boolean()) {
+            throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean)");
+        }
+        inputs.enable_thinking = enable_thinking.get<bool>();
+    }
+
     // Parse the OAI "reasoning_effort" field; "none" disables reasoning.
     if (body.contains("reasoning_effort")) {
         auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));

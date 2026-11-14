@@ -785,6 +785,11 @@ void ggml_sycl_op_group_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
 
     GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    // the kernel is handed src0_dd/dst_dd and no strides, and walks both flat
+    // over ne0*ne1*ne2. The CPU reference requires unit row stride for this
+    // op (ggml-cpu/ops.cpp:4216), so repeat it here rather than let a
+    // GPU-only graph get silently wrong numbers where the CPU would abort.
+    GGML_ASSERT(dst->src[0]->nb[0] == sizeof(float));
 
     int num_groups = dst->op_params[0];
     dpct::queue_ptr main_stream = ctx.stream();

@@ -10768,6 +10768,92 @@ struct test_add_rel_pos : public test_case {
     }
 };
 
+// GGML_OP_IM2COL_BACK
+//
+// NOTE the argument order: (grad, kernel, ...). ggml.h's comment claims the
+// opposite and is wrong -- ops.cpp:6671-6672 and the only in-tree caller
+// (ggml.c:7132) both put the gradient first.
+//
+//   a  = gradient of the forward im2col output
+//        2D [IC*KH*KW, OW, OH, N]   1D [IC*KW, OW, N, 1]   F32, contiguous
+//   b  = the forward convolution kernel
+//        2D [KW, KH, IC, OC]        1D [KW, IC, OC, 1]      F32 or F16
+//   ne = shape of the forward im2col INPUT (the image), and of the result
+//        2D [IW, IH, IC, N]         1D [IW, IC, N, 1]
+//
+// OW and OH are DERIVED from ne_input rather than passed, because nothing
+// asserts the relation between them. ops.cpp:6746 indexes the grad with no
+// bounds check, so a grad whose shape disagrees with ne is a silent
+// out-of-bounds read, not a failed case -- and a registration that passed both
+// independently could desync them by a typo.
+//
+// No ggml_set_param anywhere: ggml_compute_backward() has no
+// GGML_OP_IM2COL_BACK case, and its default is GGML_ABORT, which would kill
+// the entire run rather than this case. Without a param the grad pass stops at
+// its !any_params check and reports NOT_SUPPORTED before reaching
+// ggml_build_backward_expand.
+//
+// The kernel's data is never read by either implementation, only its ne[0] and
+// ne[1], so the F16 registrations add shape coverage and no numeric coverage.
+// Kept because supports_op gates on the type.
+struct test_im2col_back : public test_case {
+    const ggml_type type_kernel;
+    const std::array<int64_t, 4> ne_input;
+    const int KW, KH, OC;
+    const int s0, s1, p0, p1, d0, d1;
+    const bool is_2D;
+
+    std::string vars() override {
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "ne=[%d,%d,%d,%d] K=%dx%d OC=%d s=%d,%d p=%d,%d d=%d,%d 2D=%d kern=%s",
+                 (int) ne_input[0], (int) ne_input[1], (int) ne_input[2], (int) ne_input[3],
+                 KW, KH, OC, s0, s1, p0, p1, d0, d1, (int) is_2D,
+                 ggml_type_name(type_kernel));
+        return std::string(buf);
+    }
+
+    test_im2col_back(ggml_type type_kernel = GGML_TYPE_F32,
+                     std::array<int64_t, 4> ne_input = {10, 10, 3, 1},
+                     int KW = 3, int KH = 3, int OC = 1,
+                     int s0 = 1, int s1 = 1, int p0 = 1, int p1 = 1,
+                     int d0 = 1, int d1 = 1, bool is_2D = true)
+        : type_kernel(type_kernel), ne_input(ne_input), KW(KW), KH(KH), OC(OC),
+          s0(s0), s1(s1), p0(p0), p1(p1), d0(d0), d1(d1), is_2D(is_2D) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t IW = ne_input[0];
+        const int64_t IH = is_2D ? ne_input[1] : 1;
+        const int64_t IC = is_2D ? ne_input[2] : ne_input[1];
+        const int64_t N  = is_2D ? ne_input[3] : ne_input[2];
+
+        const int64_t OW = (IW + 2*p0 - d0*(KW - 1) - 1)/s0 + 1;
+        const int64_t OH = is_2D ? (IH + 2*p1 - d1*(KH - 1) - 1)/s1 + 1 : 1;
+
+        int64_t ne_grad[4];
+        int64_t ne_kern[4];
+        if (is_2D) {
+            ne_grad[0] = (int64_t) KW*KH*IC; ne_grad[1] = OW; ne_grad[2] = OH; ne_grad[3] = N;
+            ne_kern[0] = KW; ne_kern[1] = KH; ne_kern[2] = IC; ne_kern[3] = OC;
+        } else {
+            ne_grad[0] = (int64_t) KW*IC;    ne_grad[1] = OW; ne_grad[2] = N;  ne_grad[3] = 1;
+            ne_kern[0] = KW; ne_kern[1] = IC; ne_kern[2] = OC; ne_kern[3] = 1;
+        }
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_grad);
+        ggml_set_name(a, "grad");
+        ggml_tensor * b = ggml_new_tensor(ctx, type_kernel, 4, ne_kern);
+        ggml_set_name(b, "kernel");
+
+        // ggml.h takes a non-const int64_t *, so a member std::array .data()
+        // does not bind. Copy into a local.
+        int64_t ne[4] = { IW, IH, IC, N };
+
+        ggml_tensor * out = ggml_im2col_back(ctx, a, b, ne, s0, s1, p0, p1, d0, d1, is_2D);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_generic_op : public test_case {
     const ggml_op op;
     const ggml_type type;
@@ -13932,6 +14018,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_sum(GGML_TYPE_F32, {11, 5, 6, 3}, {0, 0, 0, 0}, true)); // sliced view (gaps)
     test_cases.emplace_back(new test_sum(GGML_TYPE_F32, {11, 5, 6, 3}, {1, 0, 2, 3}, true)); // sliced + non-contiguous rows
     test_cases.emplace_back(new test_sum_rows());
+
+    // im2col_back -- no coverage in this file before now.
+    test_cases.emplace_back(new test_im2col_back());
+    test_cases.emplace_back(new test_im2col_back(GGML_TYPE_F16));
+    test_cases.emplace_back(new test_im2col_back(GGML_TYPE_F32, {10, 10, 3, 4}, 3, 3, 2, 1, 1, 1, 1, 1, 1, true));
+    for (int s0 : {1, 3}) {
+        for (int s1 : {1, 2}) {
+            for (int p0 : {0, 3}) {
+                for (int d0 : {1, 2}) {
+                    test_cases.emplace_back(new test_im2col_back(
+                        GGML_TYPE_F16, {13, 11, 3, 1}, 3, 4, 2, s0, s1, p0, 0, d0, 1, true));
+                }
+            }
+        }
+    }
+    // 1D: ne is [IW, IC, N, 1] and the grad is [IC*KW, OW, N, 1].
+    test_cases.emplace_back(new test_im2col_back(GGML_TYPE_F16, {17, 2, 3, 1}, 3, 3, 4, 1, 0, 1, 1, 1, 1, false));
+    test_cases.emplace_back(new test_im2col_back(GGML_TYPE_F32, { 9, 4, 2, 1}, 4, 3, 3, 2, 0, 2, 1, 1, 1, false));
+
 
     // -----------------------------------------------------------------
     // Ops that --list-ops reports and that this file has never built a

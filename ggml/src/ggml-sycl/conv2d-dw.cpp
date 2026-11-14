@@ -153,6 +153,12 @@ void ggml_sycl_op_conv2d_dw(ggml_backend_sycl_context & ctx, ggml_tensor * dst) 
         if (ggml_is_contiguous(input)) {
             conv2d_dw_sycl<sycl::half, dw_whcn_layout>(x_d, w_d, y_d, params, stream);
         } else if (ggml_is_contiguous_channels(input)) {
+            // the layout is chosen from the INPUT alone, and kernel_index reads
+            // the kernel as (ky*KW+kx)*C + c on this branch. The CPU reference
+            // asserts the kernel's cwhn strides at the same branch
+            // (ggml-cpu/ops.cpp:7675); repeat it rather than read a kernel that
+            // is not laid out the way the input chose.
+            GGML_ASSERT(kernel->nb[0] >= kernel->nb[2] && kernel->nb[1] >= kernel->nb[0]);
             conv2d_dw_sycl<sycl::half, dw_cwhn_layout>(x_d, w_d, y_d, params, stream);
         } else {
             GGML_ABORT("Unsupported memory layout for conv2d_dw");
@@ -162,6 +168,12 @@ void ggml_sycl_op_conv2d_dw(ggml_backend_sycl_context & ctx, ggml_tensor * dst) 
         if (ggml_is_contiguous(input)) {
             conv2d_dw_sycl<float, dw_whcn_layout>(x_d, w_d, y_d, params, stream);
         } else if (ggml_is_contiguous_channels(input)) {
+            // the layout is chosen from the INPUT alone, and kernel_index reads
+            // the kernel as (ky*KW+kx)*C + c on this branch. The CPU reference
+            // asserts the kernel's cwhn strides at the same branch
+            // (ggml-cpu/ops.cpp:7675); repeat it rather than read a kernel that
+            // is not laid out the way the input chose.
+            GGML_ASSERT(kernel->nb[0] >= kernel->nb[2] && kernel->nb[1] >= kernel->nb[0]);
             conv2d_dw_sycl<float, dw_cwhn_layout>(x_d, w_d, y_d, params, stream);
         } else {
             GGML_ABORT("Unsupported memory layout for conv2d_dw");

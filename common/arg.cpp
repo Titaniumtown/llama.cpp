@@ -1734,6 +1734,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-disk-fsync"},
+        {"--no-cache-disk-fsync"},
+        "wait for the device to accept every entry written to the --cache-disk-dir tier "
+        "(default: disabled). the entries carry a checksum, so a write that a power cut "
+        "tore is rejected on read; without the wait the write returns as soon as the data "
+        "is in the page cache",
+        [](common_params & params, bool value) {
+            params.cache_disk_fsync = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_FSYNC").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--cache-entry-checkpoints"}, "N",
         string_format("max number of context checkpoints kept in a stored prompt state (default: %d, 0 - keep all)", params.cache_entry_checkpoints),
         [](common_params & params, int value) {

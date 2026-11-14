@@ -81,19 +81,132 @@ static inline int server_prompt_cache_first_rung(std::size_t entry_tokens, std::
     return (int) kept.front();
 }
 
-// a disk fetch is a blocking read on the server thread: both slots stall behind it. it must
-// save more prefill than the read costs. measured on the production pool: 0.7-0.9 GB/s of read
-// against 500-700 tok/s of prefill, i.e. about one token of reuse per 1.5 MB of entry, doubled
-// so the swap clearly wins. the floor is absolute, not just a delta over the RAM tier: with an
-// empty RAM tier the delta rule alone let a 5-token head win a 314 MB read. the head also has
-// to land on a rung, and what the restore actually reuses is the rung, not the head
-static inline bool server_prompt_cache_disk_wins(int lcp_disk, int lcp_ram, std::size_t entry_size, int first_rung) {
-    const int fetch_min_gain = std::max(2048, (int) (entry_size / 750'000));
+// uncontended price: 0.7-0.9 GB/s against 500-700 tok/s, doubled, is one token per 0.75 MB.
+// a measured rate tightens that price and never loosens it. bytes_per_token <= 0 means uncontended.
+static constexpr int SERVER_PROMPT_CACHE_UNCONTENDED_BPT = 750000;
+static constexpr int SERVER_PROMPT_CACHE_PREFILL_TOK_S   = 667;
+static constexpr int SERVER_PROMPT_CACHE_FETCH_SAFETY    = 2;
+static constexpr std::size_t SERVER_PROMPT_CACHE_WRITE_WINDOW = 128ull << 20;
+
+static inline int server_prompt_cache_bytes_per_token(double mb_s) {
+    if (!(mb_s > 0.0)) {
+        return SERVER_PROMPT_CACHE_UNCONTENDED_BPT;
+    }
+
+    const double bpt = mb_s * 1e6 / (double) (SERVER_PROMPT_CACHE_FETCH_SAFETY * SERVER_PROMPT_CACHE_PREFILL_TOK_S);
+
+    if (bpt < 1.0) {
+        return 1;
+    }
+    if (bpt > (double) SERVER_PROMPT_CACHE_UNCONTENDED_BPT) {
+        return SERVER_PROMPT_CACHE_UNCONTENDED_BPT;
+    }
+
+    return (int) bpt;
+}
+
+static inline double server_prompt_cache_rate_median(const double * samples, int n) {
+    if (n <= 0 || samples == nullptr) {
+        return 0.0;
+    }
+    if (n > 8) {
+        n = 8;
+    }
+
+    double tmp[8];
+    for (int i = 0; i < n; i++) {
+        tmp[i] = samples[i];
+    }
+    std::sort(tmp, tmp + n);
+
+    return tmp[n / 2];
+}
+
+// the fread is off the server thread. the requester still waits, and the read shares the
+// device with writeback, so a head that prefill would finish first must not be fetched.
+// the floor is absolute, not just a delta over the RAM tier.
+static inline bool server_prompt_cache_disk_wins(int lcp_disk, int lcp_ram, std::size_t entry_size, int first_rung,
+        int bytes_per_token = SERVER_PROMPT_CACHE_UNCONTENDED_BPT) {
+    if (bytes_per_token < 1) {
+        bytes_per_token = SERVER_PROMPT_CACHE_UNCONTENDED_BPT;
+    }
+
+    const int fetch_min_gain = (int) std::max<std::size_t>(2048, std::min(entry_size / (std::size_t) bytes_per_token, (std::size_t) 0x7fffffff));
 
     return lcp_disk >= 0
            && lcp_disk >= first_rung
            && lcp_disk >= fetch_min_gain
            && lcp_disk > (lcp_ram >= 0 ? lcp_ram + fetch_min_gain : -1);
+}
+
+// a failed read is not a state. a checksum miss and a short file are the same outcome:
+// leaving the index entry makes the next match pay the read and fail again
+static inline bool server_prompt_cache_disk_failed_read_unlinks(bool ok, bool corrupt) {
+    (void) corrupt;
+
+    return !ok;
+}
+
+struct server_prompt_cache_write_behind {
+    std::size_t off = 0;
+    std::size_t len = 0;
+};
+
+// bytes already in the page cache that must be waited and dropped so dirty stays within
+// the window. len 0 means the window still holds what has been written
+static inline server_prompt_cache_write_behind server_prompt_cache_write_behind_of(
+        std::size_t written, std::size_t released, std::size_t window) {
+    server_prompt_cache_write_behind behind;
+    behind.off = released;
+
+    if (written <= released) {
+        return behind;
+    }
+
+    const std::size_t dirty = written - released;
+    if (dirty <= window) {
+        return behind;
+    }
+
+    behind.len = dirty - window;
+
+    return behind;
+}
+
+enum class server_prompt_cache_queue_act { push, replace, drop_push };
+
+struct server_prompt_cache_queue_decision {
+    server_prompt_cache_queue_act act   = server_prompt_cache_queue_act::push;
+    std::size_t                   index = 0;
+};
+
+// a same-hash state already queued is replaced, not stacked. a full queue drops the least
+// valuable entry, not the front: the front is often the conversation that just spilled
+template <typename Queue, typename HashOf, typename TokensOf>
+static inline server_prompt_cache_queue_decision server_prompt_cache_queue_admit(
+        const Queue & queued, const HashOf & hash_of, const TokensOf & tokens_of, uint64_t hash, std::size_t cap,
+        std::size_t slot_tokens, int64_t now_us) {
+    server_prompt_cache_queue_decision dec;
+
+    for (std::size_t i = 0; i < queued.size(); i++) {
+        if (hash_of(queued[i]) == hash) {
+            dec.act   = server_prompt_cache_queue_act::replace;
+            dec.index = i;
+
+            return dec;
+        }
+    }
+
+    if (cap == 0 || queued.size() < cap) {
+        dec.act = server_prompt_cache_queue_act::push;
+
+        return dec;
+    }
+
+    dec.act   = server_prompt_cache_queue_act::drop_push;
+    dec.index = server_prompt_cache_disk_victim(queued, tokens_of, slot_tokens, now_us);
+
+    return dec;
 }
 
 // the disk tier's eviction price: the same tokens-per-byte decayed by recency the resident

@@ -400,8 +400,8 @@ struct server_slot {
         return true;
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::vector<common_adapter_lora_info> & lora_new) {
-        bool res = prompt_cache.load(prompt, tokens, lora_new, ctx_tgt, ctx_dft, id, &cache_decision);
+    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::vector<common_adapter_lora_info> & lora_new, int task_id = -1) {
+        bool res = prompt_cache.load(prompt, tokens, lora_new, ctx_tgt, ctx_dft, id, &cache_decision, task_id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -2110,6 +2110,9 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+    std::mutex disk_hold_mu;
+    std::map<int, server_task> disk_held;
+    std::unordered_set<int> disk_cancelled;
 
     server_metrics metrics;
 
@@ -2618,6 +2621,23 @@ private:
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, params_base.cache_entry_checkpoints,
                     params_base.checkpoint_min_step);
+            prompt_cache->on_read_ready = [this](int id) {
+                server_task held;
+                {
+                    std::lock_guard<std::mutex> lock(disk_hold_mu);
+                    auto it = disk_held.find(id);
+                    if (it == disk_held.end() || disk_cancelled.count(id) != 0) {
+                        disk_held.erase(id);
+
+                        return;
+                    }
+
+                    held = std::move(it->second);
+                    disk_held.erase(it);
+                }
+
+                queue_tasks.post(std::move(held), true);
+            };
 
             // the disk tier is best-effort and must never be able to abort the server:
             // std::filesystem calls THROW on EACCES (an unreadable dump directory was
@@ -2631,7 +2651,8 @@ private:
                         prompt_cache->disk_init(params_base.cache_disk_dir,
                                 params_base.cache_disk_mib < 0 ? 0 : 1024ull*1024ull*(size_t) params_base.cache_disk_mib,
                                 params_base.model.path, model_tgt, ctx_tgt,
-                                params_base.cache_type_k, params_base.cache_type_v);
+                                params_base.cache_type_k, params_base.cache_type_v,
+                                params_base.cache_disk_fsync);
                     } catch (const std::exception & e) {
                         SRV_WRN("prompt cache: disk tier '%s' unavailable: %s\n",
                                 params_base.cache_disk_dir.c_str(), e.what());
@@ -2861,6 +2882,36 @@ private:
         }
     }
 
+    // the slot the scheduler hands the task when no read is waited for: the pinned
+    // one, or the idle slot the similarity pick takes. a disk read has to beat its head
+    const server_prompt * prompt_of_pick(const server_task & task) {
+        if (task.id_slot != -1) {
+            const server_slot * slot = get_slot_by_id(task.id_slot);
+            return slot ? &slot->prompt : nullptr;
+        }
+
+        if (slot_sched.slot_prompt_similarity == 0.0f) {
+            return nullptr;
+        }
+
+        const server_prompt * ret = nullptr;
+        float f_sim_best = 0.0f;
+
+        for (const server_slot & slot : slots) {
+            if (slot.is_processing() || slot.prompt.tokens.empty()) {
+                continue;
+            }
+
+            const float f_sim = float(slot.prompt.tokens.get_common_prefix(task.tokens)) / task.tokens.size();
+            if (f_sim > f_sim_best && f_sim > slot_sched.slot_prompt_similarity) {
+                f_sim_best = f_sim;
+                ret = &slot.prompt;
+            }
+        }
+
+        return ret;
+    }
+
     // with a unified KV cache the prompt has to fit next to the sequences already in flight,
     // otherwise decode() cannot find free cells for it, halves the batch on every chunk and
     // finally aborts every slot. idle slots are not counted: they are cleared to make room.
@@ -2898,7 +2949,7 @@ private:
 
         const auto lora = get_task_lora(task);
 
-        if (!slot.prompt_load(*prompt_cache, task.tokens, lora)) {
+        if (!slot.prompt_load(*prompt_cache, task.tokens, lora, task.id)) {
             slot.prompt_clear();
 
             // with a unified KV cache, the restore can fail because idle slots still hold the cells it needs
@@ -2908,7 +2959,7 @@ private:
 
                 SLT_INF(slot, "%s", "retrying prompt restore after clearing idle slots\n");
 
-                if (!slot.prompt_load(*prompt_cache, task.tokens, lora)) {
+                if (!slot.prompt_load(*prompt_cache, task.tokens, lora, task.id)) {
                     slot.prompt_clear();
                 }
             }
@@ -4093,6 +4144,38 @@ private:
 
                     const int id_task = task.id;
 
+                    if (disk_cancelled.count(id_task) != 0) {
+                        disk_cancelled.erase(id_task);
+                        break;
+                    }
+
+                    // the disk tier holds only states made without a lora config
+                    if (prompt_cache && prompt_cache->disk_enabled() && !task.is_stateless() && task.tokens.size() > 0 && get_task_lora(task).empty()) {
+                        server_tokens tokens = task.tokens.clone();
+                        const server_prompt * prompt_slot = prompt_of_pick(task);
+                        {
+                            std::lock_guard<std::mutex> lock(disk_hold_mu);
+                            disk_held.insert_or_assign(id_task, std::move(task));
+                        }
+
+                        const auto wait = prompt_cache->disk_prepare(id_task, tokens, prompt_slot);
+                        if (wait == server_prompt_cache::disk_wait::pending) {
+                            SRV_INF("prompt cache: disk read in flight for task %d, slot loop continues\n", id_task);
+                            break;
+                        }
+
+                        {
+                            std::lock_guard<std::mutex> lock(disk_hold_mu);
+                            auto it = disk_held.find(id_task);
+                            if (it == disk_held.end()) {
+                                break;
+                            }
+
+                            task = std::move(it->second);
+                            disk_held.erase(it);
+                        }
+                    }
+
                     const auto plan = fits_unified_kv(task) ? slot_sched.select(get_slot_infos(), task, get_task_lora(task), prompt_cache.get()) : server_slot_plan {};
 
                     server_slot * slot = plan.id_slot == -1 ? nullptr : get_slot_by_id(plan.id_slot);
@@ -4149,6 +4232,15 @@ private:
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
                 {
+                    {
+                        std::lock_guard<std::mutex> lock(disk_hold_mu);
+                        disk_cancelled.insert(task.id_target);
+                        disk_held.erase(task.id_target);
+                    }
+                    if (prompt_cache) {
+                        prompt_cache->disk_cancel(task.id_target);
+                    }
+
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {

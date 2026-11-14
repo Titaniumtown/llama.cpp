@@ -3,10 +3,14 @@
 #include "server-common.h"
 #include "server-task.h"
 #include "server-prompt-cache-disk.h"
+#include "server-prompt-cache-read.h"
 #include "server-prompt-cache-value.h"
 #include "server-prompt-cache-spread.h"
 
+#include <atomic>
 #include <condition_variable>
+#include <deque>
+#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -205,7 +209,7 @@ struct server_prompt_cache {
 
     // restore the entry with the longest usable head, from either tier, into the slot `id_slot`
     bool load(server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
-            server_prompt_cache_decision * decision = nullptr);
+            server_prompt_cache_decision * decision = nullptr, int task_id = -1);
 
     // what a state is worth keeping: the tokens a future request takes from it per byte it
     // holds, decayed by the time since it was last used
@@ -229,7 +233,7 @@ struct server_prompt_cache {
     };
 
     bool disk_init(const std::string & dir, size_t limit, const std::string & model_path,
-            const llama_model * model, const llama_context * ctx, ggml_type type_k, ggml_type type_v);
+            const llama_model * model, const llama_context * ctx, ggml_type type_k, ggml_type type_v, bool fsync);
 
     bool disk_enabled() const;
 
@@ -254,27 +258,68 @@ struct server_prompt_cache {
     // which entry the disk tier would serve this request with, without materializing it
     disk_hit disk_find(const server_prompt & prompt_slot, const server_tokens & tokens_new, server_prompt_cache_decision & decision);
 
-    // read `hit` off the disk into `out` and remove it: the state then lives in the slot, not
-    // in two places. false leaves the tier untouched
+    // read `hit` into `out`. the caller commits once the slot holds the state. false leaves
+    // the tier untouched
     bool disk_fetch(const disk_hit & hit, server_prompt_cache_state & out);
+
+    // skip: no disk read. pending: the fread is on the reader thread, the caller must not
+    // take a slot yet. ready: the buffer is in hand and load() will restore it.
+    enum class disk_wait { skip, pending, ready };
+
+    // prompt_slot: what the slot the task would get holds, nullptr for none
+    disk_wait disk_prepare(int task_id, const server_tokens & tokens, const server_prompt * prompt_slot);
+    void disk_cancel(int task_id);
+
+    struct disk_taken {
+        std::shared_ptr<server_prompt_cache_state> state;
+        disk_hit hit;
+        bool     unlink = false;
+    };
+
+    disk_taken disk_take(int task_id);
+
+    // posted from the reader thread when a waited read finishes. empty until the server sets it.
+    std::function<void(int)> on_read_ready;
 
     std::string disk_dir;
     size_t      disk_limit       = 0;
     size_t      disk_used        = 0;
     uint64_t    disk_fingerprint = 0;
 
+    // wait for the device on every entry write. the entries carry a checksum, so a write
+    // that a power cut tore is refused when it is read back; the wait buys durability the
+    // checksum does not, at the cost of the device's latency on every entry
+    bool        disk_fsync       = false;
+
     std::vector<disk_state> disk_states;
 
 private:
     void disk_writer();
+    void disk_reader();
     void disk_write(server_prompt_cache_state & state);
     void disk_prune();
+    bool disk_read_file(const disk_hit & hit, server_prompt_cache_state & out);
+    void disk_drop_path(const std::string & path);
+    void disk_commit(const disk_hit & hit, bool unlink_file);
+    void note_read_rate(double mb_s);
 
     std::thread             disk_thread;
     std::mutex              disk_mutex;
     std::condition_variable disk_cv;
     std::list<server_prompt_cache_state> disk_queue;
-    bool                    disk_stop = false;
+    std::atomic<bool>       disk_stop { false };
+
+    std::thread             read_thread;
+    std::mutex              read_mu;
+    std::condition_variable read_cv;
+    std::deque<disk_hit>    read_q;
+    server_prompt_cache_read_sched read_sched;
+    std::map<std::string, std::shared_ptr<server_prompt_cache_state>> read_ready;
+    std::map<std::string, disk_hit> read_hits;
+    std::atomic<int>        fetch_bpt { SERVER_PROMPT_CACHE_UNCONTENDED_BPT };
+    double                  rate_samples[8] = {};
+    int                     rate_n = 0;
+    int                     rate_i = 0;
 };
 
 // what the scheduler needs to know about a slot

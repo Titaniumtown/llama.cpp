@@ -70,6 +70,32 @@ int main() {
     // ... and a short entry lends a head its own first rung covers
     check(server_prompt_cache_disk_wins(5000, -1, small, 4096), "a 5k head wins a 5k entry's read");
 
+    // 80 MB/s against 667 tok/s, doubled: 80e6 / 1334 = 59970 bytes per token.
+    // a 2.7 GB entry then costs 45022 tokens. the live loser median (13811) must not win;
+    // the live winner median (65021) still does. the uncontended price above is unchanged.
+    check(server_prompt_cache_bytes_per_token(80.0) == 59970, "80 MB/s prices at 59970 bytes per token");
+    check(server_prompt_cache_bytes_per_token(0.0) == 750000, "no sample keeps the uncontended price");
+    check(server_prompt_cache_bytes_per_token(2000.0) == 750000, "a fast sample does not loosen the price");
+    const std::size_t live = 2'700'000'000ull;
+    const int contended = server_prompt_cache_bytes_per_token(80.0);
+    check(!server_prompt_cache_disk_wins(13811, -1, live, 8192, contended), "a 13811-token head does not win a slow 2.7 GB read");
+    check(server_prompt_cache_disk_wins(65021, -1, live, 8192, contended), "a 65021-token head still wins a slow 2.7 GB read");
+    // a quotient past INT_MAX used to wrap negative and collapse to the 2048 floor
+    const std::size_t over = 3ull << 30;
+    check(!server_prompt_cache_disk_wins(3000, -1, over, 0, 1), "a 3 GiB entry at 1 byte/token does not win on a 3000-token head");
+    const double rates[] = { 30.0, 80.0, 1000.0 };
+    check(server_prompt_cache_rate_median(rates, 3) == 80.0, "the median of three rates is the middle one");
+    check(server_prompt_cache_disk_failed_read_unlinks(false, false), "a truncated read is dropped");
+    check(server_prompt_cache_disk_failed_read_unlinks(false, true), "a checksum miss is dropped");
+    check(!server_prompt_cache_disk_failed_read_unlinks(true, false), "a good read is kept");
+    const std::size_t window = 128;
+    const auto behind = server_prompt_cache_write_behind_of(160, 0, window);
+    check(behind.off == 0 && behind.len == 32, "160 written into a 128 window drops the first 32");
+    const auto held = server_prompt_cache_write_behind_of(100, 0, window);
+    check(held.len == 0, "100 written into a 128 window drops nothing");
+    const auto drain = server_prompt_cache_write_behind_of(160, 32, 0);
+    check(drain.off == 32 && drain.len == 128, "a zero window drains whatever is still dirty");
+
     printf("PASS\n");
     return 0;
 }

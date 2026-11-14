@@ -1,5 +1,6 @@
 #include "fusion.hpp"
 #include "binbcast.hpp"
+#include "dmmv.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -177,11 +178,13 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
 #else
     const bool xmx_pair = false;
 #endif // GGML_SYCL_MMVQ_HAS_XMX
-    // the ESIMD kernel covers same-type q2_K..q6_K and q8_0, single column only (as unfused DMMV)
+    // the ESIMD kernel covers same-type q2_K..q6_K and q8_0, plus mixed q2_K..q6_K gate/up
+    // pairs, single activation column only (as unfused DMMV)
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
-    const bool esimd_pair   = g_ggml_sycl_enable_esimd && wu->type == wg->type && act->ne[1] == 1 &&
-                            (wu->type == GGML_TYPE_Q2_K || wu->type == GGML_TYPE_Q3_K || wu->type == GGML_TYPE_Q4_K ||
-                             wu->type == GGML_TYPE_Q5_K || wu->type == GGML_TYPE_Q6_K || wu->type == GGML_TYPE_Q8_0);
+    const bool esimd_kq     = wu->type >= GGML_TYPE_Q2_K && wu->type <= GGML_TYPE_Q6_K &&
+                            wg->type >= GGML_TYPE_Q2_K && wg->type <= GGML_TYPE_Q6_K;
+    const bool esimd_pair   = g_ggml_sycl_enable_esimd && act->ne[1] == 1 &&
+                            (esimd_kq || (wu->type == GGML_TYPE_Q8_0 && wg->type == GGML_TYPE_Q8_0));
 #else
     const bool esimd_pair   = false;
 #endif

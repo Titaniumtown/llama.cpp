@@ -32,15 +32,6 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
     const int64_t src1_ncols, const int64_t src1_padded_row_size,
     const dpct::queue_ptr &stream);
 
-// Fused dense-FFN mat-vec: writes glu(gate . y, up . y) for same-type reordered
-// weights (Q2_K..Q6_K, Q8_0) and a single F32 activation column, using the ESIMD DMMV kernels.
-// vx is the up weight, vgate the gate weight. Only defined when GGML_SYCL_DMMV_HAS_ESIMD;
-// returns false if the type is unhandled.
-bool ggml_sycl_dequantize_mul_mat_vec_glu_reorder_esimd(
-    enum ggml_type src0_type, enum ggml_glu_op glu_op,
-    const void * vx, const void * vgate, const float * y,
-    float * dst, int ncols, int nrows, dpct::queue_ptr stream);
-
 // Plain f32 mat-vec. Same op signature as the dequantise path so it plugs into
 // ggml_sycl_op_mul_mat unchanged. Requires ne00 % (WARP_SIZE*4) == 0; callers must
 // check the same condition before selecting it.
@@ -60,6 +51,15 @@ void ggml_sycl_op_mul_mat_vec_f32(
 // silently did nothing is indistinguishable from one that ran. Defined in dmmv.cpp
 // because esimd.hpp, and the resolver behind it, is only included there.
 void ggml_sycl_dmmv_esimd_wg_size_report();
+
+// Fused dense-FFN mat-vec: writes glu(gate . y, up . y) for reordered weights and a single F32
+// activation column, using the ESIMD DMMV kernels. Same-type pairs (Q2_K..Q6_K, Q8_0) and mixed
+// Q2_K..Q6_K gate/up pairs are covered.
+// vx is the up weight, vgate the gate weight; returns false if the type pair is unhandled.
+bool ggml_sycl_dequantize_mul_mat_vec_glu_reorder_esimd(
+    enum ggml_type up_type, enum ggml_type gate_type, enum ggml_glu_op glu_op,
+    const void * vx, const void * vgate, const float * y,
+    float * dst, int ncols, int nrows, dpct::queue_ptr stream);
 #endif // GGML_SYCL_DMMV_HAS_ESIMD
 
 #endif // GGML_SYCL_DMMV_HPP

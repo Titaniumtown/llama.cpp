@@ -1618,13 +1618,26 @@ struct esimd_dmmv_glu_policy {
 // are numerically identical -- the epilogue's f32 addition order is p = 0..WG-1 either way
 // -- so this is a codegen restoration, not a behaviour change.
 //
-// WHAT IT COSTS: this is two instantiations per type and policy, not one. The row-pair
-// family over Q2_K..Q6_K emits ten device kernels, and the GLU family over the same five
-// types emits ten more. On the device this campaign runs on the cap equals the shipped
-// default, so the dynamic instantiation is reachable only at widths 1..3 and ten of the
-// twenty are dead weight in production. That is the price of the default path keeping its
+// generic reordered dequantize-matvec: each work-group owns a pair of rows chosen by the policy
+// and updates one 32-wide accumulator per row
+//
+// Ta and Tb are the two operand types: equal on the plain path and the same-type GLU, and
+// the (gate, up) pair on the mixed-type GLU.
+//
+// WG_SIZE_STATIC is the work-group width as a template argument, or 0 to take it from the
+// wg_size argument instead. The launcher instantiates the default width as a constant so
+// the block-loop stride and the lane-0 epilogue keep the compile-time trip count and
+// constant lmem indices; only a non-default width pays for a dynamic bound. The two shapes
+// are numerically identical -- the epilogue's f32 addition order is p = 0..WG-1 either way
+// -- so this is a codegen restoration, not a behaviour change.
+//
+// WHAT IT COSTS: two instantiations per operand-type pair and policy, not one -- the
+// default width reaches the kernel as a template argument and the dynamic width as a
+// second instantiation. On the device this campaign runs on the cap equals the shipped
+// default, so the dynamic instantiation is reachable only at widths 1..3 and half of the
+// kernels are dead weight in production. That is the price of the default path keeping its
 // constant trip count, paid knowingly.
-template <ggml_type T, typename Policy, int WG_SIZE_STATIC>
+template <ggml_type Ta, ggml_type Tb, typename Policy, int WG_SIZE_STATIC>
 ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd(
         const Policy & policy, const float * y,
         const int ncols, const int nrows,
@@ -1632,14 +1645,15 @@ ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd(
         const sycl::nd_item<1> & it,
         const int wg_size) {
     using namespace sycl::ext::intel::esimd;
-    using traits = ggml_sycl_esimd::esimd_reorder_q_traits<T>;
+    using traits_a = ggml_sycl_esimd::esimd_reorder_q_traits<Ta>;
+    using traits_b = ggml_sycl_esimd::esimd_reorder_q_traits<Tb>;
 
     const int wg = WG_SIZE_STATIC > 0 ? WG_SIZE_STATIC : wg_size;
 
     const int    num_blocks_per_row = ncols / QK_K;
     const size_t nb = (size_t) nrows * num_blocks_per_row;
-    const auto   pa = traits::make_ptrs(policy.w_a(), nb);
-    const auto   pb = traits::make_ptrs(policy.w_b(), nb);
+    const auto   pa = traits_a::make_ptrs(policy.w_a(), nb);
+    const auto   pb = traits_b::make_ptrs(policy.w_b(), nb);
 
     const int  tid   = it.get_local_id(0);
     const int  g     = it.get_group(0);
@@ -1657,7 +1671,15 @@ ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd(
         const size_t bi_a = (size_t) row_a * num_blocks_per_row + ib;
         const size_t bi_b = (size_t) row_b * num_blocks_per_row + ib;
 
-        traits::mac_pair(pa, bi_a, pb, bi_b, has_b, y_vec, acc_a, acc_b);
+        if constexpr (Ta == Tb) {
+            traits_a::mac_pair(pa, bi_a, pb, bi_b, has_b, y_vec, acc_a, acc_b);
+        } else {
+            // mixed gate/up types: each operand dequantizes with its own traits
+            traits_a::mac(pa, bi_a, y_vec, acc_a);
+            if (has_b) {
+                traits_b::mac(pb, bi_b, y_vec, acc_b);
+            }
+        }
     }
 
     lmem[tid * 2 + 0] = reduce<float>(acc_a, std::plus<>{});
@@ -1681,7 +1703,7 @@ ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd(
 // wg_size is on the host, outside the command group, so exactly one kernel is enqueued
 // either way and the default width reaches the kernel as a template argument rather
 // than as a run-time bound.
-template <ggml_type T, typename Policy>
+template <ggml_type Ta, ggml_type Tb, typename Policy>
 static void dmmv_esimd_submit(const Policy & policy, const float * y,
                               const int ncols, const int nrows, const int workgroups,
                               const int wg_size, dpct::queue_ptr stream) {
@@ -1692,7 +1714,7 @@ static void dmmv_esimd_submit(const Policy & policy, const float * y,
         stream->submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> lmem(lmem_size, h);
             h.parallel_for(ndr, [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                dequantize_mul_mat_vec_reorder_esimd<T, Policy, DMMV_ESIMD_WG_SIZE_DEFAULT>(
+                dequantize_mul_mat_vec_reorder_esimd<Ta, Tb, Policy, DMMV_ESIMD_WG_SIZE_DEFAULT>(
                     policy, y, ncols, nrows, lmem, it, wg_size);
             });
         });
@@ -1700,7 +1722,7 @@ static void dmmv_esimd_submit(const Policy & policy, const float * y,
         stream->submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> lmem(lmem_size, h);
             h.parallel_for(ndr, [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                dequantize_mul_mat_vec_reorder_esimd<T, Policy, 0>(
+                dequantize_mul_mat_vec_reorder_esimd<Ta, Tb, Policy, 0>(
                     policy, y, ncols, nrows, lmem, it, wg_size);
             });
         });
@@ -1712,7 +1734,7 @@ static void dequantize_mul_mat_vec_q2_K_sycl_reorder_esimd(const void *vx, const
                                                            const int nrows,
                                                            dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
-    dmmv_esimd_submit<GGML_TYPE_Q2_K>(esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows,
+    dmmv_esimd_submit<GGML_TYPE_Q2_K, GGML_TYPE_Q2_K>(esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows,
                                      (nrows + 1) / 2, dmmv_esimd_wg_size(), stream);
 }
 
@@ -1721,7 +1743,7 @@ static void dequantize_mul_mat_vec_q3_K_sycl_reorder_esimd(const void *vx, const
                                                            const int nrows,
                                                            dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
-    dmmv_esimd_submit<GGML_TYPE_Q3_K>(esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows,
+    dmmv_esimd_submit<GGML_TYPE_Q3_K, GGML_TYPE_Q3_K>(esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows,
                                      (nrows + 1) / 2, dmmv_esimd_wg_size(), stream);
 }
 
@@ -1730,7 +1752,7 @@ static void dequantize_mul_mat_vec_q4_K_sycl_reorder_esimd(const void *vx, const
                                                            const int nrows,
                                                            dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
-    dmmv_esimd_submit<GGML_TYPE_Q4_K>(esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows,
+    dmmv_esimd_submit<GGML_TYPE_Q4_K, GGML_TYPE_Q4_K>(esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows,
                                      (nrows + 1) / 2, dmmv_esimd_wg_size(), stream);
 }
 
@@ -1739,7 +1761,7 @@ static void dequantize_mul_mat_vec_q5_K_sycl_reorder_esimd(const void *vx, const
                                                            const int nrows,
                                                            dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
-    dmmv_esimd_submit<GGML_TYPE_Q5_K>(esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows,
+    dmmv_esimd_submit<GGML_TYPE_Q5_K, GGML_TYPE_Q5_K>(esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows,
                                      (nrows + 1) / 2, dmmv_esimd_wg_size(), stream);
 }
 
@@ -1748,7 +1770,7 @@ static void dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd(const void *vx, const
                                                            const int nrows,
                                                            dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
-    dmmv_esimd_submit<GGML_TYPE_Q6_K>(esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows,
+    dmmv_esimd_submit<GGML_TYPE_Q6_K, GGML_TYPE_Q6_K>(esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows,
                                      (nrows + 1) / 2, dmmv_esimd_wg_size(), stream);
 }
 
@@ -1906,8 +1928,9 @@ static void dequantize_mul_mat_vec_q8_0_sycl_reorder_esimd(const void *vx, const
 
 // ESIMD fused gate+up+GLU on reordered K-quant SOA weights: one output row (gate
 // and up) per work-group, two independent 32-wide accumulators per super-block.
-// Reuses the DMMV kernels' dequant+MAC primitive (esimd_reorder_q_traits<T>::mac_pair).
-template <ggml_type T>
+// Same-type pairs run one traits::mac_pair; mixed pairs run each operand's own
+// traits::mac (mac_pair with b disabled).
+template <ggml_type TGATE, ggml_type TUP>
 static void dequantize_mul_mat_vec_glu_reorder_esimd(const void * vx, const void * vgate,
                                                      const float * y, float * dst,
                                                      const int ncols, const int nrows,
@@ -1915,32 +1938,126 @@ static void dequantize_mul_mat_vec_glu_reorder_esimd(const void * vx, const void
                                                      dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
     // one output row (gate+up) per work-group
-    dmmv_esimd_submit<T>(esimd_dmmv_glu_policy{ vgate, vx, dst, glu_op }, y, ncols, nrows,
-                         nrows, dmmv_esimd_wg_size(), stream);
+    dmmv_esimd_submit<TGATE, TUP>(esimd_dmmv_glu_policy{ vgate, vx, dst, glu_op },
+                         y, ncols, nrows, nrows, dmmv_esimd_wg_size(), stream);
 }
 
-bool ggml_sycl_dequantize_mul_mat_vec_glu_reorder_esimd(enum ggml_type src0_type, enum ggml_glu_op glu_op,
+bool ggml_sycl_dequantize_mul_mat_vec_glu_reorder_esimd(enum ggml_type up_type, enum ggml_type gate_type,
+                                                        enum ggml_glu_op glu_op,
                                                         const void * vx, const void * vgate, const float * y,
                                                         float * dst, int ncols, int nrows, dpct::queue_ptr stream) {
-    switch (src0_type) {
+    if (up_type == gate_type) {
+        switch (up_type) {
+            case GGML_TYPE_Q2_K:
+                dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q2_K, GGML_TYPE_Q2_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                return true;
+            case GGML_TYPE_Q3_K:
+                dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q3_K, GGML_TYPE_Q3_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                return true;
+            case GGML_TYPE_Q4_K:
+                dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q4_K, GGML_TYPE_Q4_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                return true;
+            case GGML_TYPE_Q5_K:
+                dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q5_K, GGML_TYPE_Q5_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                return true;
+            case GGML_TYPE_Q6_K:
+                dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q6_K, GGML_TYPE_Q6_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                return true;
+            case GGML_TYPE_Q8_0:
+                q8_0_esimd_launch_scaled(esimd_dmmv_glu_policy{ vgate, vx, dst, glu_op }, y, ncols, nrows, nrows, stream);
+                return true;
+            default:
+                return false;
+        }
+    }
+    // mixed gate/up K-quant pairs: one kernel instantiation per (gate, up) pair; Q8_0 is a
+    // separate kernel family and does not mix
+    switch (gate_type) {
         case GGML_TYPE_Q2_K:
-            dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q2_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
-            return true;
+            switch (up_type) {
+                case GGML_TYPE_Q3_K:
+                    dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q2_K, GGML_TYPE_Q3_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                    return true;
+                case GGML_TYPE_Q4_K:
+                    dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q2_K, GGML_TYPE_Q4_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                    return true;
+                case GGML_TYPE_Q5_K:
+                    dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q2_K, GGML_TYPE_Q5_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                    return true;
+                case GGML_TYPE_Q6_K:
+                    dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q2_K, GGML_TYPE_Q6_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                    return true;
+                default:
+                    return false;
+            }
         case GGML_TYPE_Q3_K:
-            dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q3_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
-            return true;
+            switch (up_type) {
+                case GGML_TYPE_Q2_K:
+                    dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q3_K, GGML_TYPE_Q2_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                    return true;
+                case GGML_TYPE_Q4_K:
+                    dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q3_K, GGML_TYPE_Q4_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                    return true;
+                case GGML_TYPE_Q5_K:
+                    dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q3_K, GGML_TYPE_Q5_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                    return true;
+                case GGML_TYPE_Q6_K:
+                    dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q3_K, GGML_TYPE_Q6_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                    return true;
+                default:
+                    return false;
+            }
         case GGML_TYPE_Q4_K:
-            dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q4_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
-            return true;
+            switch (up_type) {
+                case GGML_TYPE_Q2_K:
+                    dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q4_K, GGML_TYPE_Q2_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                    return true;
+                case GGML_TYPE_Q3_K:
+                    dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q4_K, GGML_TYPE_Q3_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                    return true;
+                case GGML_TYPE_Q5_K:
+                    dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q4_K, GGML_TYPE_Q5_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                    return true;
+                case GGML_TYPE_Q6_K:
+                    dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q4_K, GGML_TYPE_Q6_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                    return true;
+                default:
+                    return false;
+            }
         case GGML_TYPE_Q5_K:
-            dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q5_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
-            return true;
+            switch (up_type) {
+                case GGML_TYPE_Q2_K:
+                    dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q5_K, GGML_TYPE_Q2_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                    return true;
+                case GGML_TYPE_Q3_K:
+                    dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q5_K, GGML_TYPE_Q3_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                    return true;
+                case GGML_TYPE_Q4_K:
+                    dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q5_K, GGML_TYPE_Q4_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                    return true;
+                case GGML_TYPE_Q6_K:
+                    dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q5_K, GGML_TYPE_Q6_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                    return true;
+                default:
+                    return false;
+            }
         case GGML_TYPE_Q6_K:
-            dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q6_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
-            return true;
-        case GGML_TYPE_Q8_0:
-            q8_0_esimd_launch_scaled(esimd_dmmv_glu_policy{ vgate, vx, dst, glu_op }, y, ncols, nrows, nrows, stream);
-            return true;
+            switch (up_type) {
+                case GGML_TYPE_Q2_K:
+                    dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q6_K, GGML_TYPE_Q2_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                    return true;
+                case GGML_TYPE_Q3_K:
+                    dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q6_K, GGML_TYPE_Q3_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                    return true;
+                case GGML_TYPE_Q4_K:
+                    dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q6_K, GGML_TYPE_Q4_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                    return true;
+                case GGML_TYPE_Q5_K:
+                    dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q6_K, GGML_TYPE_Q5_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+                    return true;
+                default:
+                    return false;
+            }
         default:
             return false;
     }

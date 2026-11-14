@@ -6610,8 +6610,8 @@ static bool ggml_sycl_mul_mat_glu_xmx(ggml_backend_sycl_context & ctx,
 
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
 // {mul_mat(gate), mul_mat(up), GLU} on the reorder layout via the ESIMD DMMV kernel, for
-// same-type K-quant or Q8_0 pairs and a single activation column. It reads the F32 activation
-// directly, so one launch replaces three and no q8_1 quantization is needed.
+// same-type K-quant or Q8_0 pairs and mixed Q2_K..Q6_K gate/up pairs, single activation column.
+// It reads the F32 activation directly, so one launch replaces three and no q8_1 quantization is needed.
 static bool ggml_sycl_mul_mat_glu_dmmv_esimd(ggml_backend_sycl_context & ctx, ggml_tensor * glu,
                                              ggml_tensor * gate, ggml_tensor * up, const ggml_tensor * wu,
                                              const ggml_tensor * wg, const ggml_tensor * act) {
@@ -6635,7 +6635,7 @@ static bool ggml_sycl_mul_mat_glu_dmmv_esimd(ggml_backend_sycl_context & ctx, gg
     // log the up mat-mul: glu's own srcs are the two intermediates the fusion never materialises
     scope_op_debug_print scope_dbg_print(__func__, up, /*num_src=*/2, " : fused with gate + GLU (ESIMD)");
 
-    return ggml_sycl_dequantize_mul_mat_vec_glu_reorder_esimd(wu->type, ggml_get_glu_op(glu), wu->data, wg->data,
+    return ggml_sycl_dequantize_mul_mat_vec_glu_reorder_esimd(wu->type, wg->type, ggml_get_glu_op(glu), wu->data, wg->data,
                                                               (const float *) act->data, (float *) glu->data,
                                                               (int) wu->ne[0], (int) wu->ne[1], ctx.stream());
 }
@@ -6692,8 +6692,21 @@ static bool ggml_sycl_mul_mat_glu_fused(ggml_backend_sycl_context & ctx, ggml_cg
         return false;
     }
 
-    // quant pairs the reorder kernel does not serve (mixed gate/up types, q5_K off BMG) take the
-    // standard-layout fused path instead; same-type q4_K / q5_K keep the reorder path below
+#ifdef GGML_SYCL_DMMV_HAS_ESIMD
+    // single-column K-quant pairs take the ESIMD kernel, as the unfused mul-mats would via DMMV:
+    // same-type Q2_K..Q8_0, or mixed Q2_K..Q6_K gate/up; if the reorder layout could not be
+    // installed, fall through to mmvq
+    if (g_ggml_sycl_enable_esimd && act->ne[1] == 1 &&
+        ((wu->type == wg->type && ggml_sycl_supports_reorder_esimd(wu->type)) ||
+         (wu->type >= GGML_TYPE_Q2_K && wu->type <= GGML_TYPE_Q6_K &&
+          wg->type >= GGML_TYPE_Q2_K && wg->type <= GGML_TYPE_Q6_K)) &&
+        ggml_sycl_mul_mat_glu_dmmv_esimd(ctx, glu, gate, up, wu, wg, act)) {
+        return true;
+    }
+#endif
+
+    // quant pairs the reorder kernel does not serve take the standard-layout fused path instead
+    // (only q5_K / iq4_xs pairs have a plain kernel); same-type q4_K / q5_K keep the reorder path below
     const bool reorder_pair = wg->type == wu->type &&
         (wu->type == GGML_TYPE_Q4_K || (wu->type == GGML_TYPE_Q5_K && ggml_sycl_q5_k_mmvq_reuse(ctx.device)));
     if (!reorder_pair) {

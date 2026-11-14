@@ -2774,6 +2774,57 @@ struct test_mul_mat_reorder_then_big_batch : public test_case {
     }
 };
 
+// (gate mat-vec, up mat-vec, SWIGLU) over one activation, gate and up of the same or of
+// different quant types (this model: q4_K gate with q3_K/q5_K/q6_K up). Two warm-up mat-vecs
+// install the weight reorder first, so the triple itself is eligible for the backend's fused
+// dispatches: the SYCL SWIGLU epilogue writes the GLU output from the second mat-vec's store,
+// the same-type gate+up kernels (reorder or XMX) write it from one launch, and in both the
+// GLU node never runs. The XMX mat-vec must not take a dispatch that carries such a fusion.
+struct test_mul_mat_glu_mixed : public test_case {
+    const ggml_type type_gate;
+    const ggml_type type_up;
+    const int64_t   m;
+    const int64_t   n;
+    const int64_t   k;
+
+    std::string vars() override { return VARS_TO_STR5(type_gate, type_up, m, n, k); }
+
+    test_mul_mat_glu_mixed(ggml_type type_gate = GGML_TYPE_Q4_K, ggml_type type_up = GGML_TYPE_Q5_K,
+                           int64_t m = 512, int64_t n = 5, int64_t k = 1024) :
+        type_gate(type_gate),
+        type_up(type_up),
+        m(m),
+        n(n),
+        k(k) {}
+
+    double max_nmse_err() override { return 5e-4; }
+
+    // the fused dispatches only exist when the backend sees the whole graph
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * wg = ggml_new_tensor_2d(ctx, type_gate, k, m);
+        ggml_set_name(wg, "wg");
+        ggml_tensor * wu = ggml_new_tensor_2d(ctx, type_up, k, m);
+        ggml_set_name(wu, "wu");
+        ggml_tensor * x0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(x0, "x0");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * warm = ggml_add(ctx, ggml_mul_mat(ctx, wg, x0), ggml_mul_mat(ctx, wu, x0));
+        ggml_set_name(warm, "warm");
+
+        ggml_tensor * glu = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, wg, x), ggml_mul_mat(ctx, wu, x));
+        ggml_set_name(glu, "glu");
+
+        // warm is the first source, so the reorder-installing mat-vecs run before the triple
+        ggml_tensor * out = ggml_add(ctx, ggml_repeat(ctx, warm, glu), glu);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_GET_ROWS_BACK
 struct test_get_rows_back : public test_case {
     const ggml_type type;
@@ -13152,6 +13203,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // above.
     for (int n : { 1, 5 }) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 5120, n, 5120, {2, 1}, {1, 1}));
+    }
+    // the production FFN triple (gate 17408x5120): mixed q4_K/q5_K at one column, solo verify (5),
+    // the widest mat-vec epilogue width (8) and the paired verify (10); same-type pairs at the
+    // paired verify and a full XMX GLU tile (16). GGML_SYCL_FUSE_GLU=16 lets the same-type
+    // triples reach the fused gate+up dispatch above one column.
+    for (int n : { 1, 5, 8, 10 }) {
+        test_cases.emplace_back(new test_mul_mat_glu_mixed(GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, 17408, n, 5120));
+    }
+    for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
+        for (int n : { 10, 16 }) {
+            test_cases.emplace_back(new test_mul_mat_glu_mixed(t, t, 17408, n, 5120));
+        }
     }
     // The paired MTP verify: two slots x (n_max 4 + 1) = 10 columns, plus the other
     // widths above MMVQ_MAX_BATCH_SIZE that the chunked / wide / XMX mat-vec paths serve.

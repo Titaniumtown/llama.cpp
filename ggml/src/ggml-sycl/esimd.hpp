@@ -351,6 +351,14 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q2_K> {
             acc_b += y_s * deq_b;
         }
     }
+    // Single-block MAC: mac_pair with b disabled; pb is never dereferenced when has_b is false
+    static ESIMD_INLINE void mac(const ptrs & pa, size_t bia,
+            sycl::ext::intel::esimd::simd<float, 256> & y_vec,
+            sycl::ext::intel::esimd::simd<float, 32> & acc) {
+        ptrs           pb{};
+        sycl::ext::intel::esimd::simd<float, 32> acc_b = 0.0f;
+        mac_pair(pa, bia, pb, 0, false, y_vec, acc, acc_b);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -480,6 +488,14 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q3_K> {
             acc_b += y_s * deq_b;
         }
     }
+    // Single-block MAC: mac_pair with b disabled; pb is never dereferenced when has_b is false
+    static ESIMD_INLINE void mac(const ptrs & pa, size_t bia,
+            sycl::ext::intel::esimd::simd<float, 256> & y_vec,
+            sycl::ext::intel::esimd::simd<float, 32> & acc) {
+        ptrs           pb{};
+        sycl::ext::intel::esimd::simd<float, 32> acc_b = 0.0f;
+        mac_pair(pa, bia, pb, 0, false, y_vec, acc, acc_b);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -564,6 +580,14 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q4_K> {
             acc_a += y_hi * deq_a_hi;
             acc_b += y_hi * deq_b_hi;
         }
+    }
+    // Single-block MAC: mac_pair with b disabled; pb is never dereferenced when has_b is false
+    static ESIMD_INLINE void mac(const ptrs & pa, size_t bia,
+            sycl::ext::intel::esimd::simd<float, 256> & y_vec,
+            sycl::ext::intel::esimd::simd<float, 32> & acc) {
+        ptrs           pb{};
+        sycl::ext::intel::esimd::simd<float, 32> acc_b = 0.0f;
+        mac_pair(pa, bia, pb, 0, false, y_vec, acc, acc_b);
     }
 };
 
@@ -687,6 +711,14 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q5_K> {
             acc_b += y_hi * deq_b_hi;
         }
     }
+    // Single-block MAC: mac_pair with b disabled; pb is never dereferenced when has_b is false
+    static ESIMD_INLINE void mac(const ptrs & pa, size_t bia,
+            sycl::ext::intel::esimd::simd<float, 256> & y_vec,
+            sycl::ext::intel::esimd::simd<float, 32> & acc) {
+        ptrs           pb{};
+        sycl::ext::intel::esimd::simd<float, 32> acc_b = 0.0f;
+        mac_pair(pa, bia, pb, 0, false, y_vec, acc, acc_b);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -786,6 +818,14 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q6_K> {
                 acc_b += y_g * deq_b;
             }
         }
+    }
+    // Single-block MAC: mac_pair with b disabled; pb is never dereferenced when has_b is false
+    static ESIMD_INLINE void mac(const ptrs & pa, size_t bia,
+            sycl::ext::intel::esimd::simd<float, 256> & y_vec,
+            sycl::ext::intel::esimd::simd<float, 32> & acc) {
+        ptrs           pb{};
+        sycl::ext::intel::esimd::simd<float, 32> acc_b = 0.0f;
+        mac_pair(pa, bia, pb, 0, false, y_vec, acc, acc_b);
     }
 };
 

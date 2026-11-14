@@ -1120,6 +1120,112 @@ void launch_fattn(
             }
         }
 
+        // Single-token decode is latency-bound on the long KV walk; the wave-fill heuristic
+        // under-provisions KV-split. Split into two nthreads-chunks per block (half the useful max).
+        // The test is on ncols1, not ncols1*ncols2: one token per tile is what makes this
+        // latency-bound, and how many heads are packed alongside it does not change that.
+        // ncols2 is 6 on this model, so testing the product disabled this entirely.
+        // Production decodes several columns per step -- an MTP verify step is n-max+1
+        // wide and, with a unified KV cache, arrives as one tile of that many tokens.
+        // The latency argument does not stop applying at two columns, so the gate is the
+        // largest ncols1 still latency-bound rather than a hard equality. Default 1 keeps
+        // the previous behaviour exactly; GGML_SYCL_FA_KV_SPLIT_MAX_NCOLS raises it.
+        //
+        // That "does not stop applying" was an assertion. Measured by setting the knob to
+        // 1, which disables the raise for ncols1 == 4 while leaving single-token decode
+        // untouched -- pp4 t/s, two interleaved rounds:
+        //
+        //                    8 (default)      4               1 (raise off)
+        //   pp4 d16384     93.72 / 93.62   93.55 / 93.43   91.92 / 91.85   -1.9%
+        //   pp4 d98304     61.18 / 60.29   60.75 / 60.52   52.27 / 51.45   -14.6%
+        //
+        // So the verify shape wants the raise as much as decode does, and wants it more as
+        // the cache grows. 4 and 8 tie because ncols1 is 4, so any gate >= 4 is the same
+        // configuration. tg64 at d98304 is 20.58 vs 20.63 across those arms, i.e. the
+        // ncols1 == 1 path is untouched, as the gate requires.
+        static const int kv_split_max_ncols = ggml_sycl_get_env("GGML_SYCL_FA_KV_SPLIT_MAX_NCOLS", 8);
+        if (ncols1 <= kv_split_max_ncols) {
+            // Raise only. On a short cache this formula asks for fewer blocks than the
+            // wave-fill loop already chose, and taking it verbatim throws away parallelism
+            // the machine has room for -- measurably so at depth 0.
+            // 2*nwarps*warp_size per block was "half the useful max", asserted and
+            // never measured. It is load-bearing -- deleting the raise costs 20.8%
+            // at d65536 -- so it is worth being able to sweep rather than re-assert.
+            // Swept once at C=2's introduction: C=1 won 1.68% at d8192, C=2 won
+            // 1.04% at d65536, tied at d32768, so 2 was kept as the best single
+            // constant. That trade was rewritten by the tile-loader work: with the
+            // whole-cache f16 prepass gone, the deep end no longer has a
+            // second DRAM pass for the coarser split to hide, and C=2's only win
+            // went with it. Re-swept on that kernel, interleaved, two rounds:
+            //
+            //                    C=1              C=2
+            //   tg128 d8192   27.44 / 27.40    26.76 / 26.76   +2.4%
+            //   tg128 d16384  26.56 / 26.54    26.43 / 26.47   +0.4%
+            //   tg128 d32768  25.10 / 25.04    24.85 / 24.85   +0.9%
+            //   tg128 d65536  22.58 / 22.56    22.57 / 22.55    tie
+            //   pp4   d16384  93.30 / 93.31    93.79 / 93.91   -0.6%
+            //   pp4   d65536  75.55 / 75.32    73.34 / 73.32   +3.0%
+            //
+            // pp4 is the MTP-verify shape (n-max+1 query columns against a warm
+            // cache), tg128 the draft steps and plain decode. C=1 wins five of the
+            // six points and its one loss is the smallest number in the table.
+            // Note the direction: chunk is a divisor, so C=1 asks for *twice* the
+            // parallel blocks of C=2 -- this is more oversubscription, not less,
+            // which is why C=4/8/16 fall off monotonically (22.20 / 21.38 / 18.48
+            // at d65536) and why 1 is the floor of the useful range rather than a
+            // midpoint.
+            //
+            // Do NOT try to cap this at one wave. blocks_per_wave/ntiles_total is
+            // what the wave-fill loop above already converges to, so that cap makes
+            // the whole raise inert -- measured at d65536 as 18.95 t/s, the exact
+            // value of removing the raise, against 22.82 here. The raise works by
+            // deliberately OVERSUBSCRIBING the machine to hide DRAM latency on the
+            // long KV walk, not by filling it.
+            // The sweep above stops at d65536 -- which is precisely where the two
+            // values tie -- so it could not see that the trade keeps moving. Extended
+            // by two more depths, interleaved, two rounds:
+            //
+            //                    C=1              C=2
+            //   tg64 d8192    27.43 / 27.38    26.81 / 26.73   C=1 +2.3%
+            //   tg64 d32768   25.07 / 25.10    24.92 / 24.89   C=1 +0.7%
+            //   tg64 d65536   22.58 / 22.56    22.59 / 22.57   tie
+            //   tg64 d98304   20.41 / 20.42    20.60 / 20.60   C=2 +0.9%
+            //
+            // Monotone in KV length, crossing at the tie -- but only for ONE query
+            // column. The MTP-verify shape disagrees, and sharply:
+            //
+            //                    C=1              C=2
+            //   pp4  d65536    75.62 / 75.42    72.69 / 72.05   C=1 +3.0%
+            //   pp4  d98304    63.02 / 63.68    60.20 / 60.84   C=1 +3.4%
+            //
+            // So the optimum is a function of the query width, not of depth alone, and
+            // a depth-only rule is net NEGATIVE in production: a cycle is three
+            // one-column draft passes plus one four-column verify, so +0.9% on three
+            // and -3.4% on one loses. The raise is gated on ncols1 == 1 for that
+            // reason -- every wider shape keeps the shipped C=1 bit-for-bit.
+            //
+            // Why the direction reverses with both width and depth: chunk is a divisor,
+            // so C=1 requests twice the parallel blocks. That oversubscription hides
+            // DRAM latency on the KV walk, and it pays while the walk is short enough
+            // for the blocks to stall on it. Four query columns already have 4x the work
+            // in flight per block, and a long-enough walk saturates latency on its own;
+            // in both cases the extra blocks stop hiding anything and only add
+            // FA-COMBINE reduction work over more partials.
+            //
+            // Only the env read is static: nwarps is a runtime argument, so caching
+            // the product would pin the first caller's geometry onto every later one.
+            // 0 (the default) selects by depth; any positive value forces that constant,
+            // which keeps a same-binary A/B and an escape hatch.
+            static const int kv_split_chunks_env =
+                ggml_sycl_get_env("GGML_SYCL_FA_KV_SPLIT_CHUNKS", 0);
+            const int kv_split_chunks = kv_split_chunks_env > 0
+                                            ? kv_split_chunks_env
+                                            : ((ncols1 == 1 && K->ne[1] > 65536) ? 2 : 1);
+            const int chunk = kv_split_chunks*nwarps*warp_size;
+            const int kv_split = std::min(ntiles_KQ, (int) ((K->ne[1] + chunk - 1) / chunk));
+            parallel_blocks = std::max(parallel_blocks, kv_split);
+        }
+
         blocks_num.x = ntiles_x;
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];

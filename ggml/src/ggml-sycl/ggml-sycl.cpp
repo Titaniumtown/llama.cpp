@@ -95,6 +95,7 @@
 #include "ggml-sycl/fill.hpp"
 #include "ggml-sycl/cumsum.hpp"
 #include "ggml-sycl/diag.hpp"
+#include "ggml-sycl/dmmv.hpp"
 #include "ggml-sycl/opt-step.hpp"
 #include "ggml-sycl/solve_tri.hpp"
 #include "ggml-sycl/gated_delta_net.hpp"
@@ -654,6 +655,15 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_ESIMD: %d\n", g_ggml_sycl_enable_esimd);
 #else
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_ESIMD: %d disabled by compile flag\n", g_ggml_sycl_enable_esimd);
+#endif
+        // The reordered-ESIMD DMMV work-group width, reported here rather than only at
+        // the first ESIMD launch: with GGML_SYCL_ENABLE_ESIMD=0, a non-K-quant model, or
+        // any run that never reaches decode, the launch-time line never prints, and a
+        // sweep arm that silently did nothing would have no line to read.
+#ifdef GGML_SYCL_DMMV_HAS_ESIMD
+        ggml_sycl_dmmv_esimd_wg_size_report();
+#else
+        GGML_LOG_INFO("  GGML_SYCL_DMMV_ESIMD_WG_SIZE: ESIMD DMMV disabled by compile flag\n");
 #endif
 
         GGML_LOG_INFO("  GGML_SYCL_MMVQ_WIDE: %d\n", g_ggml_sycl_mmvq_wide);

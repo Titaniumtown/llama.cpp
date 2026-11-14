@@ -1,6 +1,10 @@
 #ifndef GGML_SYCL_ESIMD_HPP
 #define GGML_SYCL_ESIMD_HPP
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
@@ -12,7 +16,203 @@
 
 namespace ggml_sycl_esimd {
 
-constexpr int GGML_SYCL_DMMV_ESIMD_WG_SIZE = 4;
+// Work-group width of the reordered ESIMD dequantize-matvec, in work-items. The
+// kernel is [[intel::sycl_explicit_simd]], so every work-item occupies a whole
+// ESIMD vector and a work-group of WG work-items spans WG * (kernel SIMD width)
+// hardware threads. dmmv.cpp owns the launch and the epilogue.
+//
+// Upstream shipped this as a bare `constexpr int` under a name that reads exactly like
+// an environment variable. It is not one: nothing anywhere read the environment, so
+// GGML_SYCL_DMMV_ESIMD_WG_SIZE=<n> in the environment has always been a silent no-op and
+// a tuner who swept it was measuring a constant. The name is now the knob and the
+// constant is the default, so each concept has exactly one spelling.
+static constexpr int DMMV_ESIMD_WG_SIZE_DEFAULT = 4;
+
+// SIMD width divisor used to turn the device's thread-count work-group limit into a
+// work-item limit.
+//
+// WHAT IT IS, AND HOW IT WAS DETERMINED. It is the width of the widest ESIMD vector
+// the kernel body touches: simd<float, 256>, produced by block_load<float, 256> on the
+// activation slice and taken by reference as the y_vec parameter of all five
+// esimd_reorder_q_traits<T>::mac_pair. Those are the only 256-lane objects in the
+// kernel; every accumulator in it is 32 wide. That this is the factor by which the
+// emitted kernel multiplies work-items into hardware threads is the
+// [[intel::sycl_explicit_simd]] contract: absent a `-fsycl-target-simd` override the
+// kernel's SIMD width comes from the widest vector it uses. Verified in this tree that
+// there is no override -- a grep of the whole checkout for reqd_simd_size,
+// esimd_vector_size, fsycl-target-simd, esimd-width and simd_factor returns nothing,
+// and ggml/src/ggml-sycl/CMakeLists.txt passes only -fsycl, -fsycl-targets=spir64_gen
+// and the max-parallel-link-jobs flag.
+//
+// WHAT IS NOT PROVEN, AND WHAT IT COSTS. The competing reading is that ESIMD's own
+// target SIMD factor -- 32, i.e. 32 x 32-bit registers per thread, which is the
+// 1024-bit vector simd<float, 256> is built from -- is what one work-item occupies,
+// giving 32 threads per work-item and therefore 4*32 = 128 threads at the shipped
+// default rather than 4*256 = 1024. Separating the two needs `reqd_simd_size` read out
+// of the emitted kernel (icpx dump-module), which has not been done here, so this
+// constant is the conservative one: the larger divisor, hence the smaller ceiling.
+// Consequence on this campaign's device, stated plainly rather than buried: a
+// 1024-thread max_work_group_size divided by 256 is 4, so the cap lands on the shipped
+// default and the upper ladder arms {8, 16, 32} all resolve to 4. What the knob buys
+// today is a measurable sweep of 1..4 downward, and an upper bound that is derived from
+// the device instead of asserted. If the 32-thread reading is confirmed, one constant
+// here changes and the whole {1,2,4,8,16,32} ladder comes back; until then a cap that is
+// too small costs sweep arms, and a cap that is too large costs a std::exit(1) on the
+// first decode token, mid-benchmark, with no fallback.
+static constexpr int DMMV_ESIMD_SIMD_FACTOR = 256;
+
+// Sweep domain. Lower bound 1: a zero-size work-group range and a zero-length
+// local_accessor are both illegal and the launch would throw mid-benchmark, and a
+// rejected launch is fatal in this tree -- ggml_sycl_op_mul_mat's function-try-block
+// prints the exception and calls std::exit(1). A knob that can abort a run is worse
+// than no knob. Upper bound 32: bounds lmem at WG*2 = 256 B, and the lane-0 epilogue
+// reduction in dmmv.cpp is a strictly serial scalar loop of WG iterations sitting
+// between the barrier and the dst store, so WG is not free to grow. This constant is
+// only the ceiling on the knob; the binding limit is the device cap below, which is
+// derived from the device instead of asserted -- add-id.cpp, norm.cpp, softmax.cpp,
+// topk-radix.cpp and ggml-sycl.cpp all size work-groups from the cached
+// ggml_sycl_info().max_work_group_sizes.
+static constexpr int DMMV_ESIMD_WG_SIZE_MIN = 1;
+static constexpr int DMMV_ESIMD_WG_SIZE_MAX = 32;
+
+// What the resolver decided, and why: the reports below print the reasoning, not just
+// the number.
+struct dmmv_esimd_wg_size_t {
+    int  wg;                 // resolved width, handed to the launcher
+    int  requested;          // width after the [MIN, MAX] clamps, before the device cap
+    int  cap;                // device cap that was applied, in [MIN, MAX]
+    int  mwgs;               // max_work_group_size for this device, 0 if unknown
+    bool from_env;           // the environment string parsed to a value
+    bool capped;             // an environment value was rewritten down to the cap
+    bool default_above_cap;  // the default exceeds the cap and was deliberately NOT capped
+};
+
+// Pure resolution. No logging, no caching: the startup report and the first-launch
+// report both call this, and the startup report must not consume the first-launch one.
+static inline dmmv_esimd_wg_size_t dmmv_esimd_wg_size_compute(int device) {
+    // Parse in the UNSIGNED domain and clamp there, then cast once. The reader cannot
+    // be ggml_sycl_get_env: that does `sscanf(str, " %u", &n)` into an unsigned and
+    // returns `(int)n` (common.cpp), so a leading sign is accepted with strtoul
+    // semantics ("-4" -> -4) and anything at or above 2^31 comes back negative --
+    // "2147483648" -> -2147483648, "4294967295" -> -1 -- which a signed clamp would then
+    // pin to the MIN bound instead of the MAX bound this header documents. Here the
+    // only (int) cast is applied after both clamps.
+    //
+    // It is the CLAMP, not the parser, that bounds the domain: %u under strtoul
+    // semantics accepts a sign and wraps mod 2^32, so "4294967296" arrives here as 0
+    // and "9999999999" as 1410065407. Do not read the lower clamp below as redundant
+    // because the reader "only produces non-negative values" -- it does not, and
+    // deleting the lower clamp is exactly the bug this comment exists to prevent.
+    //
+    // from_env is recorded because the device cap is applied ONLY to a value the
+    // environment supplied. See dmmv_esimd_wg_size_report for why.
+    unsigned n = (unsigned) DMMV_ESIMD_WG_SIZE_DEFAULT;
+    const char * s = std::getenv("GGML_SYCL_DMMV_ESIMD_WG_SIZE");
+    dmmv_esimd_wg_size_t r;
+    r.from_env = (s != nullptr && std::sscanf(s, " %u", &n) == 1);
+    if (!r.from_env) {
+        n = (unsigned) DMMV_ESIMD_WG_SIZE_DEFAULT;
+    }
+    int wg = n > (unsigned) DMMV_ESIMD_WG_SIZE_MAX ? DMMV_ESIMD_WG_SIZE_MAX : (int) n;
+    if (wg < DMMV_ESIMD_WG_SIZE_MIN) {
+        wg = DMMV_ESIMD_WG_SIZE_MIN;
+    }
+    const int requested = wg;
+
+    // Device cap, from the cached query this backend populates at init. Falls back to
+    // the static ceiling if the device index is out of range rather than trusting an
+    // uninitialised array slot. Every in-range index is populated by that query.
+    int cap = DMMV_ESIMD_WG_SIZE_MAX;
+    r.mwgs = 0;
+    if (device >= 0 && device < GGML_SYCL_MAX_DEVICES &&
+        device < ggml_sycl_info().device_count) {
+        r.mwgs = ggml_sycl_info().max_work_group_sizes[device];
+        cap = r.mwgs / DMMV_ESIMD_SIMD_FACTOR;
+    }
+    if (cap < DMMV_ESIMD_WG_SIZE_MIN) {
+        cap = DMMV_ESIMD_WG_SIZE_MIN;
+    } else if (cap > DMMV_ESIMD_WG_SIZE_MAX) {
+        cap = DMMV_ESIMD_WG_SIZE_MAX;
+    }
+
+    r.cap = cap;
+    r.capped = false;
+    r.default_above_cap = !r.from_env && requested > cap;
+    if (r.from_env && requested > cap) {
+        wg = cap;
+        r.capped = true;
+    }
+    // Note the deliberate absence of the other branch. When the value came from the
+    // environment it is capped; when it did not, it is passed through unchanged.
+    r.requested = requested;
+    r.wg = wg;
+    return r;
+}
+
+// Why the cap is applied to an opted-in value and not to the shipped default.
+//
+// The cap exists to keep a width the DEVICE WILL REJECT out of the domain a user can
+// ask for. The shipped default was never at risk in that sense: it shipped uncapped
+// upstream, so if a 4-wide group could not launch on this device the pre-patch tree
+// would already have died on the first decode token. Capping the default would not
+// prevent that -- it would rewrite a constant after the fact, and it would make the
+// value this patch calls "the shipped geometry" depend on which GPU is in the box. So
+// the default is passed through unchanged, the cap applies only to a value the
+// environment supplied, and the one case where the difference is visible -- a device
+// whose max_work_group_size / DMMV_ESIMD_SIMD_FACTOR is below 4, i.e. 512 threads or
+// fewer -- is reported with a GGML_LOG_WARN rather than silently.
+static inline void dmmv_esimd_wg_size_report(int device, const dmmv_esimd_wg_size_t & r) {
+    if (r.default_above_cap) {
+        GGML_LOG_WARN("  GGML_SYCL_DMMV_ESIMD_WG_SIZE: %d (shipped default, left uncapped)\n", r.wg);
+        GGML_LOG_WARN("  device %d: max_work_group_size %d / %d = cap %d is below the shipped default of %d; the cap "
+                      "applies only to a value the environment supplies, so a defaulted run keeps the upstream geometry "
+                      "and a launch this device rejects is the pre-existing upstream behaviour. Set "
+                      "GGML_SYCL_DMMV_ESIMD_WG_SIZE=1..%d to run under the cap.\n",
+                      device, r.mwgs, DMMV_ESIMD_SIMD_FACTOR, r.cap, DMMV_ESIMD_WG_SIZE_DEFAULT, r.cap);
+    } else if (r.capped) {
+        GGML_LOG_WARN("  GGML_SYCL_DMMV_ESIMD_WG_SIZE: %d requested, capped to %d (max_work_group_size %d / %d)\n",
+                      r.requested, r.wg, r.mwgs, DMMV_ESIMD_SIMD_FACTOR);
+    }
+}
+
+// Per-launch entry point. Called once per ESIMD DMMV launch from the single
+// dmmv_esimd_submit<T> body in dmmv.cpp, so a getenv per launch is the worst case and
+// after the first call on a device this is an atomic load and nothing else. The
+// default argument is the thread-local current device, which ggml_sycl_op_mul_mat has
+// already set with ggml_sycl_set_device(ctx.device) before dispatch; the startup
+// report passes the index explicitly because no launch has selected a device yet.
+static inline int dmmv_esimd_wg_size(int device = ggml_sycl_get_device()) {
+    // 0 means "not resolved for this device yet"; every resolved value is >= MIN >= 1,
+    // so the sentinel cannot collide. Per device, not global, because the cap is a
+    // per-device property.
+    //
+    // atomic, not plain int: two threads can make this the first call on the same
+    // device, and with a plain array BOTH take the "not yet resolved" branch, which is
+    // harmless for the value (it is idempotent -- same device, same string, same
+    // answer) but prints the first-launch line twice. The compare_exchange makes the
+    // loser discard its own resolution and take the winner's, so the line is printed
+    // exactly once. Relaxed is enough: the only writer publishes a value every reader
+    // would have computed identically, so there is no data to order -- a reader that
+    // loses the exchange re-reads the winner's store, and a reader that raced the
+    // store entirely simply recomputes and finds the exchange already taken.
+    static std::atomic<int> cache[GGML_SYCL_MAX_DEVICES] = {};
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return DMMV_ESIMD_WG_SIZE_DEFAULT;
+    }
+    const int cached = cache[device].load(std::memory_order_relaxed);
+    if (cached != 0) {
+        return cached;
+    }
+    const dmmv_esimd_wg_size_t r = dmmv_esimd_wg_size_compute(device);
+    int expected = 0;
+    if (cache[device].compare_exchange_strong(expected, r.wg, std::memory_order_relaxed,
+                                             std::memory_order_relaxed)) {
+        dmmv_esimd_wg_size_report(device, r);
+        GGML_LOG_INFO("  GGML_SYCL_DMMV_ESIMD_WG_SIZE: %d (device %d, resolved on first ESIMD DMMV launch)\n",
+                      r.wg, device);
+    }
+    return cache[device].load(std::memory_order_relaxed);
+}
 
 //
 // Shared ESIMD building blocks for the reordered K-quant dequantize-matvec

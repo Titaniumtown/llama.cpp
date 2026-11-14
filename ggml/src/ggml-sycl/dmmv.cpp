@@ -8,6 +8,7 @@
         #include <sycl/ext/oneapi/bfloat16.hpp>
         #define GGML_SYCL_DMMV_HAS_BF16
     #endif
+    // GGML_SYCL_DMMV_HAS_ESIMD is defined in dmmv.hpp, so ggml-sycl.cpp agrees with us
     #include <sycl/ext/intel/esimd.hpp>
     #include "esimd.hpp"
 #endif
@@ -1548,7 +1549,8 @@ static void launch_dequantize_mul_mat_vec_k(const void *vx, const float *y, floa
 }
 
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
-using ggml_sycl_esimd::GGML_SYCL_DMMV_ESIMD_WG_SIZE;
+using ggml_sycl_esimd::dmmv_esimd_wg_size;
+using ggml_sycl_esimd::DMMV_ESIMD_WG_SIZE_DEFAULT;
 
 // policies for dequantize_mul_mat_vec_reorder_esimd: row mapping and what to do with the two sums
 // plain mat-vec: a work-group owns two consecutive rows of one matrix
@@ -1608,14 +1610,31 @@ struct esimd_dmmv_glu_policy {
 
 // generic reordered dequantize-matvec: each work-group owns a pair of rows chosen by the policy
 // and updates one 32-wide accumulator per row
-template <ggml_type T, typename Policy>
+//
+// WG_SIZE_STATIC is the work-group width as a template argument, or 0 to take it from the
+// wg_size argument instead. The launcher instantiates the default width as a constant so
+// the block-loop stride and the lane-0 epilogue keep the compile-time trip count and
+// constant lmem indices; only a non-default width pays for a dynamic bound. The two shapes
+// are numerically identical -- the epilogue's f32 addition order is p = 0..WG-1 either way
+// -- so this is a codegen restoration, not a behaviour change.
+//
+// WHAT IT COSTS: this is two instantiations per type and policy, not one. The row-pair
+// family over Q2_K..Q6_K emits ten device kernels, and the GLU family over the same five
+// types emits ten more. On the device this campaign runs on the cap equals the shipped
+// default, so the dynamic instantiation is reachable only at widths 1..3 and ten of the
+// twenty are dead weight in production. That is the price of the default path keeping its
+// constant trip count, paid knowingly.
+template <ggml_type T, typename Policy, int WG_SIZE_STATIC>
 ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd(
         const Policy & policy, const float * y,
         const int ncols, const int nrows,
         sycl::local_accessor<float, 1> lmem,
-        const sycl::nd_item<1> & it) {
+        const sycl::nd_item<1> & it,
+        const int wg_size) {
     using namespace sycl::ext::intel::esimd;
     using traits = ggml_sycl_esimd::esimd_reorder_q_traits<T>;
+
+    const int wg = WG_SIZE_STATIC > 0 ? WG_SIZE_STATIC : wg_size;
 
     const int    num_blocks_per_row = ncols / QK_K;
     const size_t nb = (size_t) nrows * num_blocks_per_row;
@@ -1632,7 +1651,7 @@ ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd(
     simd<float, 32> acc_a = 0.0f;
     simd<float, 32> acc_b = 0.0f;
 
-    for (int ib = tid; ib < num_blocks_per_row; ib += GGML_SYCL_DMMV_ESIMD_WG_SIZE) {
+    for (int ib = tid; ib < num_blocks_per_row; ib += wg) {
         simd<float, 256> y_vec = block_load<float, 256>(y + (size_t) ib * QK_K);
 
         const size_t bi_a = (size_t) row_a * num_blocks_per_row + ib;
@@ -1648,7 +1667,7 @@ ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd(
     if (tid == 0) {
         float sum_a = 0.0f;
         float sum_b = 0.0f;
-        for (int p = 0; p < GGML_SYCL_DMMV_ESIMD_WG_SIZE; ++p) {
+        for (int p = 0; p < wg; ++p) {
             sum_a += lmem[p * 2 + 0];
             sum_b += lmem[p * 2 + 1];
         }
@@ -1657,21 +1676,44 @@ ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd(
     }
 }
 
+// one launch shape for all the K-quant ESIMD types, and the ONLY caller of
+// dmmv_esimd_wg_size() -- the type wrappers below forward to it. The branch on
+// wg_size is on the host, outside the command group, so exactly one kernel is enqueued
+// either way and the default width reaches the kernel as a template argument rather
+// than as a run-time bound.
+template <ggml_type T, typename Policy>
+static void dmmv_esimd_submit(const Policy & policy, const float * y,
+                              const int ncols, const int nrows, const int workgroups,
+                              const int wg_size, dpct::queue_ptr stream) {
+    const sycl::range<1>    lmem_size(wg_size * 2);
+    const sycl::nd_range<1> ndr(sycl::range<1>((size_t) workgroups * wg_size),
+                                sycl::range<1>(wg_size));
+    if (wg_size == DMMV_ESIMD_WG_SIZE_DEFAULT) {
+        stream->submit([&](sycl::handler &h) {
+            sycl::local_accessor<float, 1> lmem(lmem_size, h);
+            h.parallel_for(ndr, [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+                dequantize_mul_mat_vec_reorder_esimd<T, Policy, DMMV_ESIMD_WG_SIZE_DEFAULT>(
+                    policy, y, ncols, nrows, lmem, it, wg_size);
+            });
+        });
+    } else {
+        stream->submit([&](sycl::handler &h) {
+            sycl::local_accessor<float, 1> lmem(lmem_size, h);
+            h.parallel_for(ndr, [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+                dequantize_mul_mat_vec_reorder_esimd<T, Policy, 0>(
+                    policy, y, ncols, nrows, lmem, it, wg_size);
+            });
+        });
+    }
+}
+
 static void dequantize_mul_mat_vec_q2_K_sycl_reorder_esimd(const void *vx, const float *y,
                                                            float *dst, const int ncols,
                                                            const int nrows,
                                                            dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
-    const int workgroups = (nrows + 1) / 2;
-    stream->submit([&](sycl::handler &h) {
-        sycl::local_accessor<float, 1> lmem(sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE * 2), h);
-        h.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * GGML_SYCL_DMMV_ESIMD_WG_SIZE), sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE)),
-            [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                dequantize_mul_mat_vec_reorder_esimd<GGML_TYPE_Q2_K>(
-                    esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows, lmem, it);
-            });
-    });
+    dmmv_esimd_submit<GGML_TYPE_Q2_K>(esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows,
+                                     (nrows + 1) / 2, dmmv_esimd_wg_size(), stream);
 }
 
 static void dequantize_mul_mat_vec_q3_K_sycl_reorder_esimd(const void *vx, const float *y,
@@ -1679,16 +1721,8 @@ static void dequantize_mul_mat_vec_q3_K_sycl_reorder_esimd(const void *vx, const
                                                            const int nrows,
                                                            dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
-    const int workgroups = (nrows + 1) / 2;
-    stream->submit([&](sycl::handler &h) {
-        sycl::local_accessor<float, 1> lmem(sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE * 2), h);
-        h.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * GGML_SYCL_DMMV_ESIMD_WG_SIZE), sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE)),
-            [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                dequantize_mul_mat_vec_reorder_esimd<GGML_TYPE_Q3_K>(
-                    esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows, lmem, it);
-            });
-    });
+    dmmv_esimd_submit<GGML_TYPE_Q3_K>(esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows,
+                                     (nrows + 1) / 2, dmmv_esimd_wg_size(), stream);
 }
 
 static void dequantize_mul_mat_vec_q4_K_sycl_reorder_esimd(const void *vx, const float *y,
@@ -1696,16 +1730,8 @@ static void dequantize_mul_mat_vec_q4_K_sycl_reorder_esimd(const void *vx, const
                                                            const int nrows,
                                                            dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
-    const int workgroups = (nrows + 1) / 2;
-    stream->submit([&](sycl::handler &h) {
-        sycl::local_accessor<float, 1> lmem(sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE * 2), h);
-        h.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * GGML_SYCL_DMMV_ESIMD_WG_SIZE), sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE)),
-            [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                dequantize_mul_mat_vec_reorder_esimd<GGML_TYPE_Q4_K>(
-                    esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows, lmem, it);
-            });
-    });
+    dmmv_esimd_submit<GGML_TYPE_Q4_K>(esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows,
+                                     (nrows + 1) / 2, dmmv_esimd_wg_size(), stream);
 }
 
 static void dequantize_mul_mat_vec_q5_K_sycl_reorder_esimd(const void *vx, const float *y,
@@ -1713,16 +1739,8 @@ static void dequantize_mul_mat_vec_q5_K_sycl_reorder_esimd(const void *vx, const
                                                            const int nrows,
                                                            dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
-    const int workgroups = (nrows + 1) / 2;
-    stream->submit([&](sycl::handler &h) {
-        sycl::local_accessor<float, 1> lmem(sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE * 2), h);
-        h.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * GGML_SYCL_DMMV_ESIMD_WG_SIZE), sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE)),
-            [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                dequantize_mul_mat_vec_reorder_esimd<GGML_TYPE_Q5_K>(
-                    esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows, lmem, it);
-            });
-    });
+    dmmv_esimd_submit<GGML_TYPE_Q5_K>(esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows,
+                                     (nrows + 1) / 2, dmmv_esimd_wg_size(), stream);
 }
 
 static void dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd(const void *vx, const float *y,
@@ -1730,16 +1748,27 @@ static void dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd(const void *vx, const
                                                            const int nrows,
                                                            dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
-    const int workgroups = (nrows + 1) / 2;
-    stream->submit([&](sycl::handler &h) {
-        sycl::local_accessor<float, 1> lmem(sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE * 2), h);
-        h.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * GGML_SYCL_DMMV_ESIMD_WG_SIZE), sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE)),
-            [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                dequantize_mul_mat_vec_reorder_esimd<GGML_TYPE_Q6_K>(
-                    esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows, lmem, it);
-            });
-    });
+    dmmv_esimd_submit<GGML_TYPE_Q6_K>(esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows,
+                                     (nrows + 1) / 2, dmmv_esimd_wg_size(), stream);
+}
+
+// Startup report, called from ggml_check_sycl()'s "Running with Environment Variables:"
+// block so a run that never reaches an ESIMD K-quant DMMV launch still says what the
+// knob resolved to. Deliberately does NOT go through dmmv_esimd_wg_size(): the startup
+// block must not consume the per-device first-launch resolution, or the line that names
+// the device a launch actually ran on would never print. So this recomputes per device
+// and prints only the number -- any warning about a cap belongs to the launch, which is
+// where the cap takes effect.
+void ggml_sycl_dmmv_esimd_wg_size_report() {
+    const int ndev = ggml_sycl_info().device_count > 0 ? ggml_sycl_info().device_count : 1;
+    for (int i = 0; i < ndev; ++i) {
+        const ggml_sycl_esimd::dmmv_esimd_wg_size_t r = ggml_sycl_esimd::dmmv_esimd_wg_size_compute(i);
+        if (i == 0) {
+            GGML_LOG_INFO("  GGML_SYCL_DMMV_ESIMD_WG_SIZE: %d\n", r.wg);
+        } else {
+            GGML_LOG_INFO("  GGML_SYCL_DMMV_ESIMD_WG_SIZE[dev %d]: %d\n", i, r.wg);
+        }
+    }
 }
 
 // Q8_0 SOA reorder layout: [qs: nb*QK8_0] [d: nb*sizeof(half)].
@@ -1885,16 +1914,9 @@ static void dequantize_mul_mat_vec_glu_reorder_esimd(const void * vx, const void
                                                      const ggml_glu_op glu_op,
                                                      dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
-    const int workgroups = nrows; // one output row (gate+up) per work-group
-    stream->submit([&](sycl::handler & h) {
-        sycl::local_accessor<float, 1> lmem(sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE * 2), h);
-        h.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>((size_t) workgroups * GGML_SYCL_DMMV_ESIMD_WG_SIZE), sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE)),
-            [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                dequantize_mul_mat_vec_reorder_esimd<T>(
-                    esimd_dmmv_glu_policy{ vgate, vx, dst, glu_op }, y, ncols, nrows, lmem, it);
-            });
-    });
+    // one output row (gate+up) per work-group
+    dmmv_esimd_submit<T>(esimd_dmmv_glu_policy{ vgate, vx, dst, glu_op }, y, ncols, nrows,
+                         nrows, dmmv_esimd_wg_size(), stream);
 }
 
 bool ggml_sycl_dequantize_mul_mat_vec_glu_reorder_esimd(enum ggml_type src0_type, enum ggml_glu_op glu_op,

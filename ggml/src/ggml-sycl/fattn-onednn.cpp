@@ -179,6 +179,18 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
     if (causal && !implicit_enable) {
         return false;
     }
+    // ne[3] is the stream count, so a batch of concurrent sequences declines here and the
+    // fused SDPA graph is skipped without a trace, which reads as a mystery kernel swap.
+    // The gate is a real limitation of the graph; report it once so it is not invisible.
+    if (Q->ne[3] != 1) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            GGML_LOG_INFO("%s: ne[3]=%d, the fused SDPA graph is single-sequence; "
+                          "falling back to the unfused kernel\n", __func__, (int) Q->ne[3]);
+        }
+        return false;
+    }
     if (mask && (mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1)) {
         return false;
     }

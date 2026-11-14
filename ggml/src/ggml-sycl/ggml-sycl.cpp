@@ -5571,19 +5571,29 @@ static bool ggml_sycl_mmvq_chunks(int device, const ggml_tensor * src0, const gg
            src1->ne[1] <= max_cols;
 }
 
-static bool should_reorder_tensor(ggml_backend_sycl_context& ctx, const ggml_tensor * dst) {
-    return g_ggml_sycl_enable_optimize && //allow optimize, controlled by $GGML_SYCL_ENABLE_OPT
-           ctx.opt_feature.reorder &&      //allow this device due to good perf, skip the devices with bad perf.
-           dst->op == GGML_OP_MUL_MAT &&   //limit to some supported cases of Q4_0, to do for more cases.
-           // the widths mul_mat_vec_q takes in one launch or as several also bootstrap the reorder
-           (dst->src[1]->ne[1] <= MMVQ_MAX_BATCH_SIZE ||
-            ggml_sycl_mmvq_chunks(ctx.device, dst->src[0], dst->src[1], dst)) &&
-           dst->src[1]->ne[2]==1 && dst->src[1]->ne[3]==1;
+static bool should_reorder_tensor(ggml_backend_sycl_context& ctx, const ggml_tensor * dst, mul_mat_algo mm_algorithm) {
+    if (!(g_ggml_sycl_enable_optimize && //allow optimize, controlled by $GGML_SYCL_ENABLE_OPT
+          ctx.opt_feature.reorder &&     //allow this device due to good perf, skip the devices with bad perf.
+          dst->op == GGML_OP_MUL_MAT &&  //limit to some supported cases of Q4_0, to do for more cases.
+          dst->src[1]->ne[2] == 1 && dst->src[1]->ne[3] == 1)) {
+        return false;
+    }
+    // The GEMM path reads reordered layouts through the wide dequant kernels, so its
+    // bootstrap may fire at any batch width. Without this a fresh server's FIRST
+    // prompt (no decode has run yet, and model swappers restart servers on every model
+    // swap) prefills through the AoS scalar dequant: iq4_xs at 123 GB/s vs 866
+    // reordered -- 12.9% of pp2048 wasted on a layout no later op wants.
+    if (mm_algorithm == mul_mat_algo::MUL_MAT_SYCL) {
+        return true;
+    }
+    // the widths mul_mat_vec_q takes in one launch or as several also bootstrap the reorder
+    return dst->src[1]->ne[1] <= MMVQ_MAX_BATCH_SIZE ||
+           ggml_sycl_mmvq_chunks(ctx.device, dst->src[0], dst->src[1], dst);
 }
 
 static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor * src0, const ggml_tensor * /* src1 */,
                             ggml_tensor * dst, mul_mat_algo mm_algorithm) {
-    if (!should_reorder_tensor(*ctx, dst)) {
+    if (!should_reorder_tensor(*ctx, dst, mm_algorithm)) {
         return;
     }
 
@@ -5931,7 +5941,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     // multi-token call (ne[1] > 1) will take the MMVQ path and it would read the
     // reordered bytes as if they were still the unreordered layout.
 
-    if (!g_ggml_sycl_prioritize_dmmv && ((should_reorder_tensor(ctx, dst) &&
+    if (!g_ggml_sycl_prioritize_dmmv && ((should_reorder_tensor(ctx, dst, mul_mat_algo::MMVQ) &&
                                           ggml_sycl_supports_reorder_mmvq(src0->type)))) {
         bool use = g_ggml_sycl_enable_esimd && ggml_sycl_supports_reorder_esimd(src0->type);
         // Arc770 get benefit with Q4_0 by skipping MMVQ path
@@ -6000,6 +6010,12 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         // prefill ubatch sizes they are real GEMMs and must keep falling through.
         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_f32);
     } else {
+        // Bootstrap the reorder here too: the GEMM dequant dispatch reads
+        // optimized_feature.reorder and takes the wide reordered kernels, so
+        // firing the one-time reorder on the first prefill call (instead of
+        // waiting for the first decode) moves a fresh server's first prompt
+        // off the scalar AoS dequant path.
+        opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MUL_MAT_SYCL);
         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl);
     }
 }

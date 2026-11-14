@@ -12,12 +12,16 @@
 
 #include <algorithm>
 #include <array>
+#include <map>
+#include <string>
 #include <assert.h>
 #include <atomic>
 #include <cctype>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
+#include <cstring>
 #include <cstdlib>
 #include <float.h>
 #include <limits>
@@ -3219,6 +3223,18 @@ catch (sycl::exception const &exc) {
 static constexpr int64_t SYCL_F32_DNNL_MIN_GEMM_FLOPS = 256 * 256 * 256;
 #endif
 
+// Charge the span since the previous mark to `name` in the GGML_SYCL_PROF table. Lets one
+// ggml node be split into its sub-submissions -- for a quantized matmul the weight dequant
+// pass and the GEMM are separate kernels, and only the split says which one to attack.
+// A no-op unless GGML_SYCL_PROF=1; defined next to the profiler further down.
+// non-static: fattn-common.hpp marks the FA K/V dequant, which is not a graph node.
+void ggml_sycl_prof_mark_sub(const char * name, uint64_t bytes);
+// The profiler class itself is declared far below this point; this is enough for a caller
+// here to skip work that only a profiled run would consume.
+bool ggml_sycl_prof_active();
+// `weight` only names the row; passing nullptr keeps the single aggregate row.
+void ggml_sycl_prof_mark_gap(const ggml_tensor * weight = nullptr);
+
 inline void ggml_sycl_op_mul_mat_sycl(
     ggml_backend_sycl_context & ctx,
     const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
@@ -3305,6 +3321,8 @@ inline void ggml_sycl_op_mul_mat_sycl(
             size_t ne = src1_ncols*ne10;
             src1_as_f16.alloc(ne);
             to_fp16_sycl(src1_ddf_i, src1_as_f16.get(), ne, stream);
+            ggml_sycl_prof_mark_sub("CONVERT/src1/f32->f16",
+                                    ne * (sizeof(float) + sizeof(sycl::half)));
         }
         const sycl::half *src1_ptr = src1->type == GGML_TYPE_F16
                 ? (const sycl::half *)src1_ddf_i
@@ -3319,6 +3337,16 @@ inline void ggml_sycl_op_mul_mat_sycl(
             size_t ne = row_diff*ne00;
             src0_as_f16.alloc(ne);
             to_fp16_sycl(src0_dd_i, src0_as_f16.get(), ne, stream);
+            // Bytes are what this pass actually streams: the quantized weight in, f16 out.
+            // The f16 output is then re-read by the GEMM, so the true cost of carrying a
+            // quantized weight through a f16 GEMM is this row plus that extra read.
+            if (ggml_sycl_prof_active()) {
+                char key[56];
+                snprintf(key, sizeof(key), "DEQUANT/%s/%ldx%ld", ggml_type_name(src0->type),
+                         (long) ne00, (long) row_diff);
+                ggml_sycl_prof_mark_sub(key, ggml_row_size(src0->type, ne00) * row_diff
+                                                 + ne * sizeof(sycl::half));
+            }
         }
         const sycl::half *src0_ptr = src0->type == GGML_TYPE_F16
                                          ? (const sycl::half *)src0_dd_i
@@ -3329,6 +3357,20 @@ inline void ggml_sycl_op_mul_mat_sycl(
                 DnnlGemmWrapper::row_gemm(ctx,row_diff, src1_ncols , ne10, src0_ptr,
                                      DnnlGemmWrapper::to_dt<sycl::half>(), src1_ptr, DnnlGemmWrapper::to_dt<sycl::half>(),
                                       dst_dd_i, DnnlGemmWrapper::to_dt<float>(), stream);
+                // f16 A and B in, f32 C out, with the dequant and convert charged to their own
+                // rows. The key carries M x N x K because ggml_sycl_op_mul_mat splits one node
+                // into several calls with different N: an aggregated row cannot say how many
+                // FLOPs a call did, and therefore cannot say how close the GEMM is to the
+                // card's fp16 peak -- which is the whole question for the largest row in the
+                // profile. Bytes stay honest so the GB/s column remains arithmetic intensity.
+                if (ggml_sycl_prof_active()) {
+                    char gkey[80];
+                    snprintf(gkey, sizeof(gkey), "GEMM/f16/%ldx%ldx%ld", (long) row_diff,
+                             (long) src1_ncols, (long) ne10);
+                    ggml_sycl_prof_mark_sub(gkey,
+                                            (uint64_t) (row_diff * ne10 + src1_ncols * ne10) * sizeof(sycl::half)
+                                                + (uint64_t) row_diff * src1_ncols * sizeof(float));
+                }
         }
         else
 #endif
@@ -3768,6 +3810,9 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
             dev[i].src1_ddq = dev[i].src1_ddq_alloc.alloc(ctx.pool(i), nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs);
 
             if (src1_on_device && src1_is_contiguous) {
+                // Bracket the submit so the row below measures this kernel and not the
+                // host setup that preceded it -- see ggml_sycl_prof_mark_gap().
+                ggml_sycl_prof_mark_gap(src0);
                 scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
                                                      /*num_src=*/2, " : converting src1 to Q8_1");
                 try {
@@ -3777,6 +3822,13 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                               << ", line:" << __LINE__ << std::endl;
                     std::exit(1);
                 }
+                // The f16 twin of this conversion has had its own row since the profiler was
+                // written; this one never did, so its cost was folded into whichever MUL_MAT
+                // triggered it. That is a large thing to hide: it is the single most-called
+                // operation in decode, ahead of every mat-vec.
+                ggml_sycl_prof_mark_sub("QUANTIZE/src1/f32->q8_1",
+                                        (uint64_t) nrows1 * ne10 * sizeof(float)
+                                            + (uint64_t) nrows1 * src1_padded_col_size * q8_1_ts / q8_1_bs);
             }
         }
 
@@ -6796,8 +6848,580 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
     return skip;
 }
 
+// Device-side per-op profiler, enabled with GGML_SYCL_PROF=1.
+//
+// A host-side timer around each op has to synchronise per node, which inflates the
+// small ops disproportionately and mismeasures exactly what we want to know. Instead
+// this submits a barrier after every submission into the in-order queue and reads the
+// device timestamps once, after the graph has drained: consecutive barrier end-stamps
+// bracket one op's real GPU execution. Nothing synchronises: a sampled graph's stamps are
+// read a slice at a time by the flushes of the graphs after it (see pending()).
+//
+// Costs nothing when disabled - the queue is then built without the profiling property
+// and every hook below is a predictable branch on a cached flag.
+struct ggml_sycl_op_prof {
+    static bool enabled() {
+        static const bool on = [] {
+            // Parse the VALUE, not its presence. This knob was the only one in the backend
+    // that switched on for GGML_SYCL_PROF=0, which is the one way a user
+    // reasonably tries to turn something OFF. Everything else here goes
+    // through ggml_sycl_get_env.
+    const bool e = ggml_sycl_get_env("GGML_SYCL_PROF", 0) != 0;
+            if (e) {
+                atexit(&ggml_sycl_op_prof::dump);
+            }
+            return e;
+        }();
+        return on;
+    }
+
+    struct entry {
+        std::string name;
+        uint64_t    bytes;
+        sycl::event ev;       // valid only when dev_marked
+        uint64_t    host_ns;  // always valid
+        bool        dev_marked = false;
+    };
+
+    std::vector<entry> marks;
+    sycl::queue *      q = nullptr;
+
+    // The instrumented sub-marks are raised from deep inside op implementations that have no
+    // handle on the graph-scoped profiler, so it publishes itself here for the duration of
+    // one graph. Single-threaded by construction: graph_compute_impl owns the queue.
+    static ggml_sycl_op_prof *& active() {
+        static ggml_sycl_op_prof * a = nullptr;
+        return a;
+    }
+
+    // A device mark that does not DRAIN the queue, and is a DEVICE timestamp.
+    //
+    // ext_oneapi_submit_barrier() empties the pipeline at every node, so the host's
+    // per-node work is fully exposed and the device idles through it: on the B70, the
+    // production binary, one slot, 200 generated tokens at a 32k context, 19.81 ms per
+    // token with GGML_SYCL_PROF=1 against 15.26 with it off -- 23% of the decode step,
+    // and the production unit sets the profiler, so the server pays it every request.
+    //
+    // A null kernel is an ordinary command: the queue keeps running, it completes after
+    // the node's work, and its event carries a device timestamp. An empty command group
+    // is not that -- it enqueues nothing, its event completes on the host, and every
+    // span then reads as the host's submit interval. An instrumented graph costs 5.3 ms
+    // a token -- 20.16 ms per token against 14.85 with nothing armed -- and the device
+    // rows are device time again (GEMM/f16/17408x2048x5120 at 2661.51 us/call).
+    // sycl_ext_oneapi_profiling_tag is NOT cheaper here: tags in place of these kernels made
+    // every instrumented decode graph ~2x slower than null kernels did (EVERY=1, 32k, B70).
+    sycl::event dev_mark() {
+        return q->submit([&](sycl::handler & cgh) { cgh.single_task([=] {}); });
+    }
+
+    // Instrument one graph in N, because a mark is a null kernel per node: every graph
+    // instrumented is 5.3 ms of a 20.16 ms decode token, and the production unit keeps
+    // GGML_SYCL_PROF set. Whole graphs are sampled rather than nodes, so a sampled graph
+    // is one complete pass and its per-op means stay the same means. N=1 instruments
+    // every graph, which is what a measurement run wants.
+    static uint64_t sample_every() {
+        static const uint64_t v = [] {
+            const int e = ggml_sycl_get_env("GGML_SYCL_PROF_EVERY", 16);
+            return e > 1 ? (uint64_t) e : (uint64_t) 1;
+        }();
+        return v;
+    }
+
+    // A graph skipped by the sampler returns before touching q, so every mark and sub-mark
+    // inside it is the disabled path; its flush() only reads a slice of the last sampled graph's.
+    static uint64_t & graphs_seen() { static uint64_t v = 0; return v; }
+    static uint64_t & graphs_marked() { static uint64_t v = 0; return v; }
+
+    void begin(sycl::queue * queue) {
+        if (!enabled()) {
+            return;
+        }
+        const uint64_t n = graphs_seen()++;
+        if (sample_every() > 1 && (n % sample_every()) != 0) {
+            return;
+        }
+        graphs_marked()++;
+        q = queue;
+        marks.clear();
+        marks.push_back({ std::string(), 0, dev_mark(), host_now_ns(), true });
+        active() = this;
+    }
+
+    // Close a span early under an explicit name. The enclosing node's own mark then covers
+    // only what is left after this point, so a matmul's row becomes the GEMM tail rather
+    // than the whole op -- intended, and the reason DEQUANT/CONVERT/GEMM sum to the op.
+    // Takes a const char* and tests first, so a disabled mark is two branches and a load.
+    // TWO CLOCKS. A HOST/* row measures host work, and a device mark is not
+    // free: the null kernel costs 5.3 ms a token -- one mark per node, 544 of them.
+    // Timing host work with a device mark does not measure the host; it measures the
+    // mark. So every entry carries a host timestamp, and only the entries that close a
+    // DEVICE span take a device mark.
+    static uint64_t host_now_ns() {
+        return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    static bool is_host_span(const char * n) {
+        return std::strncmp(n, "HOST/", 5) == 0;
+    }
+
+    static bool is_host_span(const std::string & n) {
+        return n.rfind("HOST/", 0) == 0;
+    }
+
+    void mark_cheap(const char * name, uint64_t bytes) {
+        if (!enabled() || q == nullptr) {
+            return;
+        }
+        if (is_host_span(name)) {
+            marks.push_back({ name, bytes, sycl::event(), host_now_ns(), false });
+        } else {
+            marks.push_back({ name, bytes, dev_mark(), host_now_ns(), true });
+        }
+    }
+
+    // Bytes a mat-mul actually TOUCHES, as opposed to the size of the tensor it names.
+    //
+    // A row-limited mat-mul reads only that many rows of src0. The MTP draft head sets exactly such a
+    // limit on the MTP draft head -- k = (n_vocab*3)/8, i.e. 37.5% of a 248320-row head
+    // -- and the kernels honour it (ggml_sycl_mul_mat_vec_q, sycl_mul_mat_row_limit in
+    // mmvq.cpp). Both byte-accounting paths here charged the WHOLE tensor regardless, so
+    // every draft-head call was billed for 2.67x the bytes it moved.
+    //
+    // That is not cosmetic: it is why MUL_MAT/q6_K/5120x248320 reads an impossible
+    // 1134.2 GB/s on 5.61% of the timeline. Solving for the draft/verify call mix puts
+    // its true rate at ~500-509 GB/s, i.e. AT the weights-class wall, not an
+    // opportunity -- so a reader who believed the 1134 figure was chasing a prize that
+    // does not exist. The CLAMP is the one sycl_mul_mat_row_limit implements and this
+    // reuses that same accessor rather than inventing a second one that could drift
+    // from it. The tensor-split (row_low * split_ratio) term is NOT reproduced: the
+    // profiler has no split_ratio to hand it, so a split mat-mul is still charged on
+    // the un-split basis. Pre-existing gap, named rather than papered over.
+    static uint64_t mat_mul_bytes(const ggml_tensor * node) {
+        const ggml_tensor * w = node->src[0];
+        // MUL_MAT_ID's src[0] is an EXPERT STACK: ne[1] rows per expert across
+        // ne[2]*ne[3] experts, of which only the selected ones are read. Charging
+        // row_size * ne[1] therefore UNDER-counts by ne[2]*ne[3] and silently
+        // inflates the reported GB/s -- the opposite failure from the one this
+        // function exists to fix, and worse, because it looks like a correction.
+        // That is NOT the row limit leaking: ggml_mul_mat_get_row_limit returns 0 for
+        // every op that is not GGML_OP_MUL_MAT, so `limit > 0` is already false here.
+        // The ggml_row_size * rows term is what never consults ne[2]/ne[3], for any op.
+        // No row limit is defined for that path, so fall back to the whole-tensor
+        // size, which over-charges as it always did. Over-counting a row is visible;
+        // under-counting one is not.
+        if (node->op == GGML_OP_MUL_MAT_ID) {
+            return ggml_nbytes(w);
+        }
+        return ggml_row_size(w->type, w->ne[0]) * (uint64_t) w->ne[1];
+    }
+
+    // Bytes this node is expected to move. For a matmul in decode the weight dwarfs
+    // everything else, so attributing src0 alone gives a directly comparable
+    // "achieved streaming bandwidth" across quant types.
+    static uint64_t node_bytes(const ggml_tensor * node) {
+        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0]) {
+            return mat_mul_bytes(node);
+        }
+        // View-like nodes are never launched, so a fused span that steps over one must not
+        // be charged its bytes -- doing so inflates that row's GB/s by the full aliased
+        // tensor.
+        if (node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
+            node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE ||
+            node->op == GGML_OP_NONE || ggml_is_empty(node)) {
+            return 0;
+        }
+        uint64_t b = ggml_nbytes(node);
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            // ggml_set_rows returns ggml_view_tensor(a) and then sets op = SET_ROWS, so the
+            // node is op-shaped like a real kernel while src[2] IS the destination. The
+            // view-op guard above cannot see that, so the destination is charged once as
+            // the node and again as a source. Measured: SET_ROWS/1024x32768x1 reported
+            // 15860 GB/s against a 599 GB/s read wall, because the whole 32768-row KV
+            // destination was billed per call for a scatter that writes 34 B per row and
+            // never reads a dst byte. A pointer check catches it and every other op that
+            // aliases its own output, with no exception list to maintain.
+            if (node->src[j] && node->src[j]->data != node->data) {
+                b += ggml_nbytes(node->src[j]);
+            }
+        }
+        return b;
+    }
+
+    static std::string node_key(const ggml_tensor * node) {
+        std::string key = ggml_op_name(node->op);
+        // A concat's cost depends entirely on which axis it joins -- a dim-0 join with a short
+        // first dimension is a different kernel and a different access pattern from a dim-1
+        // join of the same tensor -- so an aggregated CONCAT row cannot say which one to look
+        // at. Carry the axis and the destination shape.
+        if (node->op == GGML_OP_CONCAT) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "/dim%d/%ldx%ldx%ld", node->op_params[0],
+                     (long) node->ne[0], (long) node->ne[1], (long) node->ne[2]);
+            key += buf;
+            return key;
+        }
+        // Flash attention splits the same way, and more violently. One FA row currently
+        // aggregates a prefill call (n_q = 512) with every decode call (n_q = 1), and it
+        // charges that shared row the summed bytes of all of them. The byte count is
+        // therefore dominated by the handful of prefill calls while the time is dominated
+        // by the hundreds of decode ones, which is the two-orders error that
+        // README.md:1764 measured -- the reported GB/s for this row moved 2.7x between two
+        // runs of the same binary. A rate built from mismatched populations is not a rate.
+        //
+        // The query width is node->ne[2], not node->ne[1]: ggml_flash_attn_ext builds the
+        // node as {v->ne[0], q->ne[2], q->ne[1], q->ne[3]}, so ne[1] is the HEAD COUNT --
+        // 24 on this model, the same for every call -- and ne[2] is the number of query
+        // tokens. The width is the population marker: a small, stable set per graph
+        // (1 for decode, the MTP verify width, the prefill width) and unlike n_kv it
+        // does not grow with context. Keying on it splits the row so each has a coherent
+        // byte-to-time population, which is what makes the row rankable at all.
+        if (node->op == GGML_OP_FLASH_ATTN_EXT && node->src[1]) {
+            char buf[96];
+            const ggml_tensor * k = node->src[1];
+            snprintf(buf, sizeof(buf), "/kv%s/q%ld/k%ldx%ld",
+                     ggml_type_name(k->type),
+                     (long) node->ne[2], (long) k->ne[0], (long) k->ne[1]);
+            key += buf;
+            return key;
+        }
+        // matmul cost is dominated by the weight, so keep type and shape apart. Carry the
+        // higher dimensions too: an expert stack is ne[0]xne[1]xne[2] and printing only the
+        // first two makes the row appear to move ne[2] times its own weight, which reads as
+        // a double-counting bug in the profiler rather than as the shape it is. It would
+        // also merge a genuinely 2-D tensor with a stack that shares its first two dims.
+        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0]) {
+            const ggml_tensor * w = node->src[0];
+            char buf[96];
+            if (w->ne[2] > 1 || w->ne[3] > 1) {
+                snprintf(buf, sizeof(buf), "/%s/%ldx%ldx%ldx%ld", ggml_type_name(w->type),
+                         (long) w->ne[0], (long) w->ne[1], (long) w->ne[2], (long) w->ne[3]);
+            } else {
+                snprintf(buf, sizeof(buf), "/%s/%ldx%ld", ggml_type_name(w->type),
+                         (long) w->ne[0], (long) w->ne[1]);
+            }
+            // Same population marker the FLASH_ATTN_EXT branch above uses, for the same
+            // reason. ne[1] on a matmul is the activation column count, and under
+            // --spec-type draft-mtp one weight row is dispatched at ncols 1, 4, 5 and 10 -
+            // so without this the row's us/call and GB/s are means over populations whose
+            // per-column cost differs by more than the differences being ranked. Measured
+            // on the deployed flags: iq4_xs at one column is 88% of the board's best, and at
+            // five it is 54%, on the same weight and the same key.
+            snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "/n%ld", (long) node->ne[1]);
+            key += buf;
+        }
+        return key;
+    }
+
+    // Bytes a fused span actually moves: its external inputs and its live outputs. An
+    // intermediate is produced AND consumed inside the span, so it never reaches memory --
+    // charging it twice (once as a dst, once as the next node's src) is what made
+    // SSM_CONV+SILU report 368 GB/s while moving 183, i.e. "70% of the wall" for a kernel
+    // that was at 35% and had a 2.19x sitting in it.
+    static uint64_t span_bytes(const ggml_cgraph * cgraph, int i, int span) {
+        const int end = (i + span < cgraph->n_nodes) ? i + span : cgraph->n_nodes;
+        auto produced_in_span = [&](const ggml_tensor * t) {
+            for (int j = i; j < end; j++) {
+                if (cgraph->nodes[j] == t) return true;
+            }
+            return false;
+        };
+        auto consumed_after = [&](const ggml_tensor * t, int from) {
+            for (int j = from; j < end; j++) {
+                for (int s = 0; s < GGML_MAX_SRC; s++) {
+                    if (cgraph->nodes[j]->src[s] == t) return true;
+                }
+            }
+            return false;
+        };
+        // A span's head output is not automatically an intermediate. ADD+RMS_NORM+MUL
+        // deliberately materialises the residual sum because a LATER block consumes it
+        // (see ggml_sycl_op_rms_norm_fused_add), so it is both fed onward in registers and
+        // written to DRAM. Dropping it would under-count that row by a whole tensor and
+        // report 357 GB/s for a kernel doing 476 -- inventing a gap where there is none,
+        // which is the same class of error this patch removes.
+        auto consumed_outside = [&](const ggml_tensor * t) {
+            for (int j = end; j < cgraph->n_nodes; j++) {
+                for (int s = 0; s < GGML_MAX_SRC; s++) {
+                    if (cgraph->nodes[j]->src[s] == t) return true;
+                }
+            }
+            return false;
+        };
+        uint64_t bytes = 0;
+        for (int j = i; j < end; j++) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            // MUL_MAT keeps charging only its weight, so the GEMM rows stay the
+            // weight-streaming intensity their shape suffix promises.
+            if ((n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) && n->src[0]) {
+                bytes += mat_mul_bytes(n);
+                continue;
+            }
+            if (n->op == GGML_OP_RESHAPE || n->op == GGML_OP_TRANSPOSE ||
+                n->op == GGML_OP_VIEW || n->op == GGML_OP_PERMUTE ||
+                n->op == GGML_OP_NONE || ggml_is_empty(n)) {
+                continue;
+            }
+            if (!consumed_after(n, j + 1) || consumed_outside(n)) {
+                bytes += ggml_nbytes(n);
+            }
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                if (n->src[s] && !produced_in_span(n->src[s])) {
+                    bytes += ggml_nbytes(n->src[s]);
+                }
+            }
+        }
+        return bytes;
+    }
+
+    void mark(const ggml_tensor * node, const ggml_cgraph * cgraph = nullptr, int i = 0, int span = 0) {
+        if (!enabled() || q == nullptr) {
+            return;
+        }
+        const uint64_t bytes = (cgraph && span > 0) ? span_bytes(cgraph, i, span) : node_bytes(node);
+        // Name a span by what it fuses, not by how many nodes it covers. "+2" merged two
+        // unrelated 3-node spans -- ADD+RMS_NORM+MUL and ADD+SILU+MUL -- into one row whose
+        // rate is an average of two different kernels, which is unreadable either way.
+        std::string key = node_key(node);
+        if (cgraph && span > 1) {
+            for (int j = i + 1; j < i + span && j < cgraph->n_nodes; j++) {
+                const ggml_tensor * n = cgraph->nodes[j];
+                key += "+";
+                key += (n->op == GGML_OP_UNARY) ? ggml_unary_op_name(ggml_get_unary_op(n))
+                                                : ggml_op_name(n->op);
+            }
+        }
+        marks.push_back({ std::move(key), bytes, dev_mark(), host_now_ns(), true });
+    }
+
+    // Totals are accumulated across every graph and dumped once at exit.
+    struct acc {
+        uint64_t ns    = 0;
+        uint64_t calls = 0;
+        uint64_t bytes = 0;
+        // A row's us/call is a mean, and a mean cannot tell 554 uniform gaps from four huge
+        // ones plus 550 empty. That distinction decides whether HOST/gpu-idle+setup is
+        // dispatch overhead (attack it with fusion) or a few blocking host copies (attack it
+        // with an async readback), so keep enough shape to answer it.
+        uint64_t max_ns    = 0;
+        uint64_t big_ns    = 0;  // ns accumulated in marks >= BIG_MARK_NS
+        uint64_t big_calls = 0;
+    };
+
+    static constexpr uint64_t BIG_MARK_NS = 100000;  // 100 us
+
+    // Deliberately leaked. atexit(dump) is registered from enabled(), which runs before
+    // this map is first constructed, so a function-local static would be destroyed
+    // BEFORE the handler that reads it -- dump() would walk a dead map. Leaking keeps it
+    // alive for the whole process; it is bounded by the number of distinct op keys.
+    static std::map<std::string, acc> & totals() {
+        static std::map<std::string, acc> * t = new std::map<std::string, acc>();
+        return *t;
+    }
+
+    // A sampled graph's marks are read over the flushes of the graphs after it. Reading is
+    // two UR queries per mark, milliseconds a graph, and after a q->wait() the device idled
+    // through all of it: that readout was the whole PROF=1 cost (+2-4% per decode step,
+    // interleaved A/B on the B70; the profiled queue and the null kernels measured as
+    // nothing). At a later flush that graph is queued and still running, so the reads
+    // overlap it -- if they fit: an MTP draft graph leaves well under the whole readout.
+    // Leaked like totals(): dump() drains it at exit.
+    struct readout {
+        std::vector<entry> m;
+        size_t             next      = 1;  // next mark to charge
+        size_t             per_flush = 0;
+        uint64_t           dev_prev  = 0;  // end stamp of the nearest device mark before next
+    };
+    static readout & pending() {
+        static readout * r = new readout();
+        return *r;
+    }
+
+    void flush() {
+        if (!enabled()) {
+            return;
+        }
+        if (q == nullptr) {
+            read_pending(pending().per_flush);
+            return;
+        }
+        read_pending(SIZE_MAX);
+        if (marks.size() >= 2) {
+            auto & r = pending();
+            r.m.swap(marks);
+            // done by the time the sampler picks the next graph
+            r.per_flush = r.m.size() / std::max<uint64_t>(sample_every() - 1, 1) + 1;
+        }
+        marks.clear();
+        active() = nullptr;
+    }
+
+    static void read_pending(size_t budget) {
+        auto & r = pending();
+        auto & m = r.m;
+        if (m.empty()) {
+            return;
+        }
+        if (r.next == 1) {
+            // In-order queue: once the last device mark is complete, every earlier one is.
+            for (size_t k = m.size(); k-- > 0;) {
+                if (m[k].dev_marked) {
+                    m[k].ev.wait();
+                    break;
+                }
+            }
+            r.dev_prev = m[0].ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+        }
+        auto & t = totals();
+        const size_t end = m.size() - r.next > budget ? r.next + budget : m.size();
+        for (size_t i = r.next; i < end; i++) {
+            // A HOST/* span is host work, priced on the host clock, and costs a
+            // clock read instead of a device mark. A device span is priced on the
+            // device timeline against the nearest preceding DEVICE mark, because the host
+            // marks in between deliberately carry no device mark of their own.
+            const bool     host_span = is_host_span(m[i].name);
+            const uint64_t hcur      = m[i].host_ns;
+            const uint64_t hprev     = m[i - 1].host_ns;
+            const uint64_t prev      = r.dev_prev;
+            const uint64_t cur       = m[i].dev_marked
+                ? m[i].ev.get_profiling_info<sycl::info::event_profiling::command_end>()
+                : 0;
+            if (m[i].dev_marked) {
+                r.dev_prev = cur;
+            }
+            // This is a device-TIMELINE span, not a kernel duration: end-to-end between two
+            // device marks. It is deliberate -- the grand total then equals the device
+            // timeline, which measures decode as ~100% device-busy (36.46 ms
+            // of span/token against a 35.10 ms/token unprofiled wall). Two consequences that
+            // a reader WILL otherwise get wrong, both paid for once already:
+            //   1. A row's us/call is exec + whatever device idle sits between the pre-node
+            //      barrier completing and this op's kernel starting, i.e. non-overlapped
+            //      dispatch. mark_gap() brackets the host gap into HOST/pre-node, so the
+            //      residue here is small for most ops -- but it is NOT zero, and it is not
+            //      uniform across rows.
+            //   2. The GB/s column is therefore a timeline rate, NOT a kernel rate, and it
+            //      is not bounded by DRAM: MUL_MAT/q5_K/5120x17408 reads 61.3 MB in 72.39 us
+            //      = 846 GB/s against this device's measured 599 GB/s read wall, because a
+            //      24 MiB L2 can serve a third of that tensor. Any row above ~599 is
+            //      reporting cache hits, and any row far below may be reporting dispatch.
+            // Use max_us and %in_big to tell a uniform kernel from a stalled one before
+            // concluding anything about a row: a tight distribution is a kernel result, a
+            // bimodal one is not.
+            const uint64_t d = host_span
+                ? (hcur > hprev ? hcur - hprev : 0)
+                : (cur > prev ? cur - prev : 0);
+            auto & slot = t[m[i].name];
+            slot.ns    += d;
+            slot.calls += 1;
+            slot.bytes += m[i].bytes;
+            if (d > slot.max_ns) {
+                slot.max_ns = d;
+            }
+            // %in_big is a DEVICE-timeline statistic: BIG_MARK_NS is a threshold on the
+            // device clock, and a HOST/* row is timed on the host clock. Comparing a host
+            // duration against a device threshold is a category error, and it is worse
+            // than useless here: the printer divides big_ns by ns, so a HOST row would
+            // print 0.0% in a column that looks like a measurement. "Big" is undefined on a host row;
+            // it reads 0.0% BY CONSTRUCTION, not by accident, and the advice to read
+            // %in_big applies to device rows only.
+            if (d >= BIG_MARK_NS && !host_span) {
+                slot.big_ns    += d;
+                slot.big_calls += 1;
+            }
+        }
+        r.next = end;
+        if (end == m.size()) {
+            m.clear();
+            r.next = 1;
+        }
+    }
+
+    static void dump() {
+        read_pending(SIZE_MAX);
+        auto & t = totals();
+        if (t.empty()) {
+            return;
+        }
+        uint64_t grand = 0, grand_bytes = 0;
+        for (const auto & kv : t) {
+            grand       += kv.second.ns;
+            grand_bytes += kv.second.bytes;
+        }
+        std::vector<std::pair<std::string, acc>> v(t.begin(), t.end());
+        std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) {
+            return a.second.ns > b.second.ns;
+        });
+        fprintf(stderr, "\n=== SYCL device-time profile (total %.2f ms, %.2f GB over %llu of %llu graphs) ===\n",
+                grand / 1e6, grand_bytes / 1e9,
+                (unsigned long long) graphs_marked(), (unsigned long long) graphs_seen());
+        fprintf(stderr, "%-30s %11s %9s %10s %8s %10s %10s %8s %7s\n", "op", "gpu_ms", "calls",
+                "us/call", "share", "GB/s", "max_us", ">=100us", "%in_big");
+        for (const auto & kv : v) {
+            const double ms = kv.second.ns / 1e6;
+            fprintf(stderr, "%-30s %11.3f %9llu %10.2f %7.2f%% %10.1f %10.1f %8llu %6.1f%%\n",
+                    kv.first.c_str(), ms,
+                    (unsigned long long) kv.second.calls,
+                    kv.second.ns / 1e3 / (double) kv.second.calls,
+                    grand ? 100.0 * kv.second.ns / grand : 0.0,
+                    kv.second.ns ? kv.second.bytes / (double) kv.second.ns : 0.0,
+                    kv.second.max_ns / 1e3,
+                    (unsigned long long) kv.second.big_calls,
+                    kv.second.ns ? 100.0 * kv.second.big_ns / kv.second.ns : 0.0);
+        }
+        // The profiler's own per-op cost is the floor under every row: two device markers
+        // per op, and the cheapest op measures those markers rather than a kernel. Measured
+        // at the decode shape (512-token prompt, 512 decode steps): ~30 us per op, which is
+        // why rows that report 5-12 us/call (RMS_NORM+MUL 12.24, GET_ROWS 11.47, UNARY+MUL
+        // ~6.2) are reporting the markers, not the kernel -- and why the MUL_MAT rows are
+        // at the read wall rather than at 92% of it. Compare a row's us/call against this
+        // floor before reading it as kernel time.
+        {
+            double floor_us = 0.0;
+            for (const auto & kv : v) {
+                if (kv.second.calls == 0) {
+                    continue;
+                }
+                const double us = kv.second.ns / 1e3 / (double) kv.second.calls;
+                if (floor_us == 0.0 || us < floor_us) {
+                    floor_us = us;
+                }
+            }
+            fprintf(stderr, "profiler floor: %.2f us/op (the smallest row mean; a row at this "
+                            "level is measuring the markers, not a kernel)\n", floor_us);
+        }
+        fflush(stderr);
+    }
+};
+
+bool ggml_sycl_prof_active() {
+    return ggml_sycl_op_prof::active() != nullptr;
+}
+
+void ggml_sycl_prof_mark_sub(const char * name, uint64_t bytes) {
+    if (ggml_sycl_op_prof * a = ggml_sycl_op_prof::active()) {
+        a->mark_cheap(name, bytes);
+    }
+}
+
+// Close the span BEFORE a sub-marked submit. A mark's duration is
+// marks[i].end - marks[i-1].end, so on an in-order queue a sub-mark bills every
+// microsecond since the previous mark -- including GPU idle while the host was
+// still setting the call up. For a sub-mark whose kernel is large that bias is
+// noise; for one whose real work is sub-microsecond it is the entire row.
+void ggml_sycl_prof_mark_gap(const ggml_tensor * weight) {
+    GGML_UNUSED(weight);
+    if (ggml_sycl_op_prof * a = ggml_sycl_op_prof::active()) {
+        a->mark_cheap("HOST/gpu-idle+setup", 0);
+    }
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_conv_window_match conv_window;
+    ggml_sycl_op_prof prof;
+    prof.begin(sycl_ctx->stream());
+
+    prof.mark_cheap("HOST/kv-reorder-census", 0);
+    prof.mark_cheap("HOST/elide-f32-census", 0);
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (ggml_sycl_is_view_or_noop(node)) {
@@ -6806,6 +7430,18 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
+
+        // Close the span before this node dispatches anything. A mark's duration is
+        // marks[i].end - marks[i-1].end, and prof.mark(node) is raised *after*
+        // ggml_sycl_compute_forward, so without this every node's row silently absorbs
+        // the host gap that preceded it. That is not uniform: an op that happens to
+        // raise a sub-mark (a mat-vec quantizing its src1) already has the gap
+        // intercepted, and an op following a long kernel has no gap because the host
+        // ran ahead during it -- so the same kernel measures fast or slow depending on
+        // what ran before it. `ffn_up` (after the 98 us `ffn_gate`) fitted the
+        // cost model to -2.4 us while `attn_gate` (after a ~6 us conv) sat +15.0 us
+        // above it, which reads as a 38% kernel defect and is not one.
+        prof.mark_cheap("HOST/pre-node", 0);
 
         // Run the window and cache updates at the convolution.
         if (conv_window.concat == nullptr && node->op == GGML_OP_CONCAT &&
@@ -6819,6 +7455,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
             if (node == conv_window.conv) {
                 ggml_sycl_ssm_conv_window(*sycl_ctx, conv_window);
+                prof.mark(node);
                 i           = conv_window.last_idx;
                 conv_window = {};
                 continue;
@@ -6826,7 +7463,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
 
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
+        prof.mark_cheap("HOST/fuse-scan", 0);
         if (nodes_to_skip != 0) {
+            prof.mark(node, cgraph, i, nodes_to_skip + 1);
             i += nodes_to_skip;
             continue;
         }
@@ -6844,6 +7483,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             const int gdn_nodes_to_skip = ggml_sycl_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
             if (gdn_nodes_to_skip > 0) {
                 ggml_sycl_op_gated_delta_net_fused_cache(*sycl_ctx, node, fused_state_cpy);
+                prof.mark(node);
                 i += gdn_nodes_to_skip;
                 continue;
             }
@@ -6851,6 +7491,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (node->op == GGML_OP_ADD &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, {}) &&
             ggml_sycl_op_add_rms_norm_fused(*sycl_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+            prof.mark(node, cgraph, i, 3);
             i += 2;
             continue;
         }
@@ -6858,6 +7499,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (node->op == GGML_OP_ROPE &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
             ggml_sycl_rope_fused(*sycl_ctx, node, cgraph->nodes[i + 2]);
+            prof.mark(node, cgraph, i, 3);
             i += 2;
             continue;
         }
@@ -6871,6 +7513,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (node->op == GGML_OP_RMS_NORM &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
             ggml_sycl_op_rms_norm_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
+            prof.mark(node, cgraph, i, 2);
             i++;
             continue;
         }
@@ -6879,12 +7522,14 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (node->op == GGML_OP_RMS_NORM &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
             ggml_sycl_op_rms_norm_scale_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
+            prof.mark(node, cgraph, i, 2);
             i++;
             continue;
         }
         if (node->op == GGML_OP_ADD &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_ADD }, {})) {
             ggml_sycl_op_add_add_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
+            prof.mark(node, cgraph, i, 2);
             i++;
             continue;
         }
@@ -6896,6 +7541,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (node->op == GGML_OP_L2_NORM) {
             const int l2_batch_skip = ggml_sycl_l2_norm_batch_fused(*sycl_ctx, cgraph, i);
             if (l2_batch_skip > 0) {
+                prof.mark(node, cgraph, i, l2_batch_skip);
                 i += l2_batch_skip;
                 continue;
             }
@@ -6911,6 +7557,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (node->op == GGML_OP_SSM_CONV &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
             ggml_sycl_ssm_conv_fused(*sycl_ctx, node, nullptr, cgraph->nodes[i + 1]);
+            prof.mark(node, cgraph, i, 2);
             i++;
             continue;
         }
@@ -6919,6 +7566,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
              ggml_sycl_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
              ggml_sycl_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS }))) {
             ggml_sycl_fused_unary_mul(*sycl_ctx, node, cgraph->nodes[i + 1]);
+            prof.mark(node, cgraph, i, 2);
             i++;
             continue;
         }
@@ -6927,11 +7575,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
              ggml_sycl_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
              ggml_sycl_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS }))) {
             ggml_sycl_fused_add_unary_mul(*sycl_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+            prof.mark(node, cgraph, i, 3);
             i += 2;
             continue;
         }
 
         if (node->op == GGML_OP_MUL_MAT && ggml_sycl_mul_mat_glu_fused(*sycl_ctx, cgraph, i)) {
+            prof.mark(node, cgraph, i, 3);
             i += 2;
             continue;
         }
@@ -6941,7 +7591,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+        prof.mark(node);
     }
+    prof.flush();
 }
 
 #ifdef GGML_SYCL_GRAPH

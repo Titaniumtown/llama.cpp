@@ -836,6 +836,15 @@ inline bool ggml_sycl_dnnl_has_optimized_gemm(int device) {
 
 int ggml_sycl_get_env(const char *env_name, int default_val);
 
+// Attribute a device-side pass that is NOT a graph node to its own profiler row
+// (GGML_SYCL_PROF=1). No-op when profiling is off. Without this, work submitted inside an
+// op -- notably launch_fattn's K/V dequant -- is invisible: it shows up in no row at all.
+// A C string, so an unsampled graph builds no std::string; a caller that composes its
+// row key gates the composition on ggml_sycl_prof_active().
+void ggml_sycl_prof_mark_sub(const char * name, uint64_t bytes);
+// True only while a sampled graph is being instrumented.
+bool ggml_sycl_prof_active();
+
 template <int N, class T> std::string debug_get_array_str(const std::string & prefix, const T array[N]) {
     if (LIKELY(!g_ggml_sycl_debug)) {
         return "";

@@ -791,8 +791,22 @@ namespace dpct
       void clear_queues() { _queues.clear(); }
 
       void init_queues() {
-        _q_in_order =
-            create_queue_impl(true, sycl::property::queue::in_order());
+        // GGML_SYCL_PROF=1 turns on device-side timestamps so the graph walker can
+        // attribute real GPU time per op. Profiling is only requested when asked
+        // for: an unprofiled queue is the default and costs nothing.
+        // Parsed inline rather than through ggml_sycl_get_env: common.hpp includes
+    // this header, so it cannot include it back. Same value semantics as the
+    // other site -- set to a non-zero number to enable, and "0" or unset off.
+    static const bool prof_enabled = []() {
+        const char * const v = getenv("GGML_SYCL_PROF");
+        return v != nullptr && v[0] != '\0' && strtol(v, nullptr, 10) != 0;
+    }();
+        if (prof_enabled) {
+            _q_in_order = create_queue_impl(true, sycl::property::queue::in_order(),
+                                            sycl::property::queue::enable_profiling());
+        } else {
+            _q_in_order = create_queue_impl(true, sycl::property::queue::in_order());
+        }
         _q_out_of_order = create_queue_impl(true);
         _saved_queue = default_queue();
       }

@@ -119,6 +119,7 @@ int g_ggml_sycl_fuse_conv_window = 1;
 int g_ggml_sycl_enable_esimd = 1;
 int g_ggml_sycl_mmid_esimd = 1;
 int g_ggml_sycl_mmvq_wide = 1;
+int g_ggml_sycl_f32mm = 2;
 int g_ggml_sycl_enable_xmx_esimd = 1;
 int g_ggml_sycl_xmx_max_cols = GGML_SYCL_XMX_MAX_COLS_DEFAULT;
 int g_ggml_sycl_xmx_glu_max_cols = GGML_SYCL_XMX_GLU_MAX_COLS;
@@ -455,6 +456,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_enable_esimd = ggml_sycl_get_env("GGML_SYCL_ENABLE_ESIMD", 1);
         g_ggml_sycl_mmid_esimd = ggml_sycl_get_env("GGML_SYCL_MMID_ESIMD", 1);
         g_ggml_sycl_mmvq_wide = ggml_sycl_get_env("GGML_SYCL_MMVQ_WIDE", 1);
+        g_ggml_sycl_f32mm = ggml_sycl_get_env("GGML_SYCL_F32MM", 2);
         g_ggml_sycl_enable_xmx_esimd = ggml_sycl_get_env("GGML_SYCL_ENABLE_XMX_ESIMD", 1);
         g_ggml_sycl_xmx_max_cols = std::max(0, ggml_sycl_get_env("GGML_SYCL_XMX_MAX_COLS", GGML_SYCL_XMX_MAX_COLS_DEFAULT));
         g_ggml_sycl_xmx_glu_max_cols =
@@ -613,6 +615,7 @@ static void ggml_check_sycl() try {
 #endif
 
         GGML_LOG_INFO("  GGML_SYCL_MMVQ_WIDE: %d\n", g_ggml_sycl_mmvq_wide);
+        GGML_LOG_INFO("  GGML_SYCL_F32MM: %d\n", g_ggml_sycl_f32mm);
 
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_XMX_ESIMD: %d\n", g_ggml_sycl_enable_xmx_esimd);
         GGML_LOG_INFO("  GGML_SYCL_XMX_MAX_COLS: %d\n", g_ggml_sycl_xmx_max_cols);
@@ -5260,6 +5263,18 @@ static bool can_use_mul_mat_q(const ggml_tensor * src0, const ggml_tensor * src1
     return src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 }
 
+// The f32 short-row mat-vec routing predicate, named so the dispatch site and the
+// supports_op site cannot drift. These two were byte-identical conditions written
+// out twice because there was no predicate to name. If they drift, the backend claims to support a shape it does not dispatch --
+// invisibly, because nothing checks that the two agree.
+static bool ggml_sycl_f32mm_routes(const ggml_tensor * src0, const ggml_tensor * src1,
+                                   const ggml_tensor * dst) {
+    return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+           dst->type == GGML_TYPE_F32 && src1->ne[1] >= 1 &&
+           src1->ne[1] <= ((src0->ne[0] < 4096 && g_ggml_sycl_f32mm != 0) ? 256 : 8) &&
+           src0->ne[0] % 4 == 0 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1);
+}
+
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
 
@@ -5356,6 +5371,16 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         }
     } else if (use_mul_mat_q) {
         ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_q);
+    } else if (ggml_sycl_f32mm_routes(src0, src1, dst)) {
+        // f32 mat-vec. The generic path below runs these through a GEMM library, which
+        // for a tall-thin f32 src0 costs far more in setup than the weight read itself.
+        // Capped at 8 columns: past that a real blocked GEMM wins again.
+        //
+        // ...except when src0 is short, where the whole product is smaller than the GEMM
+        // library's setup cost. Those get a dedicated kernel and a 256-column cap. The cap
+        // still matters: these same nodes reach ne[1] == 24*n_tokens and 96*n_tokens, so at
+        // prefill ubatch sizes they are real GEMMs and must keep falling through.
+        ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_f32);
     } else {
         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl);
     }

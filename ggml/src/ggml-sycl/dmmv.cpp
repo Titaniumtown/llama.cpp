@@ -1926,6 +1926,231 @@ bool ggml_sycl_dequantize_mul_mat_vec_glu_reorder_esimd(enum ggml_type src0_type
 
 #endif // GGML_SYCL_DMMV_HAS_ESIMD
 
+// Plain f32 mat-vec, one subgroup per output row.
+//
+// An f32 src0 matches none of the dmmv/mmvq/mmq predicates, so it falls through to
+// ggml_sycl_op_mul_mat_sycl, i.e. a oneDNN/MKL sgemm. For n=1 that dispatches a GEMV
+// through a GEMM library and the library overhead dwarfs the work: the GDN
+// ssm_alpha/ssm_beta projections ([5120,48] f32, 983 KB) measure 17.32 us each where
+// the weight read alone is ~2 us at DRAM speed, 96 calls per decode step.
+//
+// Accumulation stays in f32 -- deliberately not routed through the dfloat/half
+// machinery the F16 dmmv kernels use, since GGML_SYCL_F16 makes dfloat==half and that
+// would quietly drop the activations to half precision for a gating projection.
+static constexpr int MMV_F32_WG = 1024;
+
+// Small f32 GEMMs: the attention K/V rotation matmuls.
+//
+//     MUL_MAT(attn_inp_k_rot{256,256}, Qcur{256,24})    = {256,24}
+//     MUL_MAT(attn_inp_v_rot{64,64},   kqv_out{64,96})  = {64,96}
+//
+// Neither fits the work-group-per-row kernel below, which needs ne00 >= MMV_F32_WG*4 ==
+// 4096 to occupy its 1024 lanes: a 256-wide row uses tid < 64, a 64-wide row uses tid < 16.
+// Both also exceeded the <= 8 column cap and fell through to the GEMM library, whose fixed
+// setup is the entire cost at this size -- measured 26.64 and 13.04 us/call against a
+// ~2.3 us empty-launch floor, for products of 1.5M and 0.4M MACs on cache-resident data.
+//
+// Two shapes are provided because the obvious one is not uniformly better; see the
+// measurements in the patch header. GGML_SYCL_F32MM selects: 0 = library, 1 = subgroup,
+// 2 = element.
+static constexpr int MMV_F32_SG_WG   = 256;  // 8 subgroups per work-group
+static constexpr int MMV_F32_TINY_WG = 128;
+
+// Variant 1: one subgroup per output row, columns chunked by 8 so the weight row is loaded
+// once per chunk. Costs one subgroup reduction per output element, which is what makes it
+// lose on very short rows: at ncols == 64 only 16 of 32 lanes have work, and ncols_dst == 96
+// then pays 96 reductions to produce 96 values.
+static void mul_mat_vec_f32_f32_sg(const float * __restrict__ vx, const float * __restrict__ y,
+                                   float * __restrict__ dst, const int ncols, const int ncols_dst,
+                                   const int stride_col_y, const int stride_col_dst, const int nrows,
+                                   const sycl::nd_item<1> & item_ct1) {
+    const auto sg  = item_ct1.get_sub_group();
+    // row is uniform across the subgroup, so the early return is convergent and every
+    // surviving lane reaches the reduce_over_group calls below.
+    const int  row = item_ct1.get_group(0) * (int) sg.get_group_linear_range() + (int) sg.get_group_linear_id();
+    if (row >= nrows) {
+        return;
+    }
+
+    const int     lane = (int) sg.get_local_linear_id();
+    const float * xrow = vx + (int64_t) row * ncols;
+
+    for (int c0 = 0; c0 < ncols_dst; c0 += 8) {
+        const int cn = sycl::min(8, ncols_dst - c0);  // uniform across the subgroup
+
+        float sums[8];
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            sums[c] = 0.0f;
+        }
+
+        // ncols % 4 == 0 is guaranteed by the dispatch guard.
+        for (int i = lane * 4; i < ncols; i += WARP_SIZE * 4) {
+            const sycl::float4 xv = *(const sycl::float4 *) (xrow + i);
+            for (int c = 0; c < cn; ++c) {
+                const sycl::float4 yv = *(const sycl::float4 *) (y + (int64_t) (c0 + c) * stride_col_y + i);
+                sums[c] += xv.x() * yv.x() + xv.y() * yv.y() + xv.z() * yv.z() + xv.w() * yv.w();
+            }
+        }
+
+        for (int c = 0; c < cn; ++c) {
+            const float s = sycl::reduce_over_group(sg, sums[c], std::plus<>());
+            if (sg.leader()) {
+                dst[(int64_t) (c0 + c) * stride_col_dst + row] = s;
+            }
+        }
+    }
+}
+
+// Variant 2: one work-item per output element, no cross-lane reduction at all. row varies
+// fastest so consecutive lanes write consecutive dst addresses (coalesced) and share the
+// same y column (broadcast). The x rows are then read strided, which is fine here only
+// because the whole of src0 is 16-256 KB and stays resident.
+static void mul_mat_f32_tiny(const float * __restrict__ vx, const float * __restrict__ y,
+                             float * __restrict__ dst, const int ncols, const int ncols_dst,
+                             const int stride_col_y, const int stride_col_dst, const int nrows,
+                             const sycl::nd_item<1> & item_ct1) {
+    const int idx = (int) item_ct1.get_global_linear_id();
+    if (idx >= nrows * ncols_dst) {
+        return;
+    }
+
+    const int     row  = idx % nrows;
+    const int     c    = idx / nrows;
+    const float * xrow = vx + (int64_t) row * ncols;
+    const float * ycol = y + (int64_t) c * stride_col_y;
+
+    float s = 0.0f;
+    // ncols % 4 == 0 is guaranteed by the dispatch guard.
+    for (int i = 0; i < ncols; i += 4) {
+        const sycl::float4 xv = *(const sycl::float4 *) (xrow + i);
+        const sycl::float4 yv = *(const sycl::float4 *) (ycol + i);
+        s += xv.x() * yv.x() + xv.y() * yv.y() + xv.z() * yv.z() + xv.w() * yv.w();
+    }
+    dst[(int64_t) c * stride_col_dst + row] = s;
+}
+
+template <int ncols_dst>
+static void mul_mat_vec_f32_f32(const float * __restrict__ vx, const float * __restrict__ y,
+                                float * __restrict__ dst, const int ncols,
+                                const int stride_col_y, const int stride_col_dst,
+                                const sycl::nd_item<1> & item_ct1) {
+    // One work-group per output row, reduced across the whole group.
+    //
+    // A subgroup-per-row layout does not work for these shapes: ssm_alpha/ssm_beta are
+    // [5120, 48], so 48 rows would give 48 subgroups (1536 work-items) and nowhere near
+    // enough memory-level parallelism to stream 983 KB -- measured 30.8 us/call, worse
+    // than the oneDNN sgemm it replaces. Spreading each row over a full work-group gives
+    // 48 x 1024 = 49k work-items instead.
+    //
+    // The weight row is the entire bandwidth cost, so it is loaded once and reused across
+    // all ncols_dst activation columns: extra columns cost arithmetic, not traffic.
+    const int row = item_ct1.get_group(0);
+    const int tid = item_ct1.get_local_linear_id();
+
+    const float * xrow = vx + (int64_t) row * ncols;
+
+    float sums[ncols_dst];
+#pragma unroll
+    for (int c = 0; c < ncols_dst; ++c) {
+        sums[c] = 0.0f;
+    }
+
+    // ncols % 4 == 0 is guaranteed by the dispatch guard, so i and ncols are both
+    // multiples of 4 and a float4 at i never runs past the row.
+    for (int i = tid * 4; i < ncols; i += MMV_F32_WG * 4) {
+        const sycl::float4 xv = *(const sycl::float4 *) (xrow + i);
+#pragma unroll
+        for (int c = 0; c < ncols_dst; ++c) {
+            const sycl::float4 yv = *(const sycl::float4 *) (y + (int64_t) c * stride_col_y + i);
+            sums[c] += xv.x() * yv.x() + xv.y() * yv.y() + xv.z() * yv.z() + xv.w() * yv.w();
+        }
+    }
+
+#pragma unroll
+    for (int c = 0; c < ncols_dst; ++c) {
+        const float s = sycl::reduce_over_group(item_ct1.get_group(), sums[c], std::plus<>());
+        if (tid == 0) {
+            dst[(int64_t) c * stride_col_dst + row] = s;
+        }
+    }
+}
+
+void ggml_sycl_op_mul_mat_vec_f32(
+    ggml_backend_sycl_context & ctx,
+    const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
+    const char *src0_dd_i, const float *src1_ddf_i, const char *src1_ddq_i,
+    float *dst_dd_i, const int64_t row_low, const int64_t row_high,
+    const int64_t src1_ncols, const int64_t src1_padded_row_size,
+    const dpct::queue_ptr &stream) {
+
+    const int64_t ne00     = src0->ne[0];
+    const int64_t row_diff = row_high - row_low;
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(ne00 % 4 == 0);
+
+    const float * vx = (const float *) src0_dd_i;
+    const int stride_col_y   = ne00;        // src1 columns are contiguous, stride ne10 == ne00
+    const int stride_col_dst = dst->ne[0];
+
+    const sycl::nd_range<1> nd(sycl::range<1>((size_t) row_diff * MMV_F32_WG),
+                               sycl::range<1>(MMV_F32_WG));
+
+#define LAUNCH_MMV_F32(N)                                                                   \
+    stream->parallel_for(nd, [=](sycl::nd_item<1> it) {                                     \
+        mul_mat_vec_f32_f32<N>(vx, src1_ddf_i, dst_dd_i, ne00, stride_col_y,                \
+                               stride_col_dst, it);                                         \
+    })
+
+    // Short rows cannot fill the work-group kernel; see the two kernels above.
+    if (ne00 < MMV_F32_WG * 4) {
+        const int ncd = (int) src1_ncols;
+        const int nr  = (int) row_diff;
+        if (g_ggml_sycl_f32mm == 1) {
+            constexpr int nsg     = MMV_F32_SG_WG / WARP_SIZE;
+            const size_t  ngroups = (size_t) ((row_diff + nsg - 1) / nsg);
+            stream->parallel_for(sycl::nd_range<1>(ngroups * MMV_F32_SG_WG, MMV_F32_SG_WG),
+                                 [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                     mul_mat_vec_f32_f32_sg(vx, src1_ddf_i, dst_dd_i, ne00, ncd, stride_col_y,
+                                                            stride_col_dst, nr, it);
+                                 });
+        } else {
+            const size_t total   = (size_t) nr * (size_t) ncd;
+            const size_t ngroups = (total + MMV_F32_TINY_WG - 1) / MMV_F32_TINY_WG;
+            stream->parallel_for(sycl::nd_range<1>(ngroups * MMV_F32_TINY_WG, MMV_F32_TINY_WG),
+                                 [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                     mul_mat_f32_tiny(vx, src1_ddf_i, dst_dd_i, ne00, ncd, stride_col_y,
+                                                      stride_col_dst, nr, it);
+                                 });
+        }
+        GGML_UNUSED(ctx);
+        GGML_UNUSED(dst);
+        GGML_UNUSED(src1_ddq_i);
+        GGML_UNUSED(src1_padded_row_size);
+        return;
+    }
+
+    switch (src1_ncols) {
+        case 1: LAUNCH_MMV_F32(1); break;
+        case 2: LAUNCH_MMV_F32(2); break;
+        case 3: LAUNCH_MMV_F32(3); break;
+        case 4: LAUNCH_MMV_F32(4); break;
+        case 5: LAUNCH_MMV_F32(5); break;
+        case 6: LAUNCH_MMV_F32(6); break;
+        case 7: LAUNCH_MMV_F32(7); break;
+        case 8: LAUNCH_MMV_F32(8); break;
+        default: GGML_ABORT("unsupported src1_ncols=%d for f32 MMV", (int) src1_ncols);
+    }
+#undef LAUNCH_MMV_F32
+
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src1_ddq_i);
+    GGML_UNUSED(src1_padded_row_size);
+}
+
 void ggml_sycl_op_dequantize_mul_mat_vec(
     ggml_backend_sycl_context & ctx,
     const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,

@@ -74,6 +74,7 @@ extern int g_ggml_sycl_fuse_conv_window;
 extern int g_ggml_sycl_enable_esimd;
 extern int g_ggml_sycl_mmid_esimd;
 extern int g_ggml_sycl_mmvq_wide;
+extern int g_ggml_sycl_f32mm;
 extern int g_ggml_sycl_enable_xmx_esimd;
 extern int g_ggml_sycl_xmx_max_cols;
 extern int g_ggml_sycl_xmx_glu_max_cols;

@@ -193,15 +193,14 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         }
     }
 
-    // An implicit-causal sentinel (mask->ne[0] == 1) is only understood by
-    // the MKL kernel. The graph emits it only inside the MKL envelope, so a
-    // sentinel reaching this point means a runtime condition outside the
-    // graph's sight (GGML_SYCL_ENABLE_MKL_FA=0, sinks, pathological strides).
-    // TILE/VEC would read the [1, n_past+1] tensor as a full [n_kv, n_tokens]
-    // mask and silently produce garbage -- abort instead.
+    // An implicit-causal sentinel (mask->ne[0] == 1) is only understood by the
+    // MKL, ONE-DNN, and XMX kernels. A sentinel reaching this point means those
+    // all declined (GGML_SYCL_ENABLE_MKL_FA=0 + ONE-DNN gate miss, sinks,
+    // pathological strides). TILE/VEC would read the [1, n_past+1] tensor as a
+    // full [n_kv, n_tokens] mask and silently produce garbage -- abort instead.
     if (mask && mask->ne[0] == 1) {
-        GGML_ABORT("implicit-causal mask sentinel reached a non-MKL FA kernel "
-                   "(check GGML_SYCL_ENABLE_MKL_FA, sinks, and KV strides)");
+        GGML_ABORT("implicit-causal mask sentinel reached a non-MKL/ONE-DNN/XMX FA kernel "
+                   "(check GGML_SYCL_ENABLE_MKL_FA, the oneDNN gate, sinks, and KV strides)");
     }
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {

@@ -506,7 +506,12 @@ struct sdpa_partition {
     dnnl::graph::compiled_partition          cp;
     std::vector<dnnl::graph::logical_tensor> ins;
     dnnl::graph::logical_tensor              out;
-    size_t id_q = 0, id_k = 0, id_v = 0, id_scale = 0, id_mask = 0;
+    size_t id_q = 0, id_k = 0, id_v = 0, id_scale = 0, id_mask = 0, id_kvlen = 0, id_qlen = 0, id_ninf = 0;
+    // implicit-causal offset scalars, owned here so the host pointers handed to
+    // tensor::make_scalar_tensor outlive the in-flight execute.
+    int32_t kvlen_val = 0, qlen_val = 0;
+    float   ninf_val  = -INFINITY;
+    dnnl::graph::logical_tensor lt_kvlen, lt_qlen, lt_ninf;   // original lts: partition ports drop the host_scalar property
     bool   has_mask = false;
     bool   ok = false;
 };

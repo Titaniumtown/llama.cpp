@@ -411,18 +411,20 @@ struct server_slot {
 
         const int64_t t_start = ggml_time_us();
 
-        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        auto * cur = prompt_cache.alloc(prompt, [&](size_t & size_tgt, size_t & size_dft) {
+            size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
-        const size_t cur_size = cur_size_tgt + cur_size_dft;
-
-        SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
-                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
-
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+            SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
+                    (int) prompt.tokens.size(), (size_tgt + size_dft) / (1024.0 * 1024.0), size_dft / (1024.0 * 1024.0));
+        });
         if (cur == nullptr) {
             return false;
         }
+
+        const size_t cur_size_tgt = cur->data.main.size();
+        const size_t cur_size_dft = cur->data.drft.size();
+
         // idle: task is null. the slot fields are the launch/restore stamp. task_prev
         // is only the fallback when those fields were never set
         if (!agent.empty() || !session.empty()) {

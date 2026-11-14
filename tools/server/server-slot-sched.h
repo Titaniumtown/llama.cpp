@@ -206,7 +206,9 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    // state_size(tgt, dft) reports the bytes of the slot's state; it is called only when
+    // the tier does not already hold the prompt
+    server_prompt_cache_state * alloc(const server_prompt & prompt, const std::function<void(size_t &, size_t &)> & state_size);
 
     // the cached state that is a better starting point than `prompt` for `tokens_new`, states.end() if none
     // lcp: the common prefix of that state with `tokens_new`

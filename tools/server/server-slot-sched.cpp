@@ -261,7 +261,7 @@ std::list<server_prompt_cache_state>::iterator server_prompt_cache::victim() {
     return chosen;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, const std::function<void(size_t &, size_t &)> & state_size) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
@@ -271,6 +271,12 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             return nullptr;
         }
     }
+
+    // sized only now: the size query walks every cell of the sequence (14 ms at 98k), and an
+    // idle slot whose state the tier already holds is offered again on every task launch
+    size_t state_size_tgt = 0;
+    size_t state_size_dft = 0;
+    state_size(state_size_tgt, state_size_dft);
 
     // keep checkpoints at fixed token positions, not list indices: the selection and its
     // rationale live in server-prompt-cache-spread.h. a checkpoint does not change after it

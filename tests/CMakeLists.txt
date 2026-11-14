@@ -319,6 +319,8 @@ llama_build_and_test(test-disk-entry-checksum.cpp LINK server-context vendor::ha
 target_include_directories(test-disk-entry-checksum PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 llama_build_and_test(test-disk-read-bar.cpp LINK server-context)
 target_include_directories(test-disk-read-bar PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+llama_build_and_test(test-prompt-save-cost.cpp LINK server-context)
+target_include_directories(test-prompt-save-cost PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 llama_build_and_test(test-disk-prune-value.cpp)
 target_include_directories(test-disk-prune-value PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 llama_build_and_test(test-disk-read-sched.cpp)

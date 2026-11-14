@@ -613,11 +613,16 @@ struct ggml_backend_sycl_context {
         std::unique_ptr<ggml_sycl_pool_alloc<char>> buf;
         // Producer-emitted entries (the glu-epi anchor) live in the ctx-owned side
         // buffer below, NOT in buf: the anchor kernel still READS the previous entry's
-        // buf as its own activation, and the src1q pool is stack-disciplined, so the
-        // producer can neither free buf (kernel not yet run) nor allocate on top of it
-        // and free later (LIFO violation, asserts in the pool). When ext is set it is
-        // the entry's storage and buf is just the previous allocation kept for pool
-        // discipline; the next consumer store frees buf as the stack top, as always.
+        // buf as its own activation, so the producer can neither free buf now (that
+        // reader has not finished) nor free it before that reader retires. Not because
+        // the pool would reject the free -- ggml_sycl_pool_vmm's free list takes a free
+        // in any order and hands the range to the next allocation that fits, whatever
+        // may still be reading it -- but because the
+        // caller has to supply the quiescence the free list cannot: it has no view of
+        // submitted work, and the pool never unmaps during runtime, so the range would
+        // come back either way. When ext is set it is the entry's storage and buf is
+        // just the previous allocation, kept until its reader is done; the next
+        // consumer store frees it then.
         char * ext = nullptr;
     } src1_q8;
 
@@ -630,10 +635,13 @@ struct ggml_backend_sycl_context {
     const ggml_cgraph * cur_graph = nullptr;
     int                 cur_node  = -1;
 
-    // The general device pool is stack-disciplined (it asserts that a free is the top of
-    // the stack), so a buffer held across nodes cannot live there. Give the cache its own
-    // pool -- it is the only allocation in it, so LIFO is trivially satisfied. Mirrors the
-    // existing host_pools / fattn_bufs pattern.
+    // The general device pool is shared and short-lived, so a buffer held across nodes
+    // cannot live there: it would sit inside a pool whose other tenants are freed and
+    // re-handed out around it, and the free list has no view of submitted work, so such
+    // a free could not prove that no reader of the buffer is still in flight. Give the
+    // cache its own pool -- it is the only allocation in it, so the only free it ever
+    // sees is its own previous entry. Mirrors the existing host_pools / fattn_bufs
+    // pattern.
     std::unique_ptr<ggml_sycl_pool> src1_pools[GGML_SYCL_MAX_DEVICES];
 
     ggml_sycl_pool & src1_pool(int device) {
@@ -645,9 +653,10 @@ struct ggml_backend_sycl_context {
 
     ggml_sycl_pool & src1_pool() { return src1_pool(device); }
 
-    // A SEPARATE pool, not a second tenant of src1_pools: that pool is stack-disciplined and
-    // holds exactly one allocation, which is what makes LIFO trivially true there. Two caches
-    // replacing their buffers in either order would violate it.
+    // A SEPARATE pool, not a second tenant of src1_pools: that pool holds exactly one
+    // allocation, so the only free it ever sees is its own previous entry. Two caches
+    // replacing their buffers in either order would hand a live reader the other's
+    // bytes.
     std::unique_ptr<ggml_sycl_pool> src1q_pools[GGML_SYCL_MAX_DEVICES];
 
     ggml_sycl_pool & src1q_pool(int device) {

@@ -2167,6 +2167,16 @@ struct ggml_sycl_pool_vmm : public ggml_sycl_pool {
     };
     std::vector<mapping> mappings;
 
+    // Freed VA ranges (address-ordered, coalesced). Fused/elided ops hand
+    // out buffers that outlive their dispatching scope, so frees may arrive
+    // in any order; holes cost nothing physical because the pool never
+    // unmaps pages during runtime.
+    struct block {
+        uintptr_t addr;
+        size_t    size;
+    };
+    std::vector<block> free_blocks;
+
     explicit ggml_sycl_pool_vmm(queue_ptr qptr_, int device_) :
         device(device_),
         ctx(qptr_->get_context()),
@@ -2193,6 +2203,21 @@ struct ggml_sycl_pool_vmm : public ggml_sycl_pool {
     void * alloc(size_t size, size_t * actual_size) override {
         // round up the allocation size to the alignment to ensure that all allocations are aligned for all data types
         size = GGML_PAD(size, SYCL_BUFFER_ALIGNMENT);
+
+        // first-fit from the coalesced free list before bumping the tail
+        for (auto it = free_blocks.begin(); it != free_blocks.end(); ++it) {
+            if (it->size >= size) {
+                void * hole_ptr = reinterpret_cast<void *>(it->addr);
+                *actual_size = size;
+                if (it->size == size) {
+                    free_blocks.erase(it);
+                } else {
+                    it->addr += size;
+                    it->size -= size;
+                }
+                return hole_ptr;
+            }
+        }
 
         size_t avail = pool_size - pool_used;
 
@@ -2261,10 +2286,41 @@ struct ggml_sycl_pool_vmm : public ggml_sycl_pool {
         GGML_LOG_INFO("sycl pool[%d]: freed %llu bytes at %p\n", device, (unsigned long long) size, ptr);
 #endif
 
-        pool_used -= size;
+        uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
 
-        // all deallocations must be in reverse order of the allocations
-        GGML_ASSERT(ptr == reinterpret_cast<void *>(pool_addr + pool_used));
+        // freeing the top of the bump region: shrink and absorb trailing holes
+        if (addr + size == pool_addr + pool_used) {
+            pool_used -= size;
+            for (auto it = free_blocks.begin(); it != free_blocks.end(); ) {
+                if (it->addr + it->size == pool_addr + pool_used) {
+                    pool_used -= it->size;
+                    it = free_blocks.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            return;
+        }
+
+        // out-of-order free: insert address-ordered, coalescing neighbours
+        auto it = std::lower_bound(free_blocks.begin(), free_blocks.end(), addr,
+            [](const block & b, uintptr_t a) { return b.addr < a; });
+        if (it != free_blocks.end() && it->addr == addr + size) {
+            it->addr = addr;
+            it->size += size;
+            if (it != free_blocks.begin()) {
+                auto prev = std::prev(it);
+                if (prev->addr + prev->size == it->addr) {
+                    prev->size += it->size;
+                    free_blocks.erase(it);
+                }
+            }
+        } else if (it != free_blocks.begin() &&
+                   std::prev(it)->addr + std::prev(it)->size == addr) {
+            std::prev(it)->size += size;
+        } else {
+            free_blocks.insert(it, { addr, size });
+        }
     }
 };
 #endif // defined(GGML_SYCL_SUPPORT_VMM)
@@ -3559,13 +3615,17 @@ char * ggml_sycl_src1_q8_store_ext(ggml_backend_sycl_context & ctx, const void *
     auto & c = ctx.src1_q8;
     // A producer whose OWN kernel reads the current entry (the glu-epi anchor consumes
     // the norm mirror and emits the GLU mirror from one launch) cannot use the pool:
-    // it can neither free the current buffer here (its kernel has not run) nor allocate
-    // on top and free later (the src1q pool is a stack -- LIFO assert). Those entries
-    // live in a ctx-owned grow-only USM buffer outside every pool; c.buf is left
-    // untouched and the next consumer store frees it as the stack top, exactly as
-    // before. Producers whose kernels read only f32 srcs (norm, MUL, standalone GLU)
-    // keep the pool path -- free-then-alloc is in-order-safe for them, and it keeps the
-    // norm mirror and a subsequent anchor emission in disjoint storage by construction.
+    // it can neither free the current buffer here (its kernel has not run) nor free it
+    // later. Not because the pool would reject the free -- ggml_sycl_pool_vmm's free
+    // list takes one in any order and hands the range to the next allocation that fits
+    // -- but because that list cannot tell a reader is done: it has no view of submitted
+    // work, and the pool never unmaps pages during runtime, so the range would come
+    // back under a kernel still in flight. Those entries live in a ctx-owned grow-only USM
+    // buffer outside every pool; c.buf is left untouched and the next consumer store
+    // frees it once that reader is done, exactly as before. Producers whose kernels read
+    // only f32 srcs (norm, MUL, standalone GLU) keep the pool path -- free-then-alloc is
+    // in-order-safe for them, and it keeps the norm mirror and a subsequent anchor
+    // emission in disjoint storage by construction.
     if (!self_reading) {
         char * p = src1_q8_store(ctx, key, strm, bytes, src_ne, variant);
         if (out != nullptr && ctx.cur_graph != nullptr) {
@@ -11095,8 +11155,12 @@ static ggml_backend_dev_t ggml_backend_sycl_reg_get_device(ggml_backend_reg_t re
 // 4 * nelem bytes. Both paths reinterpret the same bytes (small path
 // as nelem floats; large path as outbox + inbox = 2*nelem uint16_t
 // each, using the full 4*nelem byte budget either way). Single
-// alloc+free per device keeps the SYCL pool's strict-LIFO invariant
-// trivial.
+// alloc+free per device makes the buffer's lifetime the pool's whole
+// story: with no second tenant, no free can interleave and hand this
+// range to someone else under a reader that has not finished -- a
+// discipline ggml_sycl_pool_vmm's free list does not have, since it
+// takes frees in any order and never learns whether submitted work
+// is done.
 //
 // For non-(N=2 FP32 contiguous) cases, comm_init or comm_allreduce_tensor
 // returns null/false, causing the meta-backend to use its generic

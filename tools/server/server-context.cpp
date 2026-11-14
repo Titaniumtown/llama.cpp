@@ -364,6 +364,9 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // what the cache offered this slot's current prompt, for the near-cold report below
+    server_prompt_cache_decision cache_decision;
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -398,7 +401,7 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::vector<common_adapter_lora_info> & lora_new) {
-        bool res = prompt_cache.load(prompt, tokens, lora_new, ctx_tgt, ctx_dft, id);
+        bool res = prompt_cache.load(prompt, tokens, lora_new, ctx_tgt, ctx_dft, id, &cache_decision);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -4119,6 +4122,9 @@ private:
                     }
 
                     // the task is not deferred past this point
+                    // the near-cold report below reads what this task's load found, not the last one
+                    slot->cache_decision = server_prompt_cache_decision();
+
                     if (plan.update_cache && prompt_cache) {
                         update_prompt_cache(*slot, task);
                     }
@@ -5624,9 +5630,15 @@ private:
                         // conversations are interleaved than the slots can keep heads for, so only
                         // the shared prefix is left to reuse and the prompt is processed again.
                         if (slot.task->n_tokens() > 1024 && n_past < slot.task->n_tokens() / 5) {
-                            SLT_WRN(slot, "cache miss: re-processed %d of %d prompt tokens (%d cached), newest checkpoint at %d\n",
+                            SLT_WRN(slot, "cache miss: re-processed %d of %d prompt tokens (%d cached), newest checkpoint at %d; "
+                                    "cache: slot %d, ram %d entries best %d (%d seen), disk %d entries best %d (%d seen), restored %d%s\n",
                                     (int) slot.task->n_tokens() - (int) n_past, (int) slot.task->n_tokens(), (int) n_past,
-                                    slot.prompt.checkpoints.empty() ? 0 : (int) slot.prompt.checkpoints.back()->n_tokens);
+                                    slot.prompt.checkpoints.empty() ? 0 : (int) slot.prompt.checkpoints.back()->n_tokens,
+                                    slot.cache_decision.slot_lcp,
+                                    slot.cache_decision.ram_count, slot.cache_decision.ram_best, slot.cache_decision.ram_seen,
+                                    slot.cache_decision.disk_count, slot.cache_decision.disk_best, slot.cache_decision.disk_seen,
+                                    slot.cache_decision.chosen_lcp,
+                                    slot.cache_decision.chosen_disk ? (slot.cache_decision.chosen_partial ? " (disk, partial)" : " (disk)") : "");
 
                             metrics.add_request_reprocessed();
                         }

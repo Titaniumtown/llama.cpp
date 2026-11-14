@@ -311,6 +311,8 @@ llama_build_and_test(test-chat-auto-parser.cpp  LABEL behavior  WORKING_DIRECTOR
 llama_build_and_test(test-chat-template.cpp  LABEL behavior)
 llama_build_and_test(test-disk-entry-classify.cpp)
 target_include_directories(test-disk-entry-classify PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+llama_build_and_test(test-disk-fetch-floor.cpp)
+target_include_directories(test-disk-fetch-floor PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 llama_build_and_test(test-server-common.cpp  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 target_link_libraries(test-server-common PRIVATE server-context)
 target_include_directories(test-server-common PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)

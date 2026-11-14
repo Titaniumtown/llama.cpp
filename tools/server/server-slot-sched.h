@@ -126,6 +126,22 @@ struct server_prompt_cache_state {
     }
 };
 
+// what each tier offered one request, and what was taken. the near-cold line prints it, so a
+// prompt the cache barely served says why: neither tier had a head for it, or the head was
+// there and the keep gate or the RAM-first rule refused it
+struct server_prompt_cache_decision {
+    int  slot_lcp    = -1;    // tokens the slot's own prompt already shares with the request
+    int  ram_count   = 0;     // entries in the RAM tier
+    int  ram_best    = -1;    // best lcp among the RAM entries that pass the keep gate
+    int  ram_seen    = -1;    // best lcp over every RAM entry, gate included
+    int  disk_count  = 0;     // entries in the disk tier
+    int  disk_best   = -1;    // best lcp among the disk entries that pass the keep gate
+    int  disk_seen   = -1;    // best lcp over every disk entry, gate included
+    int  chosen_lcp  = -1;    // lcp of the entry that was restored
+    bool chosen_disk = false; // the restored entry came off the disk
+    bool chosen_partial = false; // ... and reused under a quarter of it, so it was kept
+};
+
 struct server_prompt_cache {
     ~server_prompt_cache();
 
@@ -163,8 +179,9 @@ struct server_prompt_cache {
 
     bool has_better(const server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new) const;
 
-    // restore the result of find_better into the slot `id_slot`
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    // restore the entry with the longest usable head, from either tier, into the slot `id_slot`
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+            server_prompt_cache_decision * decision = nullptr);
 
     void update();
 
@@ -191,9 +208,23 @@ struct server_prompt_cache {
     // hand one state to the writer thread; the caller's copy is gone afterwards
     void disk_spill(server_prompt_cache_state & state);
 
-    // read the best matching entry off the disk into `out` (and remove it: the state then
-    // lives in the slot, not in two places). false when nothing on disk beats the slot
-    bool disk_load(server_prompt_cache_state & out, const server_prompt & prompt_slot, const server_tokens & tokens_new);
+    // a disk entry that survived the keep gate, before its state is read
+    struct disk_hit {
+        std::string path;
+        size_t      size = 0;
+        int         lcp  = -1;     // < 0: the tier held nothing that beats the slot
+        float       keep = 0.0f;   // lcp / entry tokens
+        float       sim  = 0.0f;   // lcp / request tokens
+        bool        partial = false; // the head reuses under a quarter of the entry
+        int         first_rung = 0;  // the first checkpoint the entry can land on
+    };
+
+    // which entry the disk tier would serve this request with, without materializing it
+    disk_hit disk_find(const server_prompt & prompt_slot, const server_tokens & tokens_new, server_prompt_cache_decision & decision);
+
+    // read `hit` off the disk into `out` and remove it: the state then lives in the slot, not
+    // in two places. false leaves the tier untouched
+    bool disk_fetch(const disk_hit & hit, server_prompt_cache_state & out);
 
     std::string disk_dir;
     size_t      disk_limit       = 0;

@@ -388,44 +388,147 @@ bool server_prompt_cache::has_better(const server_prompt & prompt, const server_
     return find_better(prompt, tokens_new, lora_new, lcp) != states.cend();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    int lcp_best = 0;
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+        server_prompt_cache_decision * decision) {
+    // a prompt made with another lora config is cleared before the new one starts, so it counts as empty
+    const bool is_empty = prompt.tokens.empty() || lora_should_clear_cache(prompt.lora, lora_new);
 
-    const auto it_found = find_better(prompt, tokens_new, lora_new, lcp_best);
+    const int lcp_best = is_empty ? 0 : prompt.tokens.get_common_prefix(tokens_new);
 
-    // an empty erase gives a mutable iterator to the same entry, its prompt is moved out below
-    const auto it_best = states.erase(it_found, it_found);
+    float f_keep_best = is_empty ? -1.0f : float(lcp_best) / prompt.tokens.size(); // empty slot: any cache entry wins
+    float f_sim_best  = float(lcp_best) / tokens_new.size();
 
-    if (it_best != states.end()) {
-        const int64_t t_start = ggml_time_us();
+    server_prompt_cache_decision dec;
+
+    dec.slot_lcp  = is_empty ? -1 : lcp_best;
+    dec.ram_count = (int) states.size();
+
+    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+
+    auto it_best = states.end();
+
+    int  lcp_ram     = -1;
+    bool ram_partial = false; // ... and the entry stays in the tier, its head only borrowed
+
+    // find the most similar cached prompt, that would also preserve the most context
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        if (lora_should_clear_cache(it->prompt.lora, lora_new)) {
+            SRV_TRC("   - prompt with length %7zu, skipping, other lora config\n", it->prompt.tokens.size());
+            continue;
+        }
+
+        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+
+        const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
+        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
+
+        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
+
+        dec.ram_seen = std::max(dec.ram_seen, lcp_cur);
+
+        // a head that keeps a quarter of its entry is taken whole and the entry is consumed.
+        // a shorter head is the prefix two conversations of one fleet share, and the resident
+        // tier can lend it: the state is copied into the slot's context, not moved out of the
+        // entry, so the owner's next turn still finds its state where it left it
+        const bool keeps      = f_keep_cur >= 0.25f; // don't trash large prompts
+        // a borrow under the entry's first rung resumes at 0: the copy and the repack buy
+        // nothing, so the floor is that rung, not a token count of its own
+        const bool borrowable = lcp_cur >= server_prompt_cache_first_rung(it->prompt.tokens.size(), min_step, (int) max_checkpoints);
+
+        if (!keeps && !borrowable) {
+            continue;
+        }
+
+        // the longest head wins: requiring a candidate to beat the standing one on both
+        // fractions skipped a longer head inside a larger entry
+        if (lcp_cur > lcp_ram && lcp_cur > lcp_best) {
+            lcp_ram     = lcp_cur;
+            ram_partial = !keeps;
+            it_best     = it;
+        }
+    }
+
+    dec.ram_best = lcp_ram;
+
+    // the disk tier is consulted on every request, not only when the RAM tier has nothing: a
+    // RAM entry that keeps the prompt poorly (a short head, or one another conversation
+    // shares) used to pre-empt a disk entry that keeps most of it, and the slot resumed from
+    // the short head and re-processed the rest
+    disk_hit hit;
+
+    if (disk_enabled() && lora_new.empty()) {
+        hit = disk_find(prompt, tokens_new, dec);
+    }
+
+    // the fetch gate (read cost vs. saved prefill, absolute floor) lives in
+    // server-prompt-cache-disk.h, where the test pins it
+    const bool disk_wins = server_prompt_cache_disk_wins(hit.lcp, lcp_ram, hit.size, hit.first_rung);
+
+    if (disk_wins) {
+        server_prompt_cache_state fetched;
+
+        if (disk_fetch(hit, fetched)) {
+            const int64_t t_restore = ggml_time_us();
+
+            if (!pcache_restore_state(fetched.data, ctx_tgt, ctx_dft, id_slot)) {
+                return false;
+            }
+
+            SRV_INF("prompt cache: restored %zu MB from disk in %.2f ms\n",
+                    fetched.data.main.size() / (1024 * 1024), (ggml_time_us() - t_restore) / 1000.0);
+
+            prompt = std::move(fetched.prompt);
+
+            dec.chosen_lcp     = hit.lcp;
+            dec.chosen_disk    = true;
+            dec.chosen_partial = hit.partial;
+        }
+        // a refused fetch (memory, I/O) falls through to the RAM entry
+    }
+
+    if (!dec.chosen_disk && it_best != states.end()) {
+        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+
+        const int64_t t_restore = ggml_time_us();
 
         if (!pcache_restore_state(it_best->data, ctx_tgt, ctx_dft, id_slot)) {
             return false;
         }
 
         SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_RESTORE__\n");
+        SRV_INF("prompt cache: restored %zu MB from RAM in %.2f ms\n",
+                it_best->data.main.size() / (1024 * 1024), (ggml_time_us() - t_restore) / 1000.0);
 
-        // the whole cached prompt is a prefix of the new one
-        if (lcp_best == (int) it_best->prompt.tokens.size()) {
-            SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
-        }
+        if (ram_partial) {
+            // a borrowed head: the entry is another conversation's state and its owner's next
+            // turn wants the rest of it. the restore copied the state into this slot's context,
+            // so the entry can stay where it is at the memory it already occupies -- and the
+            // slot needs its own copy of the token list to name what its KV now holds
+            prompt = it_best->prompt.clone();
 
-        prompt = std::move(it_best->prompt);
+            SRV_INF("prompt cache: borrowed the %d-token head of a %zu-token entry\n",
+                    lcp_ram, it_best->prompt.tokens.size());
+        } else {
+            it_best->data.main.clear();
+            it_best->data.main.shrink_to_fit();
+            it_best->data.drft.clear();
+            it_best->data.drft.shrink_to_fit();
 
-        states.erase(it_best);
-
-        SRV_TRC("slot %d: prompt cache restore took %.2f ms\n", id_slot, (ggml_time_us() - t_start) / 1000.0);
-    } else if (disk_enabled() && lora_new.empty()) {
-        // the RAM tier has nothing better; the disk tier holds what the RAM limit evicted
-        server_prompt_cache_state fetched;
-
-        if (disk_load(fetched, prompt, tokens_new)) {
-            if (!pcache_restore_state(fetched.data, ctx_tgt, ctx_dft, id_slot)) {
-                return false;
+            // the whole cached prompt is a prefix of the new one
+            if (lcp_best == (int) it_best->prompt.tokens.size()) {
+                SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
             }
 
-            prompt = std::move(fetched.prompt);
+            prompt = std::move(it_best->prompt);
+
+            states.erase(it_best);
         }
+
+        dec.chosen_lcp = lcp_ram;
+    }
+
+    if (decision != nullptr) {
+        *decision = dec;
     }
 
     return true;
@@ -1122,68 +1225,97 @@ void server_prompt_cache::disk_prune() {
     }
 }
 
-bool server_prompt_cache::disk_load(server_prompt_cache_state & out, const server_prompt & prompt_slot, const server_tokens & tokens_new) {
+server_prompt_cache::disk_hit server_prompt_cache::disk_find(const server_prompt & prompt_slot, const server_tokens & tokens_new, server_prompt_cache_decision & dec) {
+    disk_hit hit;
+
     if (disk_dir.empty()) {
+        return hit;
+    }
+
+    std::lock_guard<std::mutex> lock(disk_mutex);
+
+    // the slot's own prompt is the bar to clear: a disk entry has to offer a longer head
+    const int lcp_slot = prompt_slot.tokens.size() > 0 ? prompt_slot.tokens.get_common_prefix(tokens_new) : 0;
+
+    const disk_state * best = nullptr;
+    int lcp_hit = -1;
+
+    dec.disk_count = (int) disk_states.size();
+
+    for (const auto & e : disk_states) {
+        const int lcp = e.tokens.get_common_prefix(tokens_new);
+
+        const float f_keep = e.tokens.size() > 0 ? float(lcp) / e.tokens.size() : 0.0f;
+        const float f_sim  = float(lcp) / tokens_new.size();
+
+        SRV_TRC("prompt cache: disk entry %zu tokens, lcp = %d, f_keep = %.3f, f_sim = %.3f\n",
+                e.tokens.size(), lcp, f_keep, f_sim);
+
+        dec.disk_seen = std::max(dec.disk_seen, lcp);
+
+        if (lcp <= lcp_slot) {
+            continue;
+        }
+
+        // the RAM tier refuses entries that keep under a quarter of themselves because restoring
+        // one consumes it, and the rest of its state goes with it. a disk entry costs the read
+        // and, when the head is partial, can stay where it is: what it has to clear is the read
+        // (1 token of reuse per 1.5 MB of entry, doubled), not a fraction of itself
+        const int reuse_floor = std::max(2048, (int) (e.size / 750'000));
+
+        if (f_keep < 0.25f && lcp < reuse_floor) {
+            continue;
+        }
+
+        // the longest head wins: that is the number of tokens the request does not re-process
+        if (lcp > lcp_hit) {
+            best    = &e;
+            lcp_hit = lcp;
+        }
+    }
+
+    if (best == nullptr) {
+        return hit;
+    }
+
+    dec.disk_best = lcp_hit;
+
+    hit.path = best->path;
+    hit.size = best->size;
+    hit.lcp  = lcp_hit;
+    hit.keep = best->tokens.size() > 0 ? float(lcp_hit) / best->tokens.size() : 0.0f;
+    hit.sim  = float(lcp_hit) / tokens_new.size();
+    hit.partial = hit.keep < 0.25f;
+    hit.first_rung = server_prompt_cache_first_rung(best->tokens.size(), min_step, (int) max_checkpoints);
+
+    SRV_TRC("prompt cache: disk entry '%s' would serve lcp = %d of %zu tokens (f_keep = %.3f, f_sim = %.3f%s)\n",
+            hit.path.c_str(), hit.lcp, tokens_new.size(), hit.keep, hit.sim, hit.partial ? ", partial" : "");
+
+    return hit;
+}
+
+bool server_prompt_cache::disk_fetch(const disk_hit & hit, server_prompt_cache_state & out) {
+    if (hit.lcp < 0) {
         return false;
     }
 
-    std::string path;
-
-    {
-        std::lock_guard<std::mutex> lock(disk_mutex);
-
-        // the same rule the RAM tier uses: the best entry that keeps at least a quarter of
-        // itself, beating both the slot's current prompt and every other candidate
-        const int lcp_slot = prompt_slot.tokens.size() > 0 ? prompt_slot.tokens.get_common_prefix(tokens_new) : 0;
-
-        float f_keep_best = prompt_slot.tokens.size() > 0 ? float(lcp_slot) / prompt_slot.tokens.size() : -1.0f;
-        float f_sim_best  = float(lcp_slot) / tokens_new.size();
-
-        disk_state * best = nullptr;
-
-        for (auto & e : disk_states) {
-            const int lcp = e.tokens.get_common_prefix(tokens_new);
-
-            const float f_keep = e.tokens.size() > 0 ? float(lcp) / e.tokens.size() : 0.0f;
-            const float f_sim  = float(lcp) / tokens_new.size();
-
-            SRV_TRC("prompt cache: disk entry %zu tokens, lcp = %d, f_keep = %.3f, f_sim = %.3f\n",
-                    e.tokens.size(), lcp, f_keep, f_sim);
-
-            if (f_keep < 0.25f) {
-                continue;
-            }
-
-            if (f_keep_best < f_keep && f_sim_best < f_sim) {
-                f_keep_best = f_keep;
-                f_sim_best  = f_sim;
-                best        = &e;
-            }
-        }
-
-        if (best == nullptr) {
-            return false;
-        }
-
-        // a fetch materializes the whole state at once, next to a loaded model whose ZFS ARC
-        // may already hold most of the box: never spend more than half of what is available
-        const size_t mem_avail = pcache_mem_available_bytes();
-        if (mem_avail > 0 && best->size > mem_avail / 2) {
-            SRV_WRN("prompt cache: not fetching %.2f MiB from disk, %.2f GiB of memory available\n",
-                    best->size / (1024.0 * 1024.0), mem_avail / (1024.0 * 1024.0 * 1024.0));
-            return false;
-        }
-
-        SRV_INF("prompt cache: fetching entry from disk (f_keep = %.3f, f_sim = %.3f)\n", f_keep_best, f_sim_best);
-
-        path = best->path;
+    // a fetch materializes the whole state at once, next to a loaded model whose ZFS ARC may
+    // already hold most of the box: never spend more than half of what is available
+    const size_t mem_avail = pcache_mem_available_bytes();
+    if (mem_avail > 0 && hit.size > mem_avail / 2) {
+        SRV_WRN("prompt cache: not fetching %.2f MiB from disk, %.2f GiB of memory available\n",
+                hit.size / (1024.0 * 1024.0), mem_avail / (1024.0 * 1024.0 * 1024.0));
+        return false;
     }
+
+    SRV_INF("prompt cache: fetching entry from disk (lcp = %d, f_keep = %.3f, f_sim = %.3f%s)\n",
+            hit.lcp, hit.keep, hit.sim, hit.partial ? ", keeping it" : "");
 
     // the read happens outside the lock: a multi-GiB read is seconds, and the writer thread
     // must not be blocked behind it
-    FILE * file = fopen(path.c_str(), "rb");
+    FILE * file = fopen(hit.path.c_str(), "rb");
     if (file == nullptr) {
-        SRV_WRN("prompt cache: cannot open '%s': %s\n", path.c_str(), strerror(errno));
+        SRV_WRN("prompt cache: cannot open '%s': %s\n", hit.path.c_str(), strerror(errno));
         return false;
     }
 
@@ -1191,30 +1323,52 @@ bool server_prompt_cache::disk_load(server_prompt_cache_state & out, const serve
     out.data.main.clear();
     out.data.drft.clear();
 
+    const int64_t t_read = ggml_time_us();
+
     const bool ok = pcache_read_entry(file, disk_fingerprint, out);
     fclose(file);
 
+    const int64_t t_read_us = ggml_time_us() - t_read;
+
+    if (ok) {
+        SRV_INF("prompt cache: read %s in %.2f ms (%.0f MB/s)\n",
+                hit.path.c_str(), t_read_us / 1000.0,
+                t_read_us > 0 ? 1e6 * (double) hit.size / (double) t_read_us / (1024.0 * 1024.0) : 0.0);
+    }
+
     if (!ok) {
-        SRV_WRN("prompt cache: '%s' is truncated, dropping it\n", path.c_str());
+        SRV_WRN("prompt cache: '%s' is truncated, dropping it\n", hit.path.c_str());
         return false;
     }
 
-    // the state is about to be in the slot, not in two places: drop the file and its index
-    // entry now that the read succeeded
     {
         std::lock_guard<std::mutex> lock(disk_mutex);
 
-        for (auto it = disk_states.begin(); it != disk_states.end(); ++it) {
-            if (it->path == path) {
+        auto it = disk_states.begin();
+        for (; it != disk_states.end(); ++it) {
+            if (it->path == hit.path) {
+                break;
+            }
+        }
+
+        if (it != disk_states.end()) {
+            // a partial head is a shared prefix: another conversation's state, of which this
+            // request uses the head. the owner's next turn wants the rest, so the file stays
+            // where it is and only its use is recorded. a full head moves: the state is about
+            // to be in the slot, not in two places
+            if (hit.partial) {
+                it->last_use_us = ggml_time_us();
+            } else {
                 disk_used -= it->size;
                 disk_states.erase(it);
-                break;
             }
         }
     }
 
-    std::error_code ec;
-    std::filesystem::remove(path, ec);
+    if (!hit.partial) {
+        std::error_code ec;
+        std::filesystem::remove(hit.path, ec);
+    }
 
     return true;
 }

@@ -130,6 +130,63 @@ static bool ggml_sycl_fattn_kv_reorder_foreign(const ggml_tensor * K, const ggml
     return (ggml_sycl_kv_reorder_seg(K) > 0 && !k_ok) ||
            (ggml_sycl_kv_reorder_seg(V) > 0 && !v_ok);
 }
+
+// MKL path: XMX-accelerated GEMM for prompt processing (all KV cache types).
+// The MKL kernel converts non-F16 K/V to F16 via to_fp16_sycl before GEMM,
+// so quantized, F16, BF16, and F32 caches all benefit from XMX acceleration.
+// Activates automatically when flash-attn is enabled (--flash-attn on or -fa)
+// and n_kv >= 1024. Falls through to TILE/VEC for ALiBi, logit softcap,
+// and mismatched batch dimensions (unsupported by the MKL kernel).
+// Set GGML_SYCL_ENABLE_MKL_FA=0 to force TILE/VEC path for A/B testing.
+// Example: GGML_SYCL_ENABLE_MKL_FA=0 llama-cli -m model.gguf -fa -ngl 99 ...
+// Note: MKL GEMM calls are incompatible with SYCL graph capture replay.
+bool ggml_sycl_flash_attn_ext_mkl_supported(const ggml_tensor * dst) {
+    const ggml_tensor * Q     = dst->src[0];
+    const ggml_tensor * K     = dst->src[1];
+    const ggml_tensor * V     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    const bool standard_shape = Q->ne[0] >= 64 && Q->ne[0] <= 512 &&
+        Q->ne[0] % 64 == 0 && Q->ne[0] == V->ne[0];
+    // GLM-4.7 Flash's MLA shape is already expressible by the MKL pipeline:
+    // KQ GEMM uses DKQ=576 while VKQ and output use DV=512. Keep this narrow
+    // until other mismatched K/V shapes have independent correctness data.
+    const bool glm_mla_shape = Q->ne[0] == 576 && K->ne[0] == 576 &&
+        V->ne[0] == 512 && gqa_ratio == 20 &&
+        K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
+
+    if (!(g_ggml_sycl_enable_mkl_fa == 1 && mask && !sinks && gqa_ratio >= 2 &&
+          !ggml_sycl_fattn_kv_reorder_foreign(K, V) &&
+          (standard_shape || glm_mla_shape) &&
+          Q->ne[1] >= 32 && K->ne[1] >= 1024 &&
+          max_bias == 0.0f && logit_softcap == 0.0f &&
+          (Q->ne[3] == K->ne[3] || K->ne[3] == 1))) {
+        return false;
+    }
+    // F16 K/V strides must be a multiple of ne[0]*2 (the natural row size
+    // in bytes). This passes both dense (nb1 == ne0*2) and interleaved
+    // (nb1 == H * ne0*2). Only pathological test strides like nb1=32 or
+    // nb1=75 for ne0=40 fall through to TILE.
+    for (const ggml_tensor * t : {K, V}) {
+        const bool glm_v_stride = glm_mla_shape && t == V &&
+            V->view_src && V->nb[1] == K->nb[1];
+        if (!glm_v_stride && t->type == GGML_TYPE_F16 &&
+                t->nb[1] % (t->ne[0] * 2) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef SYCL_FLASH_ATTN
     GGML_UNUSED(dst);
@@ -143,7 +200,6 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
-    const ggml_tensor * sinks = dst->src[4];
 
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
@@ -173,47 +229,8 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_ONEDNN;
     }
 
-    // MKL path: XMX-accelerated GEMM for prompt processing (all KV cache types).
-    // The MKL kernel converts non-F16 K/V to F16 via to_fp16_sycl before GEMM,
-    // so quantized, F16, BF16, and F32 caches all benefit from XMX acceleration.
-    // Activates automatically when flash-attn is enabled (--flash-attn on or -fa)
-    // and n_kv >= 1024. Falls through to TILE/VEC for ALiBi, logit softcap,
-    // and mismatched batch dimensions (unsupported by the MKL kernel).
-    // Set GGML_SYCL_ENABLE_MKL_FA=0 to force TILE/VEC path for A/B testing.
-    // Example: GGML_SYCL_ENABLE_MKL_FA=0 llama-cli -m model.gguf -fa -ngl 99 ...
-    // Note: MKL GEMM calls are incompatible with SYCL graph capture replay.
-    const bool standard_shape = Q->ne[0] >= 64 && Q->ne[0] <= 512 &&
-        Q->ne[0] % 64 == 0 && Q->ne[0] == V->ne[0];
-    // GLM-4.7 Flash's MLA shape is already expressible by the MKL pipeline:
-    // KQ GEMM uses DKQ=576 while VKQ and output use DV=512. Keep this narrow
-    // until other mismatched K/V shapes have independent correctness data.
-    const bool glm_mla_shape = Q->ne[0] == 576 && K->ne[0] == 576 &&
-        V->ne[0] == 512 && gqa_ratio == 20 &&
-        K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
-
-    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && !sinks && gqa_ratio >= 2 &&
-        !ggml_sycl_fattn_kv_reorder_foreign(K, V) &&
-        (standard_shape || glm_mla_shape) &&
-        Q->ne[1] >= 32 && K->ne[1] >= 1024 &&
-        max_bias == 0.0f && logit_softcap == 0.0f &&
-        (Q->ne[3] == K->ne[3] || K->ne[3] == 1)) {
-        // F16 K/V strides must be a multiple of ne[0]*2 (the natural row size
-        // in bytes). This passes both dense (nb1 == ne0*2) and interleaved
-        // (nb1 == H * ne0*2). Only pathological test strides like nb1=32 or
-        // nb1=75 for ne0=40 fall through to TILE.
-        bool kv_strides_ok = true;
-        for (const ggml_tensor * t : {K, V}) {
-            const bool glm_v_stride = glm_mla_shape && t == V &&
-                V->view_src && V->nb[1] == K->nb[1];
-            if (!glm_v_stride && t->type == GGML_TYPE_F16 &&
-                    t->nb[1] % (t->ne[0] * 2) != 0) {
-                kv_strides_ok = false;
-                break;
-            }
-        }
-        if (kv_strides_ok) {
-            return BEST_FATTN_KERNEL_MKL;
-        }
+    if (ggml_sycl_flash_attn_ext_mkl_supported(dst)) {
+        return BEST_FATTN_KERNEL_MKL;
     }
 
     // Decode over a row-split cache: both products on XMX. Ahead of the implicit-causal TILE

@@ -518,6 +518,7 @@ struct sdpa_partition {
     float   ninf_val  = -INFINITY;
     dnnl::graph::logical_tensor lt_kvlen, lt_qlen, lt_ninf;   // original lts: partition ports drop the host_scalar property
     bool   has_mask = false;
+    bool   unfused  = false;   // compiled without oneDNN's fused SDPA kernel
     bool   ok = false;
 };
 #endif
@@ -780,6 +781,8 @@ struct ggml_backend_sycl_context {
     }
 
     std::unordered_map<std::string, sdpa_partition> sdpa_partitions;
+    // head sizes whose SDPA graph oneDNN compiled without its fused kernel
+    std::unordered_set<int64_t> sdpa_unfused;
 #endif
 
     // pool

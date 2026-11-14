@@ -228,6 +228,7 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
 #if GGML_SYCL_DNNL
 
 #include "dnnl.hpp"
+#include "dnnl_version.h"
 #include "dnnl_sycl.hpp"
 #include "oneapi/dnnl/dnnl_graph.hpp"   // graph API lives only under oneapi/dnnl/, not at the include root
 
@@ -434,6 +435,17 @@ static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int 
     E.ins      = parts[0].get_input_ports();
     E.out      = parts[0].get_output_ports()[0];
     E.cp       = parts[0].compile(E.ins, {E.out}, eng);
+#if DNNL_VERSION_MAJOR > 3 || (DNNL_VERSION_MAJOR == 3 && DNNL_VERSION_MINOR >= 13)
+    // the fused kernel needs no scratchpad; without it (e.g. the OpenCL driver cannot build oneDNN's microkernels)
+    // oneDNN runs the graph as separate primitives that keep the f32 scores [H, q, seq] in the scratchpad
+    const size_t scratch = E.cp.get_scratchpad_logical_tensor().get_mem_size();
+    E.unfused = scratch >= (size_t) H * q * seq * sizeof(float);
+    static std::atomic<bool> warned{ false };
+    if (E.unfused && !warned.exchange(true)) {
+        GGML_LOG_WARN("%s: oneDNN compiled the SDPA graph without its fused kernel (%zu KiB of scratchpad at q=%d seq=%d)%s\n",
+                      __func__, scratch >> 10, q, seq, g_ggml_sycl_enable_mkl_fa ? "; the MKL kernel runs the shapes it supports" : "");
+    }
+#endif
     E.out      = E.cp.query_logical_tensor(E.out.get_id());
     // E.id_mask and the causal scalar ids were captured when the mask stage was built.
     E.id_q     = query.get_id(); E.id_k = key.get_id(); E.id_v = value.get_id();
@@ -449,7 +461,8 @@ catch (const std::exception & e) {
     return {};
 }
 
-void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
+// false: the node belongs to MKL, which runs outside the try so its failures are not taken for oneDNN's
+static bool ggml_sycl_flash_attn_ext_onednn_run(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
@@ -473,6 +486,17 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     dpct::queue_ptr stream = ctx.stream();
     dnnl::engine    eng    = ctx.engine_dnnl(stream);
     dnnl::stream    strm   = ctx.stream_dnnl(stream);
+
+    // Unfused, oneDNN keeps the scores (H*q*seq floats) in device memory, where the MKL kernel needs none.
+    // MKL GEMM calls cannot be recorded into a SYCL graph, so a recording queue keeps the oneDNN partition.
+    // Fusion depends on the head size, not on q or seq, so a head size seen unfused skips the compile.
+    auto mkl_instead = [&]() {
+        return ggml_sycl_flash_attn_ext_mkl_supported(dst) &&
+               stream->ext_oneapi_get_state() != sycl::ext::oneapi::experimental::queue_state::recording;
+    };
+    if (ctx.sdpa_unfused.count(d) && mkl_instead()) {
+        return false;
+    }
 
     const ggml_sycl_fattn_extra extra = ggml_sycl_fattn_get_extra(dst);
 
@@ -674,7 +698,16 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
         } else {
             ggml_sycl_flash_attn_ext_tile(ctx, dst);
         }
-        return;
+        return true;
+    }
+    if (E.unfused) {
+        // a thin q (<= 16) has its own oneDNN configs, so only a prefill-width verdict speaks for the head size
+        if (q > 16) {
+            ctx.sdpa_unfused.insert(d);
+        }
+        if (mkl_instead()) {
+            return false;
+        }
     }
 
     // The causal offset scalars are per-cache-entry fixed, but keep them fresh here: the
@@ -717,6 +750,7 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     if (ggml_sycl_info().device_count > 1) {
         stream->wait_and_throw();
     }
+    return true;
 }
 catch (const std::exception & e) {
     const ggml_tensor * mfall = dst->src[3];
@@ -730,6 +764,13 @@ catch (const std::exception & e) {
         ggml_sycl_flash_attn_ext_mkl(ctx, dst);
     } else {
         ggml_sycl_flash_attn_ext_tile(ctx, dst);
+    }
+    return true;
+}
+
+void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    if (!ggml_sycl_flash_attn_ext_onednn_run(ctx, dst)) {
+        ggml_sycl_flash_attn_ext_mkl(ctx, dst);
     }
 }
 

@@ -16,7 +16,8 @@ bool ggml_sycl_flash_attn_ext_onednn_failed(int device);
 bool ggml_sycl_fattn_onednn_binds_kv(const ggml_tensor * K, const ggml_tensor * V);
 
 // Run flash attention through oneDNN's fused xmx SDPA
-// execute the cached SDPA partition, write the f32 dst. Falls back to the TILE kernel on any failure.
+// execute the cached SDPA partition, write the f32 dst. Where oneDNN compiled the partition without its fused kernel,
+// runs the MKL kernel instead if it supports the node. Falls back to the TILE kernel on any failure.
 void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
 #endif // GGML_SYCL_FATTN_ONEDNN_HPP

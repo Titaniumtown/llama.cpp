@@ -18,10 +18,75 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+
+// THIS SIZES GRAPH CONSTRUCTION, WHICH NO OTHER INSTRUMENT ON THIS BOX CAN SEE.
+//
+// The SYCL profiler measures device time and the host prologue
+// inside graph_compute_impl. It cannot see this file: build_graph and
+// sched_alloc_graph run on the host, before the backend ever sees the graph.
+//
+// MEASURED, and it is 0.34% of a decode step: over one 256-token completion at
+// --spec-draft-n-max 4, 338 process_ubatch calls, 120 rebuilt, 218 reused (64.5%
+// reused), build_graph 10.048 ms plus sched_alloc_graph 8.156 ms = 18.204 ms.
+//
+// Upstream had a per-call timer here and commented it out. A log line per call is
+// unusable for this question anyway: at ~1.3 graphs per token the output is
+// thousands of lines and the interest is in the total and the per-call
+// distribution. So this accumulates and reports once at exit.
+//
+// LLAMA_GRAPH_PROF=1 enables. The disabled path is one static-local bool and one
+// branch per call site -- no clock read, no allocation, nothing that could move a
+// measurement. ggml_time_us() is a clock read and only happens when enabled.
+struct llama_graph_build_prof {
+    static bool enabled() {
+        static const bool on = [] {
+            const bool e = getenv("LLAMA_GRAPH_PROF") != nullptr;
+            if (e) {
+                atexit(&dump);
+            }
+            return e;
+        }();
+        return on;
+    }
+
+    // Function-local statics rather than in-class static members: the counters are
+    // non-const, and a non-const static data member with an in-class initializer is
+    // C++17-only, while this file's translation unit is not reliably compiled in
+    // that mode. Local statics also give thread-safe initialisation for free and
+    // avoid an out-of-line definition in a header-visible struct.
+    static uint64_t & n_rebuilt() { static uint64_t v = 0; return v; }
+    static uint64_t & n_reused()  { static uint64_t v = 0; return v; }
+    static uint64_t & us_build()  { static uint64_t v = 0; return v; }
+    static uint64_t & us_alloc()  { static uint64_t v = 0; return v; }
+
+    static void dump() {
+        const uint64_t n = n_reused() + n_rebuilt();
+        if (n == 0) {
+            return;
+        }
+        const uint64_t nb = n_rebuilt();
+        fprintf(stderr,
+                "LLAMA_GRAPH_PROF: %llu process_ubatch calls, %llu rebuilt, %llu reused (%.1f%% reused)\n"
+                "  build_graph       %9.3f ms total  %8.4f ms/call\n"
+                "  sched_alloc_graph %9.3f ms total  %8.4f ms/call\n"
+                "  both              %9.3f ms total  %8.4f ms/process_ubatch\n",
+                (unsigned long long) n,
+                (unsigned long long) nb,
+                (unsigned long long) n_reused(),
+                100.0 * (double) n_reused() / (double) n,
+                (double) us_build() / 1e3, nb ? (double) us_build() / 1e3 / nb : 0.0,
+                (double) us_alloc() / 1e3, nb ? (double) us_alloc() / 1e3 / nb : 0.0,
+                (double) (us_build() + us_alloc()) / 1e3,
+                (double) (us_build() + us_alloc()) / 1e3 / n);
+    }
+};
+
 
 //
 // llama_context
@@ -1864,6 +1929,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         n_reused++;
+
+        if (llama_graph_build_prof::enabled()) {
+            llama_graph_build_prof::n_reused()++;
+        }
     } else {
         gf_res_prev_active = nullptr;
         res->reset();
@@ -1871,11 +1940,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        //const auto t_start_us = ggml_time_us();
+        // Replaces the commented-out per-call timer upstream left here. Both
+        // build_graph and sched_alloc_graph are timed separately because they have
+        // different fixes -- the first is llama-graph.cpp's node construction, the
+        // second is the scheduler's memory plan -- and one number would not say
+        // which one to look at.
+        const bool prof = llama_graph_build_prof::enabled();
+        const int64_t t_build = prof ? ggml_time_us() : 0;
 
         gf = model.build_graph(gparams);
 
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        if (prof) {
+            llama_graph_build_prof::us_build() += ggml_time_us() - t_build;
+        }
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -1883,7 +1960,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        if (prof) {
+            const int64_t t_alloc = ggml_time_us();
+            const bool ok = ggml_backend_sched_alloc_graph(sched.get(), gf);
+            llama_graph_build_prof::us_alloc() += ggml_time_us() - t_alloc;
+            llama_graph_build_prof::n_rebuilt()++;
+            if (!ok) {
+                LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
+        } else if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;

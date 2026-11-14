@@ -3276,7 +3276,7 @@ static sycl::half * src1_f16_lookup(ggml_backend_sycl_context & ctx, const void 
 }
 
 static sycl::half * src1_f16_store(ggml_backend_sycl_context & ctx, const void * key,
-                                   const void * strm, size_t ne) {
+                                   const void * strm, size_t ne, int node = -1) {
     auto & c = ctx.src1_f16;
     c.buf = std::make_unique<ggml_sycl_pool_alloc<sycl::half>>(ctx.src1_pool());
     c.buf->alloc(ne);
@@ -3284,7 +3284,7 @@ static sycl::half * src1_f16_store(ggml_backend_sycl_context & ctx, const void *
     c.key    = key;
     c.stream = strm;
     c.ne     = ne;
-    c.node   = ctx.cur_node;
+    c.node   = node < 0 ? ctx.cur_node : node;
     return c.buf->get();
 }
 
@@ -3476,8 +3476,59 @@ inline void ggml_sycl_op_mul_mat_sycl(
                     out = src1_as_f16.get();
                 }
                 to_fp16_sycl(src1_ddf_i, out, ne, stream);
-                ggml_sycl_prof_mark_sub("CONVERT/src1/f32->f16",
-                                        ne * (sizeof(float) + sizeof(sycl::half)));
+                char ckey[96];
+                int  cn = snprintf(ckey, sizeof(ckey), "CONVERT/src1/f32->f16/%ldx%ld",
+                                   (long) ne10, (long) src1_ncols);
+                // Name the tensor that produced this activation. Shape alone already split
+                // the row usefully, but two different producers can share a shape, and which
+                // producer to fold the conversion into is the only actionable question this
+                // row can answer -- so the row should say. ggml names activations per layer
+                // ("ffn_swiglu-62"); the layer suffix is dropped so the row groups by
+                // producer instead of splitting 48 ways. Costs nothing unless profiling.
+                if (cn > 0 && (size_t) cn < sizeof(ckey) && ggml_sycl_prof_active()) {
+                    size_t L = strlen(src1->name);
+                    while (L > 0 && src1->name[L - 1] >= '0' && src1->name[L - 1] <= '9') { L--; }
+                    if (L > 0 && src1->name[L - 1] == '-') { L--; }
+                    if (L > 0) {
+                        cn += snprintf(ckey + cn, sizeof(ckey) - (size_t) cn, "<-%.*s", (int) L,
+                                       src1->name);
+                    }
+                    // ...and the OP that wrote it, which is the actionable half: the tensor
+                    // name says which activation, the op name says which backend function
+                    // would have to emit the f16 copy for it. That mapping has been inferred
+                    // wrong twice in this series, each time visible only as a patch that
+                    // collected nothing.
+                    //
+                    // Resolve views through view_src and then match by tensor IDENTITY.
+                    // Matching on the data pointer instead looks equivalent and is not:
+                    // ggml's allocator reuses buffers, so a pointer match names whichever
+                    // unrelated node last occupied that address. The first cut of this did
+                    // exactly that and confidently reported `attn_norm` written by an ADD
+                    // and `attn_gated` by a ROPE.
+                    if (cn > 0 && (size_t) cn < sizeof(ckey) && ctx.cur_graph != nullptr) {
+                        const ggml_tensor * base = src1;
+                        while (base->view_src != nullptr) { base = base->view_src; }
+                        const char * pop = "?";
+                        for (int j = ctx.cur_node; j >= 0 && ctx.cur_node - j <= 32; --j) {
+                            const ggml_tensor * n = ctx.cur_graph->nodes[j];
+                            if (n == base || n == src1) {
+                                pop = (n->op == GGML_OP_UNARY)
+                                          ? ggml_unary_op_name(ggml_get_unary_op(n))
+                                          : ggml_op_name(n->op);
+                                break;
+                            }
+                        }
+                        // ...and the CONSUMER's op, which needs no scan at all -- `dst` IS
+                        // the consuming node here. Three patches aimed at this row have now
+                        // collected nothing, and the untested half of the story is the
+                        // consumer: the mirror's lookahead accepts only GGML_OP_MUL_MAT, and
+                        // a MoE activation arrives at this very conversion through
+                        // GGML_OP_MUL_MAT_ID, which that test rejects outright.
+                        snprintf(ckey + cn, sizeof(ckey) - (size_t) cn, "[%s->%s]", pop,
+                                 ggml_op_name(dst->op));
+                    }
+                }
+                ggml_sycl_prof_mark_sub(ckey, ne * (sizeof(float) + sizeof(sycl::half)));
                 src1_ptr = out;
             }
         }
@@ -5423,6 +5474,62 @@ static bool can_use_mul_mat_q(const ggml_tensor * src0, const ggml_tensor * src1
     }
 #endif // GGML_SYCL_SUPPORT_XMX && !GGML_SYCL_FORCE_MMQ
     return src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+}
+
+// 0 disables the producer-side f16 mirror, restoring the standalone conversion pass.
+static inline bool ggml_sycl_f16_mirror_enabled() {
+    static const int e = ggml_sycl_get_env("GGML_SYCL_F16_MIRROR", 1);
+    return e != 0;
+}
+
+sycl::half * ggml_sycl_f16_mirror_for_next_matmul(ggml_backend_sycl_context & ctx,
+                                                  const ggml_tensor * dst, size_t ne) {
+    if (!ggml_sycl_f16_mirror_enabled() || !ggml_sycl_src1_cache_enabled()) {
+        return nullptr;
+    }
+    if (dst == nullptr || dst->type != GGML_TYPE_F32 || dst->data == nullptr) {
+        return nullptr;
+    }
+
+    const ggml_cgraph * g = ctx.cur_graph;
+    if (g == nullptr) {
+        return nullptr;
+    }
+
+    // A fused span executes at the index of its HEAD, but the tensor it produces belongs to
+    // its LAST node. That matters because the cache's write scan starts just after the
+    // stored index: registering at the head would put the span's own tail -- the node whose
+    // declared output is precisely this tensor -- inside the scan, so it would read as an
+    // intervening write and every lookup would miss. Find the producer instead. Bounded,
+    // because a span is a handful of nodes and an unbounded walk is not worth it.
+    int prod = -1;
+    for (int j = ctx.cur_node; j < g->n_nodes && j - ctx.cur_node <= 8; ++j) {
+        if (g->nodes[j] == dst) { prod = j; break; }
+    }
+    if (prod < 0 || prod + 1 >= g->n_nodes) {
+        return nullptr;
+    }
+    ggml_tensor * nxt = g->nodes[prod + 1];
+    if (nxt->op != GGML_OP_MUL_MAT || nxt->src[1] != dst) {
+        return nullptr;
+    }
+
+    // Only the f16 GEMM path converts src1. The mat-vec paths quantize to q8_1 or read f32
+    // directly, so a mirror written for them is pure extra traffic -- which is exactly the
+    // decode case, where ne[1] is 1..a few and this must stay silent.
+    if (nxt->src[1]->ne[1] <= 1) {
+        return nullptr;
+    }
+    if (can_use_dequantize_mul_mat_vec(nxt->src[0], nxt->src[1], nxt)) {
+        return nullptr;
+    }
+    if (can_use_mul_mat_vec_q(ctx.device, nxt->src[0], nxt->src[1], nxt)) {
+        return nullptr;
+    }
+
+    // The lookup re-validates: same graph, bounded node distance, and no node between here
+    // and the consumer writing over the f32 source. Storing cannot make a stale hit possible.
+    return src1_f16_store(ctx, dst->data, (const void *) ctx.stream(), ne, prod);
 }
 
 // The f32 short-row mat-vec routing predicate, named so the dispatch site and the

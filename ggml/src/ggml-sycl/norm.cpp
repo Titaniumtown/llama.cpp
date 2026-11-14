@@ -961,6 +961,7 @@ void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context & ctx, ggml_tenso
 
 // ADD(a, b) -> RMS_NORM -> MUL(w) in one launch. The sum (read by a later residual add) and
 // normed * w are written after a barrier, as mul->data may alias a.
+template <bool do_mirror>
 static void add_rms_norm_mul_f32(const float *            a,
                                  const float *            b,
                                  float *                  sum,
@@ -970,7 +971,8 @@ static void add_rms_norm_mul_f32(const float *            a,
                                  const float              eps,
                                  const sycl::nd_item<3> & item_ct1,
                                  float *                  s_sum,
-                                 const int                block_size) {
+                                 const int                block_size,
+                                 sycl::half *             mir) {
     const int    row = item_ct1.get_group(2);
     const size_t off = (size_t) row * ncols;
     const int    tid = item_ct1.get_local_id(2);
@@ -1014,6 +1016,11 @@ static void add_rms_norm_mul_f32(const float *            a,
     sycl::float4 *       s4 = reinterpret_cast<sycl::float4 *>(sum + off);
     sycl::float4 *       d4 = reinterpret_cast<sycl::float4 *>(dst + off);
     const sycl::float4 * m4 = reinterpret_cast<const sycl::float4 *>(mul);
+    // only enabled for a contiguous dst, so the mirror shares dst's row offset
+    sycl::vec<sycl::half, 4> * h4 = nullptr;
+    if constexpr (do_mirror) {
+        h4 = reinterpret_cast<sycl::vec<sycl::half, 4> *>(mir + off);
+    }
 #pragma unroll
     for (int k = 0; k < 2; ++k) {
         const int i = tid + k * block_size;
@@ -1022,20 +1029,25 @@ static void add_rms_norm_mul_f32(const float *            a,
             const sycl::float4 u = scale * v[k] * m;
             s4[i]                = v[k];
             d4[i]                = u;
+            if constexpr (do_mirror) {
+                h4[i] = u.convert<sycl::half, sycl::rounding_mode::automatic>();
+            }
         }
     }
 }
 
-static void add_rms_norm_mul_f32_sycl(const float * a,
-                                      const float * b,
-                                      float *       sum,
-                                      const float * mul,
-                                      float *       dst,
-                                      const int     ncols,
-                                      const int     nrows,
-                                      const float   eps,
-                                      queue_ptr     stream,
-                                      int           device) {
+template <bool do_mirror>
+static void add_rms_norm_mul_f32_launch(const float * a,
+                                        const float * b,
+                                        float *       sum,
+                                        const float * mul,
+                                        float *       dst,
+                                        sycl::half *  mir,
+                                        const int     ncols,
+                                        const int     nrows,
+                                        const float   eps,
+                                        queue_ptr     stream,
+                                        int           device) {
     const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
     GGML_ASSERT(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
     const sycl::range<3> global_dims(1, 1, nrows);
@@ -1044,8 +1056,8 @@ static void add_rms_norm_mul_f32_sycl(const float * a,
         sycl::local_accessor<float, 1> s_sum(sycl::range<1>(work_group_size / WARP_SIZE), cgh);
         cgh.parallel_for(sycl::nd_range<3>(global_dims * block_dims, block_dims),
                          [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             add_rms_norm_mul_f32(a, b, sum, mul, dst, ncols, eps, item_ct1, get_pointer(s_sum),
-                                                  work_group_size);
+                             add_rms_norm_mul_f32<do_mirror>(a, b, sum, mul, dst, ncols, eps, item_ct1,
+                                                             get_pointer(s_sum), work_group_size, mir);
                          });
     });
 }
@@ -1074,9 +1086,19 @@ bool ggml_sycl_op_add_rms_norm_fused(ggml_backend_sycl_context & ctx,
     if (!(eps >= 0.0f)) {
         return false;
     }
-    add_rms_norm_mul_f32_sycl((const float *) a->data, (const float *) b->data, (float *) add->data,
-                              (const float *) w->data, (float *) mul->data, (int) ncols, (int) add->ne[1], eps,
-                              ctx.stream(), ctx.device);
+    // The span's output is the next f16 GEMM's activation in every transformer block here.
+    // Emit its f16 copy from the register rather than letting that GEMM re-read the whole
+    // tensor to make one.
+    sycl::half * mir = ggml_sycl_f16_mirror_for_next_matmul(ctx, mul, (size_t) ggml_nelements(mul));
+    if (mir != nullptr) {
+        add_rms_norm_mul_f32_launch<true>((const float *) a->data, (const float *) b->data, (float *) add->data,
+                                          (const float *) w->data, (float *) mul->data, mir, (int) ncols,
+                                          (int) add->ne[1], eps, ctx.stream(), ctx.device);
+    } else {
+        add_rms_norm_mul_f32_launch<false>((const float *) a->data, (const float *) b->data, (float *) add->data,
+                                           (const float *) w->data, (float *) mul->data, nullptr, (int) ncols,
+                                           (int) add->ne[1], eps, ctx.stream(), ctx.device);
+    }
     return true;
 }
 

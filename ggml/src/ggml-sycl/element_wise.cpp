@@ -368,18 +368,27 @@ static void unary_op_ceil_kernel(const T * x, T * dst, const int k, const sycl::
     }
 }
 
-template<typename T, typename F>
-static void unary_gated_op_flat_kernel(const T * x, const T * g, T * dst, const uint64_t k, const sycl::nd_item<1> & item_ct1, F func) {
+// MIRROR additionally writes an f16 copy of each result. The value is already in a register,
+// so the mirror costs one narrow store and no extra read; it exists to delete the standalone
+// f32->f16 pass the consuming f16 GEMM would otherwise run over the whole tensor.
+template<bool MIRROR, typename T, typename F>
+static void unary_gated_op_flat_kernel(const T * x, const T * g, T * dst, sycl::half * mir,
+                                       const uint64_t k, const sycl::nd_item<1> & item_ct1, F func) {
     SYCL_GLOBAL_ID_LOOP(k, item_ct1) {
-        dst[i] = func(x[i]) * g[i];
+        const T v = func(x[i]) * g[i];
+        dst[i]    = v;
+        if constexpr (MIRROR) {
+            mir[i] = static_cast<sycl::half>(v);
+        }
     }
 }
 
-template<typename T, typename F>
+template<bool MIRROR, typename T, typename F>
 static void unary_gated_op_generic_kernel(
         const T * x,
         const T * g,
         T * dst,
+        sycl::half * mir,
         const uint64_t k,
         const sycl::uint3 n_fd,
         const uint64_t o0,
@@ -392,7 +401,11 @@ static void unary_gated_op_generic_kernel(
         const sycl::uint2 rc = fast_div_modulo((uint32_t) i, n_fd);
         const int64_t j0 = rc.x() * o0 + rc.y();
         const int64_t j1 = o0 == o1 ? j0 : rc.x() * o1 + rc.y();
-        dst[i] = func(x[j0]) * g[j1];
+        const T v = func(x[j0]) * g[j1];
+        dst[i]    = v;
+        if constexpr (MIRROR) {
+            mir[i] = static_cast<sycl::half>(v);
+        }
     }
 }
 
@@ -682,27 +695,39 @@ static inline void ggml_sycl_op_unary_gated(
         ggml_backend_sycl_context & ctx, ggml_tensor * dst, F func) {
 
     dispatch_ggml_sycl_op_fused_glu(ctx, dst,
-        [func](const auto * x_ptr, const auto * g_ptr, auto * dst_ptr, uint64_t k, uint64_t n, uint64_t o0, uint64_t o1, queue_ptr main_stream) {
+        [func, &ctx, dst](const auto * x_ptr, const auto * g_ptr, auto * dst_ptr, uint64_t k, uint64_t n, uint64_t o0, uint64_t o1, queue_ptr main_stream) {
 
             const uint32_t num_blocks = (uint32_t) ceil_div(k, SYCL_GLU_BLOCK_SIZE);
             const sycl::nd_range<1> launch_range(num_blocks * sycl::range<1>(SYCL_GLU_BLOCK_SIZE),
                                                  sycl::range<1>(SYCL_GLU_BLOCK_SIZE));
 
+            // An f32 result whose only consumer is an f16 GEMM is about to be re-read in full
+            // and rewritten as f16. Emit that copy here instead, from the register.
+            using dst_t = std::remove_cv_t<std::remove_pointer_t<decltype(dst_ptr)>>;
+            sycl::half * mir = nullptr;
+            if constexpr (std::is_same_v<dst_t, float>) {
+                mir = ggml_sycl_f16_mirror_for_next_matmul(ctx, dst, (size_t) k);
+            }
+
             // o0 == n and o1 == n make the index math the identity, so index flat
             // note: not ggml_is_contiguous - a fused [gate|up] src0 is contiguous with o0 == 2n
-            if (o0 == n && o1 == n) {
-                main_stream->parallel_for(launch_range,
-                    [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                        unary_gated_op_flat_kernel(x_ptr, g_ptr, dst_ptr, k, item_ct1, func);
-                    });
-            } else {
-                // launch-invariant divisor, and only this path needs it
-                const sycl::uint3 n_fd = init_fastdiv_values((uint32_t) n);
-                main_stream->parallel_for(launch_range,
-                    [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                        unary_gated_op_generic_kernel(x_ptr, g_ptr, dst_ptr, k, n_fd, o0, o1, item_ct1, func);
-                    });
-            }
+            auto launch = [&](auto mirror_tag) {
+                constexpr bool MIR = decltype(mirror_tag)::value;
+                if (o0 == n && o1 == n) {
+                    main_stream->parallel_for(launch_range,
+                        [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                            unary_gated_op_flat_kernel<MIR>(x_ptr, g_ptr, dst_ptr, mir, k, item_ct1, func);
+                        });
+                } else {
+                    // launch-invariant divisor, and only this path needs it
+                    const sycl::uint3 n_fd = init_fastdiv_values((uint32_t) n);
+                    main_stream->parallel_for(launch_range,
+                        [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                            unary_gated_op_generic_kernel<MIR>(x_ptr, g_ptr, dst_ptr, mir, k, n_fd, o0, o1, item_ct1, func);
+                        });
+                }
+            };
+            if (mir != nullptr) { launch(std::true_type{}); } else { launch(std::false_type{}); }
         });
 }
 
@@ -1102,16 +1127,30 @@ void ggml_sycl_op_add_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tens
 // unary_src and other_src separate contiguous same-shape tensors. Elides the
 // standalone unary launch and its HBM round-trip of the unary output. Mirrors
 // the fused unary+mul path in ggml-cuda.
-template <typename T, typename Op>
-static void fused_unary_mul_sycl(const T * a, const T * b, T * dst, const int64_t k, queue_ptr stream, Op op) {
+template <bool MIRROR, typename T, typename Op>
+static void fused_unary_mul_launch(const T * a, const T * b, T * dst, sycl::half * mir,
+                                   const int64_t k, queue_ptr stream, Op op) {
     const uint32_t num_blocks = ceil_div((uint32_t) k, SYCL_GLU_BLOCK_SIZE);
     stream->parallel_for(
         sycl::nd_range<1>(num_blocks * sycl::range<1>(SYCL_GLU_BLOCK_SIZE), sycl::range<1>(SYCL_GLU_BLOCK_SIZE)),
         [=](sycl::nd_item<1> item_ct1) {
             SYCL_GLOBAL_ID_LOOP(k, item_ct1) {
-                dst[i] = op(a[i]) * b[i];
+                const T v = op(a[i]) * b[i];
+                dst[i]    = v;
+                if constexpr (MIRROR) {
+                    mir[i] = static_cast<sycl::half>(v);
+                }
             }
         });
+}
+
+// Runtime choice, compile-time store: with no mirror the extra write is not branched over,
+// it is not instantiated.
+template <typename T, typename Op>
+static void fused_unary_mul_sycl(const T * a, const T * b, T * dst, const int64_t k, queue_ptr stream, Op op,
+                                 sycl::half * mir = nullptr) {
+    if (mir != nullptr) { fused_unary_mul_launch<true>(a, b, dst, mir, k, stream, op); }
+    else                { fused_unary_mul_launch<false>(a, b, dst, mir, k, stream, op); }
 }
 
 // Fused ADD(bias) + UNARY + MUL(scale) with per-ne0 broadcast of bias and scale:
@@ -1150,10 +1189,13 @@ static inline void ggml_sycl_op_fused_unary_mul(ggml_backend_sycl_context & ctx,
             const float * a = (const float *) unary_src->data;
             const float * b = (const float *) other_src->data;
             float *       d = (float *) mul_node->data;
+            // The gated linear-attention output is consumed by the next f16 GEMM; emit its
+            // f16 copy here rather than letting that GEMM re-read the tensor to build one.
+            sycl::half * mir = ggml_sycl_f16_mirror_for_next_matmul(ctx, mul_node, (size_t) k);
             switch (uop) {
-                case GGML_UNARY_OP_SILU:     fused_unary_mul_sycl<float>(a, b, d, k, stream, [](auto x) { return op_silu(x); }); break;
-                case GGML_UNARY_OP_SIGMOID:  fused_unary_mul_sycl<float>(a, b, d, k, stream, [](auto x) { return op_sigmoid(x); }); break;
-                case GGML_UNARY_OP_SOFTPLUS: fused_unary_mul_sycl<float>(a, b, d, k, stream, [](auto x) { return op_softplus(x); }); break;
+                case GGML_UNARY_OP_SILU:     fused_unary_mul_sycl<float>(a, b, d, k, stream, [](auto x) { return op_silu(x); }, mir); break;
+                case GGML_UNARY_OP_SIGMOID:  fused_unary_mul_sycl<float>(a, b, d, k, stream, [](auto x) { return op_sigmoid(x); }, mir); break;
+                case GGML_UNARY_OP_SOFTPLUS: fused_unary_mul_sycl<float>(a, b, d, k, stream, [](auto x) { return op_softplus(x); }, mir); break;
                 default: GGML_ABORT("fused unary+mul: unsupported unary op");
             }
             break;

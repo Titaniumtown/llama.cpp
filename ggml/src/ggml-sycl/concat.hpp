@@ -15,6 +15,12 @@
 
 #include "common.hpp"
 
-void ggml_sycl_op_concat(ggml_backend_sycl_context & ctx, ggml_tensor *dst);
+void ggml_sycl_op_concat(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
+                         const ggml_tensor * gather = nullptr);
+
+// GGML_SYCL_CONV_FOLD=0 disables the conv-state gather fold. A same-binary control is
+// not a convenience here: the closure holding the previous binary is GC-able, and this
+// A/B has already been lost to a garbage collection once.
+bool ggml_sycl_conv_fold_enabled();
 
 #endif // GGML_SYCL_CONCAT_HPP

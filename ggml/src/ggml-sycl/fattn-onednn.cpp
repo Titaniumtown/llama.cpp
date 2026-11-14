@@ -126,6 +126,16 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
             if (t->type == GGML_TYPE_F16 && t->nb[1] % (t->ne[0] * 2) != 0) {
                 return false;
             }
+            if (ggml_is_quantized(t->type)) {
+                // dequantize_block_nc indexes in whole blocks, so a byte stride that
+                // is not a whole number of them cannot be represented: s0x = nb/ts
+                // would truncate and the kernel would read the tensor with strides it
+                // does not have. Decline rather than divide it away.
+                const size_t ts = ggml_type_size(t->type);
+                if (t->nb[1] % ts || t->nb[2] % ts || t->nb[3] % ts) {
+                    return false;
+                }
+            }
         }
     }
     // Optional KV-length ceiling (GGML_SYCL_FA_ONEDNN_MAX_KV, 0 = unlimited). Escape hatch:
@@ -216,6 +226,32 @@ static void permute_sdpa_out_sycl(const sycl::half * out, float * dst,
 // Build + compile the contiguous-input GQA SDPA graph (MatMul->Divide->[Add]->SoftMax->MatMul), f32 out.
 // The Add node is only present with a mask.
 // Mirrors the hardware-verified scratch/onednn_sdpa_probe.cpp build_gqa (partitions=1, sdp_primitive_kernel_t).
+// WHAT THIS PARTITION CAN POSSIBLY REACH. Prefill FA has been carried in this
+// ledger as "~45% of the 138 TFLOP/s real-data ceiling" -- 197.9 TFLOP in 3.34 s = 59
+// TFLOP/s at d32768, the single largest item in the backlog. That denominator is wrong.
+// 138 was measured on k=5120/17408 GEMMs; flash attention tiles over keys, so the GEMMs
+// INSIDE this partition are small-k: bmm1 is m=ubatch, k=d(=256), n=key_tile and bmm2 is
+// m=ubatch, k=key_tile, n=d. A standalone oneDNN f16 matmul sweep at exactly those
+// shapes (B=24, m=2048, entropy-filled, two rounds agreeing to <1%):
+//
+//   key tile   bmm1 TFLOP/s   bmm2 TFLOP/s        control          TFLOP/s
+//      128         44.5           43.5            k=5120            136.5
+//      256         55.4           55.5            k=17408           143.8
+//      512         70.0           77.5
+//     1024         87.5           94.4
+//     2048         87.5          104.6
+//
+// The controls reproduce the 138 figure, so the sweep is calibrated. At a 256-key tile
+// oneDNN's own bare GEMM pair does 55.4 TFLOP/s -- and this fused partition measures 59
+// in production, i.e. it is already FASTER than the sum of its parts while additionally
+// doing the softmax. There is nothing to win by reimplementing it: a hand-written XMX
+// kernel would be competing with 55, not with 138.
+//
+// The ONLY remaining lever is the internal key tile, and the curve above prices it
+// exactly: 256 -> 512 is worth ~1.3x, 256 -> 1024 ~1.6x, 256 -> 2048 ~1.8x. oneDNN
+// chooses that blocking itself and the public graph API does not expose it, so this is
+// not actionable from here today. If a future oneDNN exposes SDPA blocking, the number
+// to beat is 59 TFLOP/s and the target is ~105.
 static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int seq, int d, bool has_mask,
                                  const std::array<int64_t, 5> & k_str, const std::array<int64_t, 5> & v_str) try {
     using ltype = logical_tensor::layout_type;
@@ -241,6 +277,46 @@ static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int 
     auto sdiv   = op(id++, op::kind::Divide, "scale_div");     // score / (1/kq_scale) == score * kq_scale
     sdiv.add_inputs({score, scale}); sdiv.add_outputs({scaled});
 
+    // This explicit additive mask is the largest priced-but-unreachable item in the SYCL
+    // prefill path, and the reason it is unreachable is a property of oneDNN's pattern
+    // matcher rather than of the mask. Both halves are measured; do not re-derive them.
+    //
+    // What it costs. Ablated in-tree by dropping this Add node from the graph (wrong
+    // numerics, pure cost probe), production flags, two rounds:
+    //
+    //             with mask            without           delta
+    //   pp4096   1514.92 / 1504.12   1520.66 / 1513.32   +0.5%
+    //   pp16384  1430.04 / 1424.94   1445.25 / 1442.13   +1.1%
+    //   pp32768  1316.68 / 1313.72   1346.47 / 1344.81   +2.3%
+    //
+    // Monotone in depth, as it must be: FA is the only O(N^2) row here, so its share --
+    // and the mask's with it -- keeps growing. At the 87k prompts production actually
+    // serves, FA's share is roughly 2.1x its d32768 value, putting the mask near 4.8% of
+    // prefill, and prefill is ~80% of wall time on a long-prompt request.
+    //
+    // Why it cannot be taken. The fix would be an implicit causal mask
+    // (GenIndex -> GreaterEqual -> Select), which oneDNN documents as a fusible SDPA
+    // pattern. It is, but only in the form llama.cpp cannot use. Checked directly against
+    // this toolkit's oneDNN at the production shape (H24 q2048 seq32768 d256), counting
+    // partitions from get_partitions():
+    //
+    //   explicit mask (this code)          1 partition, supported
+    //   no mask at all                     1 partition, supported
+    //   implicit causal, no offset         1 partition, supported
+    //   implicit causal, WITH offset       8 partitions
+    //
+    // Prefill needs the offset: a ubatch's queries sit at absolute positions seq-q+j, so
+    // the condition is col <= row + (seq-q), and only the very first ubatch has offset 0.
+    // Expressing that needs one more node (Add the offset to the row index), and that node
+    // takes the graph off the SDPA pattern entirely -- 8 partitions means the N^2 score
+    // matrix gets materialised across separate launches, which is far worse than paying
+    // the mask. Splitting into an unmasked [q, seq-q] block plus a plain-causal [q, q]
+    // block does not help either: both halves fuse, but merging two SDPA results needs
+    // their softmax denominators and this pattern only emits normalised output.
+    //
+    // So the prize is quantified and parked. It becomes reachable if oneDNN grows an
+    // offset-tolerant causal pattern or a causal-mask attribute, and the number to beat
+    // is the "without" column above.
     // without a mask the scaled scores feed the softmax directly
     logical_tensor    mask;
     logical_tensor    smax_in = scaled;
@@ -350,6 +426,44 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
         // dims are {mb=1, Hkv, rep=1, seq, d}; the size-1 dims at 0 and 2 never advance an address.
         return std::array<int64_t, 5>{ s3, s2, s2, s1, 1 };
     };
+    // Binding in place hands the SDPA each head's K plane as 512 B rows on a 2048 B pitch
+    // (the cache is interleaved: nb[1] == Hkv*d*ts), i.e. 1/Hkv density with no prefetch
+    // across rows. Packing it into dense per-head planes was built, measured, and reverted.
+    // The three numbers are worth keeping, because the idea is an obvious one to have again.
+    //
+    // 1. The win is real, and it is K-only. bmm1 reads K transposed and bmm2 reads V
+    //    naturally, so the two tensors do not behave alike. Standalone at the production
+    //    shape (H24 Hkv4 rep6 q2048 d256), entropy-filled operands, two rounds:
+    //
+    //      seq     K packed        V packed        K net after a 500 GB/s staging estimate
+    //      6144    -3.3 / -3.9%    --              -163 / -182 us
+    //      8192    +0.6 / -0.0%    --               -40 /  -69 us
+    //      12288   +2.1 / +1.3%    -2.1 / -2.0%     +60 /   -6 us
+    //      16384   +4.7 / +4.6%    +1.6 / +1.7%    +388 / +380 us
+    //      32768   +4.2 / +3.5%    +1.3 / +0.8%    +675 / +505 us
+    //      65536   +4.2 / +4.2%    +0.9 / +1.4%   +1333 / +1321 us
+    //
+    //    V's gain never clears its own copy at any depth. K's kernel win is negative below
+    //    ~12288 and positive above -- the pitch only hurts once a head plane stops fitting
+    //    the caches -- so the crossover is bracketed, not assumed.
+    //
+    // 2. It does not survive integration. Gated at seq >= 16384, same binary, env-toggled:
+    //    pp32768 1310.05/1311.50/1310.71 off vs 1312.81/1312.29/1311.07/1312.64 on;
+    //    pp65536 1135.28/1130.67/1132.91/1127.91 off vs 1131.84/1130.01/1129.63/1129.02 on.
+    //    That is +0.11% and -0.14%, both inside a +-0.6% spread. The profiled FA row moved
+    //    -1.0% (14232 -> 14090 us/call) against the -4.2% the kernel alone promised.
+    //
+    // 3. The reason the estimate was 3x optimistic: a strided gather is penalised by exactly
+    //    the pitch it is removing. The CONT row in this same profile is such a copy and runs
+    //    at 254 GB/s, not the 500 assumed above. Redone at 254: ~144 staged calls x ~100 MB
+    //    = 57 ms of copy against ~120 ms of kernel gain = +0.25% of prefill, which is what
+    //    was measured. Read-time packing also re-copies the whole prefix every ubatch, so its
+    //    cost is O(N^2) at copy bandwidth against O(N^2) at compute bandwidth -- the ratio
+    //    never improves with depth.
+    //
+    // What would win is packing at WRITE time, when each token is stored: O(N) total instead
+    // of O(N^2), and no staging buffer. That is llama.cpp's cache layout, shared with every
+    // other backend, so it is not reachable from here.
 
     if (ggml_sycl_fattn_onednn_binds_kv(K, V)) {
         K_ptr = (sycl::half *) K->data;
@@ -373,6 +487,7 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
             } else {
                 const size_t ts = ggml_type_size(K->type);
                 to_fp16_nc_sycl_t to_fp16 = ggml_get_to_fp16_nc_sycl(K->type);
+
                 to_fp16(K_data, K_ptr,
                         K->ne[0], K->ne[1], K->ne[2], K->ne[3],
                         (int64_t)K->nb[1] / ts, (int64_t)K->nb[2] / ts, (int64_t)K->nb[3] / ts, stream);
@@ -393,6 +508,7 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
             } else {
                 const size_t ts = ggml_type_size(V->type);
                 to_fp16_nc_sycl_t to_fp16 = ggml_get_to_fp16_nc_sycl(V->type);
+
                 to_fp16(V_data, V_ptr,
                         V->ne[0], V->ne[1], V->ne[2], V->ne[3],
                         (int64_t)V->nb[1] / ts, (int64_t)V->nb[2] / ts, (int64_t)V->nb[3] / ts, stream);

@@ -5795,12 +5795,17 @@ private:
                         }
                         slot.prompt.tokens.push_back(cur_tok);
 
-                        // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
+                        // break at the last user message, and again a min step past the last
+                        // checkpoint: user-message starts alone leave the system prompt -- the
+                        // prefix two conversations of one agent share -- with no checkpoint at
+                        // all, so a reuse that diverges inside it re-processes the whole prompt
+                        if (do_checkpoint) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_tokens + params_base.checkpoint_min_step) {
+                            const auto last = checkpoints.empty() ? 0 : checkpoints.back()->n_tokens;
+
+                            if (pos == last_user_pos || pos > last + checkpoint_step_at(last, params_base.checkpoint_min_step)) {
                                 break;
                             }
                         }
@@ -5861,8 +5866,13 @@ private:
                         slot.init_sampler();
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
-                        // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        // message, we are near the end of the prompt, or it is a min step past
+                        // the last checkpoint (the uniform case)
+                        const auto last_ckpt = slot.prompt.checkpoints.empty() ? 0 : slot.prompt.checkpoints.back()->n_tokens;
+                        const bool past_min_step =
+                            n_tokens_start > last_ckpt + checkpoint_step_at(last_ckpt, params_base.checkpoint_min_step);
+
+                        if (!is_user_start && !near_prompt_end && !past_min_step) {
                             do_checkpoint = false;
                         }
                     }

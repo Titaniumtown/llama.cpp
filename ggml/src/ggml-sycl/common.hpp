@@ -940,6 +940,9 @@ inline bool ggml_sycl_dnnl_has_optimized_gemm(int device) {
 
 int ggml_sycl_get_env(const char *env_name, int default_val);
 
+char * ggml_sycl_src1_q8_store_ext(ggml_backend_sycl_context & ctx, const void * key, const void * strm,
+                                   size_t bytes, size_t src_ne, int variant, const ggml_tensor * out);
+
 // Attribute a device-side pass that is NOT a graph node to its own profiler row
 // (GGML_SYCL_PROF=1). No-op when profiling is off. Without this, work submitted inside an
 // op -- notably launch_fattn's K/V dequant -- is invisible: it shows up in no row at all.
@@ -948,6 +951,16 @@ int ggml_sycl_get_env(const char *env_name, int default_val);
 void ggml_sycl_prof_mark_sub(const char * name, uint64_t bytes);
 // True only while a sampled graph is being instrumented.
 bool ggml_sycl_prof_active();
+
+// Bytes rms_norm_f32's q8_1 emission actually moved, keyed by the tensor it was
+// emitted for. The emission writes into a side buffer that is not a graph tensor, so
+// span_bytes cannot see it; on the decode widths it is bounded for, that is a 90%
+// under-count weighted across the five fused-norm rows. The map is file-scope in
+// ggml-sycl.cpp, beside ggml_sycl_prof_mark_sub and the rest of the profiler's free
+// functions -- producer and reader must share ONE object, which is the whole reason
+// this is a function and not a context field. A second copy on the context would
+// compile, apply, and charge nothing.
+void ggml_sycl_q8_emit_record(const ggml_tensor * out, uint64_t bytes);
 
 template <int N, class T> std::string debug_get_array_str(const std::string & prefix, const T array[N]) {
     if (LIKELY(!g_ggml_sycl_debug)) {
@@ -1060,6 +1073,19 @@ static constexpr int ggml_sycl_get_max_cpy_bytes() {
 // cache and the mul_mat path predicates live.
 sycl::half * ggml_sycl_f16_mirror_for_next_matmul(ggml_backend_sycl_context & ctx,
                                                   const ggml_tensor * dst, size_t ne);
+
+// Decode-side dual of the f16 mirror: if the node after `dst` is a mat-vec that will quantize
+// `dst` to q8_1 as its src1, hand back the SoA q8_1 buffer for the producing kernel to fill and
+// register it in the src1 q8_1 cache (the rendezvous -- no consumer detection).
+// Returns nullptr when the consumer would not quantize, so the caller can template the
+// emission away. *kx receives ne00. Defined in ggml-sycl.cpp beside the cache.
+char * ggml_sycl_q8_emit_for_next_matvec(ggml_backend_sycl_context & ctx,
+                                         const ggml_tensor * dst, int * kx);
+
+// Binary GGML_OP_MUL fast path: same-shape contiguous f32 product fused with the q8_1
+// emission above. Returns false (and launches nothing) when the emission gate declines;
+// the caller then takes the generic bin_bcast path. Defined in element_wise.cpp.
+bool ggml_sycl_mul_emit_q8_fast(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
 // Aligned memory transfers of 8/16 bytes can be faster than 2 transfers with 4 bytes.
 template <int nbytes, int alignment = 0>

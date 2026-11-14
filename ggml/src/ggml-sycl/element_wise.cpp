@@ -371,8 +371,57 @@ static void unary_op_ceil_kernel(const T * x, T * dst, const int k, const sycl::
 // MIRROR additionally writes an f16 copy of each result. The value is already in a register,
 // so the mirror costs one narrow store and no extra read; it exists to delete the standalone
 // f32->f16 pass the consuming f16 GEMM would otherwise run over the whole tensor.
-template<bool MIRROR, typename T, typename F>
+// Q8 additionally emits the q8_1 SoA copy of the result -- the dual of MIRROR for the
+// decode side, where the consuming mat-vec would otherwise launch a standalone
+// QUANTIZE/src1 kernel (5.3 us of pure launch latency at decode). Same
+// block-per-sub-group recipe as the norm's emission: the value is re-read from
+// dst after a work-group barrier (proven md5-identical to the register), and a
+// sub-group enters or skips a whole block as a unit so every reduce_over_group is
+// full-width -- the one-column-per-lane form silently reduces over HALF a block on
+// Intel's 16-wide sub-groups.
+template<typename T>
+static __dpct_inline__ void producer_q8_emit(const T * dst, char * q8, const int64_t k,
+                                        const int kx, const sycl::nd_item<1> & it) {
+    if constexpr (std::is_same_v<T, float>) {
+        it.barrier(sycl::access::fence_space::global_and_local);
+        const auto    sg   = it.get_sub_group();
+        const int     lane = (int) it.get_local_id(0) % WARP_SIZE;
+        const int     sgid = (int) it.get_local_id(0) / WARP_SIZE;
+        const int     nsg  = (int) it.get_local_range(0) / WARP_SIZE;
+        constexpr int EPW  = QK8_1 / WARP_SIZE;
+        const int64_t base = (int64_t) it.get_group(0) * it.get_local_range(0);
+        const int64_t lim  = base + (int64_t) it.get_local_range(0) < k ? base + (int64_t) it.get_local_range(0) : k;
+        const int64_t rowbytes = kx + (kx / QK8_1) * (int) sizeof(sycl::half2);
+        for (int64_t b32 = base + (int64_t) sgid * QK8_1; b32 + QK8_1 <= lim; b32 += (int64_t) nsg * QK8_1) {
+            float vv[EPW];
+            float sum = 0.0f, amax = 0.0f;
+#pragma unroll
+            for (int e = 0; e < EPW; e++) {
+                vv[e] = (float) dst[b32 + lane * EPW + e];
+                sum  += vv[e];
+                amax  = sycl::fmax(amax, sycl::fabs(vv[e]));
+            }
+            sum  = sycl::reduce_over_group(sg, sum, sycl::plus<float>());
+            amax = sycl::reduce_over_group(sg, amax, sycl::maximum<float>());
+            const float   d    = amax == 0.0f ? 1.0f : amax / 127.0f;
+            const int64_t row  = b32 / kx;
+            const int     colb = (int) (b32 - row * kx);
+            char *        rowp = q8 + row * rowbytes;
+#pragma unroll
+            for (int e = 0; e < EPW; e++) {
+                ((int8_t *) rowp)[colb + lane * EPW + e] = static_cast<int8_t>(sycl::round(vv[e] / d));
+            }
+            if (lane == 0) {
+                *(sycl::half2 *) (rowp + kx + (colb / QK8_1) * (int) sizeof(sycl::half2)) =
+                    sycl::half2(sycl::half(amax == 0.0f ? 0.0f : d), sycl::half(sum));
+            }
+        }
+    }
+}
+
+template<bool MIRROR, bool Q8, typename T, typename F>
 static void unary_gated_op_flat_kernel(const T * x, const T * g, T * dst, sycl::half * mir,
+                                       char * q8, const int q8_kx,
                                        const uint64_t k, const sycl::nd_item<1> & item_ct1, F func) {
     SYCL_GLOBAL_ID_LOOP(k, item_ct1) {
         const T v = func(x[i]) * g[i];
@@ -381,14 +430,19 @@ static void unary_gated_op_flat_kernel(const T * x, const T * g, T * dst, sycl::
             mir[i] = static_cast<sycl::half>(v);
         }
     }
+    if constexpr (Q8) {
+        producer_q8_emit(dst, q8, (int64_t) k, q8_kx, item_ct1);
+    }
 }
 
-template<bool MIRROR, typename T, typename F>
+template<bool MIRROR, bool Q8, typename T, typename F>
 static void unary_gated_op_generic_kernel(
         const T * x,
         const T * g,
         T * dst,
         sycl::half * mir,
+        char * q8,
+        const int q8_kx,
         const uint64_t k,
         const sycl::uint3 n_fd,
         const uint64_t o0,
@@ -407,47 +461,67 @@ static void unary_gated_op_generic_kernel(
             mir[i] = static_cast<sycl::half>(v);
         }
     }
+    if constexpr (Q8) {
+        producer_q8_emit(dst, q8, (int64_t) k, q8_kx, item_ct1);
+    }
 }
 
 // Fused UNARY + MUL. Unlike the gated ops above, `x` and `g` are separate tensors of the
 // same shape; `o0`/`o1` are their row strides in elements, so a half-view needs no repack.
 // `dst` is contiguous and indexed flat. Math is done in f32, as the CPU and CUDA references do.
-template<typename T, typename F>
-static void unary_mul_flat_kernel(const T * x, const T * g, T * dst, const int64_t k, const sycl::nd_item<1> &item_ct1, F op) {
+template<bool Q8, typename T, typename F>
+static void unary_mul_flat_kernel(const T * x, const T * g, T * dst, char * q8, const int q8_kx,
+                                  const int64_t k, const sycl::nd_item<1> &item_ct1, F op) {
     SYCL_GLOBAL_ID_LOOP(k, item_ct1) {
         dst[i] = (T) (op((float) x[i]) * (float) g[i]);
     }
+    if constexpr (Q8) {
+        producer_q8_emit(dst, q8, k, q8_kx, item_ct1);
+    }
 }
 
-template<typename T, typename F>
-static void unary_mul_strided_kernel(const T * x, const T * g, T * dst, const int64_t k, const sycl::uint3 n_fd, const int64_t o0, const int64_t o1, const sycl::nd_item<1> &item_ct1, F op) {
+template<bool Q8, typename T, typename F>
+static void unary_mul_strided_kernel(const T * x, const T * g, T * dst, char * q8, const int q8_kx,
+                                     const int64_t k, const sycl::uint3 n_fd, const int64_t o0, const int64_t o1, const sycl::nd_item<1> &item_ct1, F op) {
     SYCL_GLOBAL_ID_LOOP(k, item_ct1) {
         const sycl::uint2 rc = fast_div_modulo((uint32_t) i, n_fd);
         const int64_t j0 = rc.x() * o0 + rc.y();
         const int64_t j1 = o0 == o1 ? j0 : rc.x() * o1 + rc.y();
         dst[i] = (T) (op((float) x[j0]) * (float) g[j1]);
     }
+    if constexpr (Q8) {
+        producer_q8_emit(dst, q8, k, q8_kx, item_ct1);
+    }
 }
 
 template<typename T, typename F>
-static void unary_mul_sycl(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, queue_ptr main_stream, F op) {
+static void unary_mul_sycl(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, queue_ptr main_stream, F op,
+                           char * q8 = nullptr, int q8_kx = 0) {
     const size_t            num_blocks = ceil_div((size_t) k, (size_t) SYCL_GLU_BLOCK_SIZE);
     const sycl::nd_range<1> range(num_blocks * sycl::range<1>(SYCL_GLU_BLOCK_SIZE), sycl::range<1>(SYCL_GLU_BLOCK_SIZE));
 
     // o0 == o1 == n makes (i/n)*o0 + (i%n) == i, so the strided kernel degenerates to the flat one
     if (o0 == n && o1 == n) {
-        main_stream->parallel_for(range, [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-            unary_mul_flat_kernel(x, g, dst, k, item_ct1, op);
-        });
+        auto launch_flat = [&](auto q8_tag) {
+            constexpr bool Q8 = decltype(q8_tag)::value;
+            main_stream->parallel_for(range, [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                unary_mul_flat_kernel<Q8>(x, g, dst, q8, q8_kx, k, item_ct1, op);
+            });
+        };
+        if (q8 != nullptr) { launch_flat(std::true_type{}); } else { launch_flat(std::false_type{}); }
         return;
     }
 
     // 32-bit fastdiv, exact only below 2^31; ggml_sycl_can_fuse() already declined past that
     GGML_ASSERT(k < ((int64_t) 1 << 31));
     const sycl::uint3 n_fd = init_fastdiv_values((uint32_t) n);
-    main_stream->parallel_for(range, [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-        unary_mul_strided_kernel(x, g, dst, k, n_fd, o0, o1, item_ct1, op);
-    });
+    auto launch_strided = [&](auto q8_tag) {
+        constexpr bool Q8 = decltype(q8_tag)::value;
+        main_stream->parallel_for(range, [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            unary_mul_strided_kernel<Q8>(x, g, dst, q8, q8_kx, k, n_fd, o0, o1, item_ct1, op);
+        });
+    };
+    if (q8 != nullptr) { launch_strided(std::true_type{}); } else { launch_strided(std::false_type{}); }
 }
 
 // ADD(bias) + UNARY + MUL(scale) with both broadcast over dim 0, the delta-net alpha gate:
@@ -704,30 +778,40 @@ static inline void ggml_sycl_op_unary_gated(
             // An f32 result whose only consumer is an f16 GEMM is about to be re-read in full
             // and rewritten as f16. Emit that copy here instead, from the register.
             using dst_t = std::remove_cv_t<std::remove_pointer_t<decltype(dst_ptr)>>;
-            sycl::half * mir = nullptr;
+            sycl::half * mir    = nullptr;
+            char *       q8_out = nullptr;
+            int          q8_kx  = 0;
             if constexpr (std::is_same_v<dst_t, float>) {
                 mir = ggml_sycl_f16_mirror_for_next_matmul(ctx, dst, (size_t) k);
+                // Mutually exclusive by construction: the f16 mirror fires only for an f16 GEMM
+                // consumer (prefill), the q8_1 emission only for a mat-vec consumer (decode).
+                if (mir == nullptr) {
+                    q8_out = ggml_sycl_q8_emit_for_next_matvec(ctx, dst, &q8_kx);
+                }
             }
 
             // o0 == n and o1 == n make the index math the identity, so index flat
             // note: not ggml_is_contiguous - a fused [gate|up] src0 is contiguous with o0 == 2n
-            auto launch = [&](auto mirror_tag) {
+            auto launch = [&](auto mirror_tag, auto q8_tag) {
                 constexpr bool MIR = decltype(mirror_tag)::value;
+                constexpr bool Q8  = decltype(q8_tag)::value;
                 if (o0 == n && o1 == n) {
                     main_stream->parallel_for(launch_range,
                         [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                            unary_gated_op_flat_kernel<MIR>(x_ptr, g_ptr, dst_ptr, mir, k, item_ct1, func);
+                            unary_gated_op_flat_kernel<MIR, Q8>(x_ptr, g_ptr, dst_ptr, mir, q8_out, q8_kx, k, item_ct1, func);
                         });
                 } else {
                     // launch-invariant divisor, and only this path needs it
                     const sycl::uint3 n_fd = init_fastdiv_values((uint32_t) n);
                     main_stream->parallel_for(launch_range,
                         [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                            unary_gated_op_generic_kernel<MIR>(x_ptr, g_ptr, dst_ptr, mir, k, n_fd, o0, o1, item_ct1, func);
+                            unary_gated_op_generic_kernel<MIR, Q8>(x_ptr, g_ptr, dst_ptr, mir, q8_out, q8_kx, k, n_fd, o0, o1, item_ct1, func);
                         });
                 }
             };
-            if (mir != nullptr) { launch(std::true_type{}); } else { launch(std::false_type{}); }
+            if (mir != nullptr)         { launch(std::true_type{},  std::false_type{}); }
+            else if (q8_out != nullptr) { launch(std::false_type{}, std::true_type{}); }
+            else                        { launch(std::false_type{}, std::false_type{}); }
         });
 }
 
@@ -1071,11 +1155,17 @@ void ggml_sycl_op_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor *
     const int64_t k = ggml_nelements(mul_node);
     const int64_t n = mul_node->ne[0];
 
+    // Same producer-side q8_1 emission as the GLU: attn_gated is ssm_out /
+    // attn_output's src1, whose consumer otherwise launches a standalone quantize.
+    int    q8_kx  = 0;
+    char * q8_out = ggml_sycl_q8_emit_for_next_matvec(ctx, mul_node, &q8_kx);
+
     const auto dispatch_type = [&](auto op) {
         switch (mul_node->type) {
             case GGML_TYPE_F32:
                 unary_mul_sycl((const float *) x->data, (const float *) g->data, (float *) mul_node->data,
-                               k, n, x->nb[1] / sizeof(float), g->nb[1] / sizeof(float), main_stream, op);
+                               k, n, x->nb[1] / sizeof(float), g->nb[1] / sizeof(float), main_stream, op,
+                               q8_out, q8_kx);
                 break;
             case GGML_TYPE_F16:
                 unary_mul_sycl((const sycl::half *) x->data, (const sycl::half *) g->data, (sycl::half *) mul_node->data,
@@ -1127,13 +1217,14 @@ void ggml_sycl_op_add_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tens
 // unary_src and other_src separate contiguous same-shape tensors. Elides the
 // standalone unary launch and its HBM round-trip of the unary output. Mirrors
 // the fused unary+mul path in ggml-cuda.
-template <bool MIRROR, typename T, typename Op>
+template <bool MIRROR, bool Q8, typename T, typename Op>
 static void fused_unary_mul_launch(const T * a, const T * b, T * dst, sycl::half * mir,
+                                   char * q8, const int q8_kx,
                                    const int64_t k, queue_ptr stream, Op op) {
     const uint32_t num_blocks = ceil_div((uint32_t) k, SYCL_GLU_BLOCK_SIZE);
     stream->parallel_for(
         sycl::nd_range<1>(num_blocks * sycl::range<1>(SYCL_GLU_BLOCK_SIZE), sycl::range<1>(SYCL_GLU_BLOCK_SIZE)),
-        [=](sycl::nd_item<1> item_ct1) {
+        [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
             SYCL_GLOBAL_ID_LOOP(k, item_ct1) {
                 const T v = op(a[i]) * b[i];
                 dst[i]    = v;
@@ -1141,16 +1232,21 @@ static void fused_unary_mul_launch(const T * a, const T * b, T * dst, sycl::half
                     mir[i] = static_cast<sycl::half>(v);
                 }
             }
+            if constexpr (Q8) {
+                producer_q8_emit(dst, q8, k, q8_kx, item_ct1);
+            }
         });
 }
 
 // Runtime choice, compile-time store: with no mirror the extra write is not branched over,
-// it is not instantiated.
+// it is not instantiated. The q8_1 emission is the mirror's decode-side dual and the two
+// are mutually exclusive (GEMM consumer vs mat-vec consumer).
 template <typename T, typename Op>
 static void fused_unary_mul_sycl(const T * a, const T * b, T * dst, const int64_t k, queue_ptr stream, Op op,
-                                 sycl::half * mir = nullptr) {
-    if (mir != nullptr) { fused_unary_mul_launch<true>(a, b, dst, mir, k, stream, op); }
-    else                { fused_unary_mul_launch<false>(a, b, dst, mir, k, stream, op); }
+                                 sycl::half * mir = nullptr, char * q8 = nullptr, int q8_kx = 0) {
+    if (mir != nullptr)     { fused_unary_mul_launch<true,  false>(a, b, dst, mir, q8, q8_kx, k, stream, op); }
+    else if (q8 != nullptr) { fused_unary_mul_launch<false, true >(a, b, dst, mir, q8, q8_kx, k, stream, op); }
+    else                    { fused_unary_mul_launch<false, false>(a, b, dst, mir, q8, q8_kx, k, stream, op); }
 }
 
 // Fused ADD(bias) + UNARY + MUL(scale) with per-ne0 broadcast of bias and scale:
@@ -1173,6 +1269,31 @@ static void fused_add_unary_mul_sycl(const T * a, const T * bias, const T * scal
         });
 }
 
+// Plain binary MUL with a producer-side q8_1 emission. The GDN gating chain's second
+// gate is a standalone GGML_OP_MUL (inplace over the gated norm's buffer) whose output,
+// read through a contiguous reshape, is the ssm_out/attn_output mat-vec's src1 -- the
+// last quantize-pool family (528+96+48+48 misses per 12-token trace). Emitting from the
+// upstream fused norm was built and falsified: these are the only bytes the
+// consumer sees. Same recipe as the GLU/UNARY+MUL producers; the identity op turns
+// fused_unary_mul's kernel into a plain product with the emission's sub-group layout.
+// Only fires when the gate helper hands back a buffer; every other MUL keeps the
+// generic bin_bcast path untouched.
+bool ggml_sycl_mul_emit_q8_fast(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * s0 = dst->src[0];
+    const ggml_tensor * s1 = dst->src[1];
+    if (dst->type != GGML_TYPE_F32 || s0->type != GGML_TYPE_F32 || s1->type != GGML_TYPE_F32) { return false; }
+    if (!ggml_are_same_shape(s0, s1) || !ggml_are_same_shape(s0, dst)) { return false; }
+    if (!ggml_is_contiguous(s0) || !ggml_is_contiguous(s1) || !ggml_is_contiguous(dst)) { return false; }
+    int    q8_kx  = 0;
+    char * q8_out = ggml_sycl_q8_emit_for_next_matvec(ctx, dst, &q8_kx);
+    if (q8_out == nullptr) { return false; }
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    const int64_t k = ggml_nelements(dst);
+    fused_unary_mul_sycl<float>((const float *) s0->data, (const float *) s1->data, (float *) dst->data,
+                                k, ctx.stream(), [](auto v) { return v; }, nullptr, q8_out, q8_kx);
+    return true;
+}
+
 static inline void ggml_sycl_op_fused_unary_mul(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
     const ggml_tensor * unary_src = unary_node->src[0];
     const ggml_tensor * other_src = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
@@ -1191,11 +1312,14 @@ static inline void ggml_sycl_op_fused_unary_mul(ggml_backend_sycl_context & ctx,
             float *       d = (float *) mul_node->data;
             // The gated linear-attention output is consumed by the next f16 GEMM; emit its
             // f16 copy here rather than letting that GEMM re-read the tensor to build one.
-            sycl::half * mir = ggml_sycl_f16_mirror_for_next_matmul(ctx, mul_node, (size_t) k);
+            // At decode the consumer is a mat-vec instead: emit the q8_1 copy (the dual of the f16 mirror).
+            sycl::half * mir    = ggml_sycl_f16_mirror_for_next_matmul(ctx, mul_node, (size_t) k);
+            int          q8_kx  = 0;
+            char *       q8_out = mir == nullptr ? ggml_sycl_q8_emit_for_next_matvec(ctx, mul_node, &q8_kx) : nullptr;
             switch (uop) {
-                case GGML_UNARY_OP_SILU:     fused_unary_mul_sycl<float>(a, b, d, k, stream, [](auto x) { return op_silu(x); }, mir); break;
-                case GGML_UNARY_OP_SIGMOID:  fused_unary_mul_sycl<float>(a, b, d, k, stream, [](auto x) { return op_sigmoid(x); }, mir); break;
-                case GGML_UNARY_OP_SOFTPLUS: fused_unary_mul_sycl<float>(a, b, d, k, stream, [](auto x) { return op_softplus(x); }, mir); break;
+                case GGML_UNARY_OP_SILU:     fused_unary_mul_sycl<float>(a, b, d, k, stream, [](auto x) { return op_silu(x); }, mir, q8_out, q8_kx); break;
+                case GGML_UNARY_OP_SIGMOID:  fused_unary_mul_sycl<float>(a, b, d, k, stream, [](auto x) { return op_sigmoid(x); }, mir, q8_out, q8_kx); break;
+                case GGML_UNARY_OP_SOFTPLUS: fused_unary_mul_sycl<float>(a, b, d, k, stream, [](auto x) { return op_softplus(x); }, mir, q8_out, q8_kx); break;
                 default: GGML_ABORT("fused unary+mul: unsupported unary op");
             }
             break;

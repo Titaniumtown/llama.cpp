@@ -3345,6 +3345,28 @@ static char * src1_q8_store(ggml_backend_sycl_context & ctx, const void * key, c
     return c.buf->get();
 }
 
+// Producer-side entry to the q8_1 cache. An op that produces a mat-vec activation can emit the
+// q8_1 copy itself and register it here; the consumer's src1_q8_lookup is keyed on the float
+// data pointer, so no consumer detection is needed -- the cache IS the rendezvous. A wrong
+// `variant` guess is safe: the lookup compares it and simply misses.
+char * ggml_sycl_src1_q8_store_ext(ggml_backend_sycl_context & ctx, const void * key, const void * strm,
+                                   size_t bytes, size_t src_ne, int variant, const ggml_tensor * out) {
+    char * p = src1_q8_store(ctx, key, strm, bytes, src_ne, variant);
+    // src1_q8_store stamps c.node = ctx.cur_node, which for a CONSUMER is the node that reads
+    // the activation -- correct there. A producer is the other way round: a fused op dispatches
+    // at the index of its FIRST node, so its own output lands at cur_node+1 or +2 and the
+    // lookup's overwrite walk (which starts at c.node+1) sees the output as a later write over
+    // the source range and rejects every entry. Measured, not reasoned: with key, stream,
+    // bytes, src_ne and variant all byte-identical at the very next mat-vec, the hit count did
+    // not move off its baseline at all. Stamp the node that actually produces `out` instead.
+    if (out != nullptr && ctx.cur_graph != nullptr) {
+        for (int j = ctx.cur_node; j < ctx.cur_node + 4 && j < ctx.cur_graph->n_nodes; ++j) {
+            if (ctx.cur_graph->nodes[j] == out) { ctx.src1_q8.node = j; break; }
+        }
+    }
+    return p;
+}
+
 inline void ggml_sycl_op_mul_mat_sycl(
     ggml_backend_sycl_context & ctx,
     const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
@@ -5532,6 +5554,85 @@ sycl::half * ggml_sycl_f16_mirror_for_next_matmul(ggml_backend_sycl_context & ct
     return src1_f16_store(ctx, dst->data, (const void *) ctx.stream(), ne, prod);
 }
 
+// Decode-side dual of the mirror above. The f16 mirror stays silent for mat-vec consumers
+// because they quantize src1 to q8_1 instead -- one standalone QUANTIZE/src1 launch each,
+// ~5.3 us of pure launch latency (a dropped work-group sweep moved that kernel 1.7% and
+// end-to-end exactly zero). The fused RMS-norm already emits for its consumers;
+// of the remainder the largest producer is the GLU, whose output is ffn down's src1. Same
+// rendezvous: emit the SoA q8_1 copy from the producer and register it under the src1 float
+// pointer; the consumer's src1_q8_lookup compares variant and simply misses on any mismatch.
+// Off switch: GGML_SYCL_GLU_EMIT_Q8=0.
+char * ggml_sycl_q8_emit_for_next_matvec(ggml_backend_sycl_context & ctx,
+                                         const ggml_tensor * dst, int * kx) {
+    static const int emit  = ggml_sycl_get_env("GGML_SYCL_GLU_EMIT_Q8", 1);
+    *kx = 0;
+    if (emit == 0 || !ggml_sycl_src1_cache_enabled()) { return nullptr; }
+    if (dst == nullptr || dst->type != GGML_TYPE_F32 || dst->data == nullptr) { return nullptr; }
+
+    const ggml_cgraph * g = ctx.cur_graph;
+    if (g == nullptr) { return nullptr; }
+
+    // Same producer scan as the mirror: a fused span executes at its HEAD's index while the
+    // tensor belongs to its LAST node, and the cache's overwrite walk starts after the stored
+    // index -- registering at the head would make the span's own tail read as an intervening
+    // write. GLU dispatches as a single node today, but the scan costs nothing and keeps this
+    // correct if it ever joins a span.
+    int prod = -1;
+    for (int j = ctx.cur_node; j < g->n_nodes && j - ctx.cur_node <= 8; ++j) {
+        if (g->nodes[j] == dst) { prod = j; break; }
+    }
+    if (prod < 0 || prod + 1 >= g->n_nodes) { return nullptr; }
+    ggml_tensor * nxt = g->nodes[prod + 1];
+    // The consumer may sit one contiguous same-data view away: the GDN gating chain is
+    // MUL -> RESHAPE([head_dim, heads*t] -> [6144, t]) -> MUL_MAT, and a falsified upstream emission
+    // established the MUL as the only node whose bytes the mat-vec actually reads. The
+    // emission then must speak the VIEW's dims: its ne[0] is the q8_1 row length the
+    // consumer's lookup hashes, and the store is stamped on the view node so the cache's
+    // overwrite walk starts at the consumer. Off switch: GGML_SYCL_MUL_EMIT_Q8=0 (also
+    // disables the binary-MUL fast path that feeds through this hop).
+    static const int hop_emit = ggml_sycl_get_env("GGML_SYCL_MUL_EMIT_Q8", 1);
+    const ggml_tensor * tgt = dst;
+    if (nxt->op != GGML_OP_MUL_MAT || nxt->src[1] != dst) {
+        if (hop_emit == 0 || prod + 2 >= g->n_nodes) { return nullptr; }
+        if ((nxt->op != GGML_OP_RESHAPE && nxt->op != GGML_OP_VIEW) || nxt->src[0] != dst ||
+            nxt->data != dst->data || !ggml_is_contiguous(nxt)) { return nullptr; }
+        ggml_tensor * mm = g->nodes[prod + 2];
+        if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != nxt) { return nullptr; }
+        tgt = nxt;
+        nxt = mm;
+    }
+
+    const char * why = nullptr;
+    // The consumer must take the quantizing mat-vec path: not DMMV (reads f32 directly) and
+    // within MMVQ's batch bound -- rows above it take the GEMM path and never look up the
+    // q8_1 cache. MATRIX_ROW_PADDING-aligned ne00 makes the padded q8_1 row
+    // stride equal the natural one, which the emission's flat row math assumes (17408 and
+    // 5120 both qualify).
+    // can_use_dequantize_mul_mat_vec being true does NOT mean DMMV runs: the dispatcher masks
+    // it off whenever the reorder-MMVQ path is available and GGML_SYCL_PRIORITIZE_DMMV is
+    // unset (the production state). The first cut of this gate declined on can_use_* and
+    // collected exactly zero: 704/704 emissions refused as "dmmv" while the consumer's
+    // src1_q8_lookup ran and missed 704 times at precisely the bytes this would have stored.
+    // Decline only when DMMV is genuinely prioritized; a stored entry that some corner-case
+    // consumer never looks up is a harmless 19.5 KB write into a buffer the next op reuses.
+    if (!can_use_mul_mat_vec_q(ctx.device, nxt->src[0], tgt, nxt))  { why = "not-mmvq"; }
+    else if (g_ggml_sycl_prioritize_dmmv)                           { why = "dmmv-prioritized"; }
+    else if (tgt->ne[1] < 1 || tgt->ne[1] > MMVQ_MAX_BATCH_SIZE)    { why = "rows"; }
+    else if (tgt->ne[2] != 1 || tgt->ne[3] != 1)                    { why = "dims23"; }
+    else if (!ggml_is_contiguous(tgt))                              { why = "noncontig"; }
+    else if (tgt->ne[0] % MATRIX_ROW_PADDING != 0)                  { why = "ne00%pad"; }
+    if (why != nullptr) {
+        return nullptr;
+    }
+
+    const size_t bytes  = (size_t) tgt->ne[1] * tgt->ne[0] * sizeof(block_q8_1) / QK8_1;
+    const size_t src_ne = (size_t) ggml_nelements(tgt);
+    char * p = ggml_sycl_src1_q8_store_ext(ctx, (const void *) tgt->data, (const void *) ctx.stream(),
+                                           bytes, src_ne, /*SoA=*/1, tgt);
+    *kx = (int) tgt->ne[0];
+    return p;
+}
+
 // The f32 short-row mat-vec routing predicate, named so the dispatch site and the
 // supports_op site cannot drift. These two were byte-identical conditions written
 // out twice because there was no predicate to name. If they drift, the backend claims to support a shape it does not dispatch --
@@ -7211,6 +7312,14 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
 //
 // Costs nothing when disabled - the queue is then built without the profiling property
 // and every hook below is a predictable branch on a cached flag.
+// What rms_norm_f32's q8_1 emission moved this graph. norm_q8_emit_target
+// (norm.cpp) writes it through ggml_sycl_q8_emit_record; span_bytes reads it. File-scope
+// because the profiler is a stateless per-graph local (`ggml_sycl_op_prof prof;`) with
+// no context to reach, and threading one through mark()/span_bytes() would touch every
+// call site for a measurement-only concern. Cleared at the top of each graph compute
+// beside the other per-graph resets, so it can never outlive the graph it describes.
+static std::unordered_map<const ggml_tensor *, uint64_t> q8_emit_bytes;
+
 struct ggml_sycl_op_prof {
     static bool enabled() {
         static const bool on = [] {
@@ -7524,6 +7633,13 @@ struct ggml_sycl_op_prof {
                     bytes += ggml_nbytes(n->src[s]);
                 }
             }
+            // Charge the q8_1 emission this node's span performed, if any. Keyed
+            // on the node, because norm_q8_emit_target is handed the span's MUL and the
+            // span walk visits it -- same pointer on both sides.
+            const auto emit = q8_emit_bytes.find(n);
+            if (emit != q8_emit_bytes.end()) {
+                bytes += emit->second;
+            }
         }
         return bytes;
     }
@@ -7746,6 +7862,18 @@ struct ggml_sycl_op_prof {
         fflush(stderr);
     }
 };
+// Defined BELOW `struct ggml_sycl_op_prof` so the writer can consult it:
+// otherwise every rms_norm_f32 q8_1 emission, in every build, pays an
+// `unordered_map` insert -- a pointer hash and a heap node -- to fill a ledger
+// that `span_bytes` only reads when the profiler is on. Defining it here lets producer and reader share ONE gate:
+// a sampled graph in flight, the only time span_bytes reads the ledger.
+void ggml_sycl_q8_emit_record(const ggml_tensor * out, uint64_t bytes) {
+    if (LIKELY(ggml_sycl_op_prof::active() == nullptr)) {
+        return;
+    }
+    q8_emit_bytes[out] = bytes;
+}
+
 
 bool ggml_sycl_prof_active() {
     return ggml_sycl_op_prof::active() != nullptr;
@@ -7781,6 +7909,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     prof.begin(sycl_ctx->stream());
     prof.mark_cheap("HOST/kv-reorder-census", 0);
     prof.mark_cheap("HOST/elide-f32-census", 0);
+    // The emission ledger describes the graph about to run, not the last one.
+    // Tensors are reused across graphs, so a stale entry would be charged to whatever
+    // node happened to sit at that address in this graph.
+    q8_emit_bytes.clear();
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         sycl_ctx->cur_node = i;

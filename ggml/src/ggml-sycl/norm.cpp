@@ -1,6 +1,7 @@
 #include "norm.hpp"
 
 #include "fusion.hpp"
+#include "quantize.hpp"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/presets.hpp"
 
@@ -146,6 +147,51 @@ static void group_norm_f32(const float* x, float* dst, const int group_size, con
     }
 }
 
+// Emit the q8_1 copy of a just-written normed row that the consuming mat-vec would otherwise
+// launch a separate kernel for (5 us/launch at decode, pure launch latency). One q8_1 block
+// per SUB-GROUP, QK8_1 / WARP_SIZE columns per lane: the mapping and arithmetic of
+// quantize_and_reorder_q8_1_soa, so the bytes are bit-identical. A block spans 32 columns and
+// a sub-group 16 on Intel, so a column-per-lane fold into the store loop would reduce over half
+// a block; iterating whole blocks also keeps every reduce_over_group full-width.
+static void rms_norm_emit_q8_1(const float * dst, const int64_t dst_stride_col, char * q8_out, const int q8_kx,
+                               const int ncols, const sycl::nd_item<3> & item_ct1, const int tid,
+                               const int block_size) {
+    constexpr int EPW = QK8_1 / WARP_SIZE;
+    // block b was written by the threads holding columns [32b, 32b+32), not this sub-group's
+    item_ct1.barrier(sycl::access::fence_space::global_and_local);
+
+    const auto sg   = item_ct1.get_sub_group();
+    const int  lane = tid % WARP_SIZE;
+    const int  nsg  = block_size / WARP_SIZE;
+    const int  nblk = ncols / QK8_1;
+
+    for (int b = tid / WARP_SIZE; b < nblk; b += nsg) {
+        const int c0 = b * QK8_1 + lane * EPW;
+
+        float vv[EPW];
+        float sum  = 0.0f;
+        float amax = 0.0f;
+#pragma unroll
+        for (int i = 0; i < EPW; i++) {
+            vv[i] = dst[(c0 + i) * dst_stride_col];
+            sum += vv[i];
+            amax = sycl::fmax(amax, sycl::fabs(vv[i]));
+        }
+        sum  = sycl::reduce_over_group(sg, sum, sycl::plus<float>());
+        amax = sycl::reduce_over_group(sg, amax, sycl::maximum<float>());
+
+        const float d = amax == 0.0f ? 1.0f : amax / 127.0f;
+#pragma unroll
+        for (int i = 0; i < EPW; i++) {
+            ((int8_t *) q8_out)[c0 + i] = static_cast<int8_t>(sycl::round(vv[i] / d));
+        }
+        if (lane == 0) {
+            *(sycl::half2 *) (q8_out + q8_kx + b * (int) sizeof(sycl::half2)) =
+                sycl::half2(sycl::half(amax == 0.0f ? 0.0f : d), sycl::half(sum));
+        }
+    }
+}
+
 template <bool do_multiply = false, bool do_add = false>
 static void rms_norm_f32(const float* x, float* dst, const int ncols,
     const int64_t src_stride_col, const int64_t src_stride_row, const int64_t src_stride_channel, const int64_t src_stride_sample,
@@ -155,7 +201,8 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols,
     const int64_t mul_stride_sample = 0, const int mul_nrows = 0, const int mul_nchannels = 0, const int mul_nsamples = 0,
     const float* add = nullptr, const int64_t add_stride_row = 0, const int64_t add_stride_channel = 0,
     const int64_t add_stride_sample = 0, const int add_nrows = 0, const int add_nchannels = 0, const int add_nsamples = 0,
-    const float scale_mul = 1.0f) {
+    const float scale_mul = 1.0f,
+    char * q8_out = nullptr, int q8_kx = 0, int q8_row_stride = 0) {
 
     static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
 
@@ -173,6 +220,10 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols,
 
     x   += src_offset;
     dst += dst_offset;
+    if (q8_out != nullptr) {
+        // q8_1 rows are padded to MATRIX_ROW_PADDING, so this stride is not dst's
+        q8_out += (size_t) row * (size_t) q8_row_stride;
+    }
 
     if constexpr (do_multiply) {
         const int mul_row     = row     % mul_nrows;
@@ -269,6 +320,10 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols,
                 dst[col * dst_stride_col] = v * scale_mul;
             }
         }
+    }
+
+    if (q8_out != nullptr) {
+        rms_norm_emit_q8_1(dst, dst_stride_col, q8_out, q8_kx, ncols, item_ct1, tid, block_size);
     }
 }
 
@@ -492,7 +547,8 @@ static void rms_norm_mul_f32_sycl(const float* x, const float* mul, float* dst, 
         const int64_t dst_stride_col, const int64_t dst_stride_row, const int64_t dst_stride_channel, const int64_t dst_stride_sample,
         const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
         const int mul_nrows, const int mul_nchannels, const int mul_nsamples,
-        const float eps, queue_ptr stream, int device) {
+        const float eps, queue_ptr stream, int device,
+        char * q8_out = nullptr, int q8_kx = 0, int q8_row_stride = 0) {
     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
     if (ncols < 1024) {
         const sycl::range<3> block_dims(1, 1, WARP_SIZE);
@@ -505,7 +561,8 @@ static void rms_norm_mul_f32_sycl(const float* x, const float* mul, float* dst, 
                         src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
                         dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
                         eps, item_ct1, nullptr, WARP_SIZE,
-                        mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples);
+                        mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples,
+                        nullptr, 0, 0, 0, 0, 0, 0, 1.0f, q8_out, q8_kx, q8_row_stride);
                 });
             });
     }
@@ -523,7 +580,8 @@ static void rms_norm_mul_f32_sycl(const float* x, const float* mul, float* dst, 
                         src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
                         dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
                         eps, item_ct1, get_pointer(s_sum_acc_ct1), work_group_size,
-                        mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples);
+                        mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples,
+                        nullptr, 0, 0, 0, 0, 0, 0, 1.0f, q8_out, q8_kx, q8_row_stride);
                 });
             });
     }
@@ -814,6 +872,42 @@ void ggml_sycl_op_rms_norm_scale_fused(ggml_backend_sycl_context & ctx, ggml_ten
         ss0, ss1, ss2, ss3, ds0, ds1, ds2, ds3, eps, scale_mul, main_stream, ctx.device);
 }
 
+// Gate + register for the producer-side q8_1 emission. Returns the buffer to write into, or
+// nullptr when the shape is one no mat-vec consumer reads (or the block mapping cannot cover).
+static char * norm_q8_emit_target(ggml_backend_sycl_context & ctx, const ggml_tensor * out,
+                                  int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+                                  int64_t d00, const void * strm, int * q8_kx,
+                                  int * q8_row_stride) {
+    static const int emit_q8 = ggml_sycl_get_env("GGML_SYCL_NORM_EMIT_Q8", 1);
+    *q8_kx         = 0;
+    *q8_row_stride = 0;
+    if (emit_q8 != 1) { return nullptr; }
+
+    // Wider than MMVQ_MAX_BATCH_SIZE the mat-mul takes the f16 GEMM path, which never looks up
+    // the q8_1 cache: a -d 8192 prefill emitting there turned decode 26.29 -> 26.23 t/s.
+    if (ne02 != 1 || ne03 != 1 || ne01 > MMVQ_MAX_BATCH_SIZE || ne00 % QK8_1 != 0 ||
+        !ggml_is_contiguous(out) || d00 != 1) {
+        return nullptr;
+    }
+    const int bs = ne00 < 1024 ? WARP_SIZE : ggml_sycl_info().max_work_group_sizes[ctx.device];
+    if (ne00 % bs != 0) {
+        return nullptr;
+    }
+
+    const int64_t padded  = GGML_PAD(ne00, MATRIX_ROW_PADDING);
+    const size_t  rstride = (size_t) padded * sizeof(block_q8_1) / QK8_1;
+    const size_t  bytes   = rstride * (size_t) ne01;
+    const size_t  src_ne  = (size_t) ggml_nelements(out);
+    char * p = ggml_sycl_src1_q8_store_ext(ctx, (const void *) out->data, strm, bytes, src_ne, /*SoA=*/1, out);
+    // the kernel re-reads its f32 dst and writes a padded q8_1 side buffer the profiler's
+    // span_bytes cannot see; charged after the decline so a refused shape costs nothing
+    ggml_sycl_q8_emit_record(out, (uint64_t) bytes + 4 * (uint64_t) src_ne);
+
+    *q8_kx         = (int) ne00;
+    *q8_row_stride = (int) rstride;
+    return p;
+}
+
 void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
     const ggml_tensor * rms_norm_src = dst->src[0];
     float eps = 0.0f;
@@ -869,9 +963,15 @@ void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor * 
     const int mul_nchannels = mul_src->ne[2];
     const int mul_nsamples  = mul_src->ne[3];
 
+    int    q8_kx         = 0;
+    int    q8_row_stride = 0;
+    char * q8_out = norm_q8_emit_target(ctx, mul_tensor, ne00, ne01, ne02, ne03, d00,
+                                        (const void *) main_stream, &q8_kx, &q8_row_stride);
+
     rms_norm_mul_f32_sycl(src0_dd, mul_dd, dst_dd, ne00, ne01, ne02, ne03,
         s00, s01, s02, s03, d00, d01, d02, d03,
-        mul_s01, mul_s02, mul_s03, mul_nrows, mul_nchannels, mul_nsamples, eps, main_stream, ctx.device);
+        mul_s01, mul_s02, mul_s03, mul_nrows, mul_nchannels, mul_nsamples, eps, main_stream, ctx.device,
+        q8_out, q8_kx, q8_row_stride);
 }
 
 void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
@@ -972,7 +1072,9 @@ static void add_rms_norm_mul_f32(const float *            a,
                                  const sycl::nd_item<3> & item_ct1,
                                  float *                  s_sum,
                                  const int                block_size,
-                                 sycl::half *             mir) {
+                                 sycl::half *             mir,
+                                 char *                   q8_out,
+                                 const int                q8_row_stride) {
     const int    row = item_ct1.get_group(2);
     const size_t off = (size_t) row * ncols;
     const int    tid = item_ct1.get_local_id(2);
@@ -1034,6 +1136,11 @@ static void add_rms_norm_mul_f32(const float *            a,
             }
         }
     }
+
+    if (q8_out != nullptr) {
+        rms_norm_emit_q8_1(dst + off, 1, q8_out + (size_t) row * (size_t) q8_row_stride, ncols, ncols, item_ct1,
+                           tid, block_size);
+    }
 }
 
 template <bool do_mirror>
@@ -1043,6 +1150,8 @@ static void add_rms_norm_mul_f32_launch(const float * a,
                                         const float * mul,
                                         float *       dst,
                                         sycl::half *  mir,
+                                        char *        q8_out,
+                                        const int     q8_row_stride,
                                         const int     ncols,
                                         const int     nrows,
                                         const float   eps,
@@ -1057,7 +1166,8 @@ static void add_rms_norm_mul_f32_launch(const float * a,
         cgh.parallel_for(sycl::nd_range<3>(global_dims * block_dims, block_dims),
                          [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                              add_rms_norm_mul_f32<do_mirror>(a, b, sum, mul, dst, ncols, eps, item_ct1,
-                                                             get_pointer(s_sum), work_group_size, mir);
+                                                             get_pointer(s_sum), work_group_size, mir, q8_out,
+                                                             q8_row_stride);
                          });
     });
 }
@@ -1088,17 +1198,16 @@ bool ggml_sycl_op_add_rms_norm_fused(ggml_backend_sycl_context & ctx,
     }
     // The span's output is the next f16 GEMM's activation in every transformer block here.
     // Emit its f16 copy from the register rather than letting that GEMM re-read the whole
-    // tensor to make one.
+    // tensor to make one; at decode widths emit the next mat-vec's q8_1 copy instead.
     sycl::half * mir = ggml_sycl_f16_mirror_for_next_matmul(ctx, mul, (size_t) ggml_nelements(mul));
-    if (mir != nullptr) {
-        add_rms_norm_mul_f32_launch<true>((const float *) a->data, (const float *) b->data, (float *) add->data,
-                                          (const float *) w->data, (float *) mul->data, mir, (int) ncols,
-                                          (int) add->ne[1], eps, ctx.stream(), ctx.device);
-    } else {
-        add_rms_norm_mul_f32_launch<false>((const float *) a->data, (const float *) b->data, (float *) add->data,
-                                           (const float *) w->data, (float *) mul->data, nullptr, (int) ncols,
-                                           (int) add->ne[1], eps, ctx.stream(), ctx.device);
-    }
+    int          q8_kx         = 0;
+    int          q8_row_stride = 0;
+    char *       q8_out = norm_q8_emit_target(ctx, mul, ncols, add->ne[1], 1, 1, 1, (const void *) ctx.stream(),
+                                              &q8_kx, &q8_row_stride);
+    const auto   launch = mir != nullptr ? add_rms_norm_mul_f32_launch<true> : add_rms_norm_mul_f32_launch<false>;
+    launch((const float *) a->data, (const float *) b->data, (float *) add->data, (const float *) w->data,
+           (float *) mul->data, mir, q8_out, q8_row_stride, (int) ncols, (int) add->ne[1], eps, ctx.stream(),
+           ctx.device);
     return true;
 }
 

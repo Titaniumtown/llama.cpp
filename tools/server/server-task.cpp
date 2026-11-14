@@ -1582,6 +1582,11 @@ std::string server_task_result_metrics::to_metrics() {
             "Number of prompt tokens reused from the cache",
             (double) metrics.n_prompt_cached
         }, {
+            "requests_reprocessed_total",
+            "Requests whose prompt reused under 20% of its tokens, i.e. the conversation head "
+            "moved (compaction, or another session took the slot) and the prompt was processed again",
+            (double) metrics.n_requests_reprocessed
+        }, {
             "prompt_seconds_total",
             "Total time spent processing prompts",
             metrics.prompt.time / 1.e6

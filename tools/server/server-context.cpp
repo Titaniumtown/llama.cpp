@@ -5620,6 +5620,17 @@ private:
 
                         metrics.add_prompt_cached(n_past);
 
+                        // a prompt the cache could barely help is the agentic thrash signal: more
+                        // conversations are interleaved than the slots can keep heads for, so only
+                        // the shared prefix is left to reuse and the prompt is processed again.
+                        if (slot.task->n_tokens() > 1024 && n_past < slot.task->n_tokens() / 5) {
+                            SLT_WRN(slot, "cache miss: re-processed %d of %d prompt tokens (%d cached), newest checkpoint at %d\n",
+                                    (int) slot.task->n_tokens() - (int) n_past, (int) slot.task->n_tokens(), (int) n_past,
+                                    slot.prompt.checkpoints.empty() ? 0 : (int) slot.prompt.checkpoints.back()->n_tokens);
+
+                            metrics.add_request_reprocessed();
+                        }
+
                         slot.prompt.tokens.keep_first(n_past);
 
                         // this is to signal the client that the request has started processing

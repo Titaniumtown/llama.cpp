@@ -557,6 +557,10 @@ struct server_metrics {
     // tokens reused from the cache need no decode, so they only have a count
     uint64_t n_prompt_cached = 0;
 
+    // requests the cache could barely help: the prompt reused under 20% of its tokens, so the
+    // conversation went through the prompt again. the agentic thrash signal.
+    uint64_t n_requests_reprocessed = 0;
+
     uint64_t n_tokens_max = 0;
 
     uint64_t n_decode     = 0;
@@ -583,6 +587,10 @@ struct server_metrics {
 
     void add_prompt_cached(uint64_t n_tokens) {
         n_prompt_cached += n_tokens;
+    }
+
+    void add_request_reprocessed() {
+        n_requests_reprocessed++;
     }
 };
 

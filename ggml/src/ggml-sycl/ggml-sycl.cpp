@@ -924,17 +924,72 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-// allocates the pinned upload staging on first use; returns false if staging is disabled or the allocation failed
-static bool ggml_sycl_buffer_init_staging(ggml_backend_sycl_buffer_context * ctx) {
-    const int n_slots = g_ggml_sycl_upload_staging_slots;
-    if (n_slots > 0 && ctx->staging.data == nullptr) {
-        ctx->staging.data = sycl::malloc_host(n_slots * ctx->staging_slot_size, *ctx->stream);
-        if (ctx->staging.data != nullptr) {
-            ctx->staging.events.resize(n_slots);
-            ctx->staging.submitted.assign(n_slots, false);
+// Host <-> device tensor copies go through pinned staging memory. The driver copies
+// to and from pageable host memory at 0.06-10 GB/s depending on the copy size
+// (Arc Pro B70, Level Zero: ~9 GB/s up to 64 MiB, erratic above that), while a
+// DMA from pinned memory runs at 27 GB/s. Chunking through two pinned halves
+// overlaps the host memcpy with the DMA of the previous chunk.
+//
+// This also keeps the mmap() workaround below: the driver never sees the caller's
+// pointer, only the staging buffer.
+struct ggml_sycl_host_staging {
+    static constexpr size_t chunk_size = 32 * 1024 * 1024;
+
+    std::mutex mutex;
+    char * buf = nullptr; // 2 * chunk_size, allocated on first use, lives for the process
+
+    char * half(size_t i, sycl::queue & q) {
+        if (buf == nullptr) {
+            // honor the escape hatch: every other pinned-host path in this backend is
+            // gated on the same flag (pinned allocations misbehave on some systems)
+            if (g_ggml_sycl_enable_host_pinned_mem) {
+                buf = (char *) sycl::malloc_host(2 * chunk_size, q);
+            }
+            if (buf == nullptr) {
+                // chunked copies still stay inside the fast regime of the driver's
+                // pageable path, so this fallback is only modestly slower
+                buf = (char *) malloc(2 * chunk_size);
+                GGML_ASSERT(buf != nullptr && "failed to allocate host staging memory");
+            }
         }
+        return buf + (i & 1) * chunk_size;
     }
-    return ctx->staging.data != nullptr;
+};
+
+static ggml_sycl_host_staging g_sycl_host_staging[GGML_SYCL_MAX_DEVICES];
+
+static void ggml_sycl_copy_host_to_device(int device, sycl::queue & q, char * dst, const char * src, size_t size) {
+    auto & st = g_sycl_host_staging[device];
+    std::lock_guard<std::mutex> lock(st.mutex);
+
+    sycl::event ev[2];
+    for (size_t off = 0, i = 0; off < size; off += st.chunk_size, ++i) {
+        const size_t n = std::min(st.chunk_size, size - off);
+        char * s = st.half(i, q);
+        if (i >= 2) {
+            ev[i & 1].wait(); // the DMA that last read this half
+        }
+        memcpy(s, src + off, n);
+        ev[i & 1] = q.memcpy(dst + off, s, n);
+    }
+    q.wait();
+}
+
+static void ggml_sycl_copy_device_to_host(int device, sycl::queue & q, char * dst, const char * src, size_t size) {
+    auto & st = g_sycl_host_staging[device];
+    std::lock_guard<std::mutex> lock(st.mutex);
+
+    sycl::event ev[2];
+    ev[0] = q.memcpy(st.half(0, q), src, std::min(st.chunk_size, size));
+    for (size_t off = 0, i = 0; off < size; off += st.chunk_size, ++i) {
+        const size_t n = std::min(st.chunk_size, size - off);
+        const size_t off_next = off + n;
+        if (off_next < size) {
+            ev[(i + 1) & 1] = q.memcpy(st.half(i + 1, q), src + off_next, std::min(st.chunk_size, size - off_next));
+        }
+        ev[i & 1].wait();
+        memcpy(dst + off, st.half(i, q), n);
+    }
 }
 
 static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
@@ -947,43 +1002,12 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
     ggml_sycl_set_device(ctx->device);
 
-    // copy through pinned memory so the device never reads mmap()ed pages directly
-    // chunks pipeline on the in-order compute queue, so no drain per tensor is needed
-    if (ggml_sycl_buffer_init_staging(ctx)) {
-        queue_ptr    stream    = ctx->stream;
-        char *       dst       = (char *) tensor->data + offset;
-        const char * src       = (const char *) data;
-        size_t       remaining = size;
-        while (remaining > 0) {
-            const size_t chunk = std::min(remaining, ctx->staging_slot_size);
-            const int    slot  = ctx->staging.next;
-            ctx->staging.next = (ctx->staging.next + 1) % (int) ctx->staging.submitted.size();
-            if (ctx->staging.submitted[slot]) {
-                ctx->staging.events[slot].wait_and_throw();
-            }
-            void * stage = (char *) ctx->staging.data + slot * ctx->staging_slot_size;
-            memcpy(stage, src, chunk);
-            ctx->staging.events[slot] = stream->memcpy(dst, stage, chunk);
-            ctx->staging.submitted[slot] = true;
-            src       += chunk;
-            dst       += chunk;
-            remaining -= chunk;
-        }
-        return;
-    }
 
     auto stream = &(dpct::dev_mgr::instance().get_device(ctx->device).default_queue());
     SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
-#ifndef _WIN32
-    // Note: Use host buffer to save the data from mmap(), then copy to device. It's workaround for mmap() issue on PVC GPU.
-    // This function will be called during load model from disk. Use memory buffer replace dynamic won't save more time and brings potential memory leak risk here.
-    char * host_buf = (char *) malloc(size);
-    memcpy(host_buf, data, size);
-    SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, host_buf, size).wait()));
-    free(host_buf);
-#else
-    SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, data, size).wait()));
-#endif
+    // Note: the data is copied to a host buffer first, then to the device. It's workaround for mmap() issue on PVC GPU.
+    // This function will be called during load model from disk.
+    SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_copy_host_to_device(ctx->device, *stream, (char *) tensor->data + offset, (const char *) data, size)));
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -1000,32 +1024,9 @@ static void ggml_backend_sycl_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     const char * src = (const char *) data;
     ggml_sycl_set_device(ctx->device);
 
-    if (stride_tensor != size || size > ctx->staging_slot_size || !ggml_sycl_buffer_init_staging(ctx)) {
-        // dst rows not contiguous, row larger than a staging slot, or no staging: same as the generic fallback
-        for (size_t i = 0; i < n_copies; ++i) {
-            ggml_backend_sycl_buffer_set_tensor(buffer, tensor, src + i * stride_data, offset + i * stride_tensor, size);
-        }
-        return;
-    }
-
-    // dst rows are contiguous: pack as many rows as fit into a staging slot and copy each slot with one memcpy
-    // a slot is only waited on when it is reused, so packing the next slot overlaps with the previous copies
-    queue_ptr    stream        = ctx->stream;
-    char *       dst           = (char *) tensor->data + offset;
-    const size_t rows_per_slot = ctx->staging_slot_size / size;
-    for (size_t i0 = 0; i0 < n_copies; i0 += rows_per_slot) {
-        const size_t n    = std::min(rows_per_slot, n_copies - i0);
-        const int    slot = ctx->staging.next;
-        ctx->staging.next = (ctx->staging.next + 1) % (int) ctx->staging.submitted.size();
-        if (ctx->staging.submitted[slot]) {
-            ctx->staging.events[slot].wait_and_throw();
-        }
-        char * stage = (char *) ctx->staging.data + slot * ctx->staging_slot_size;
-        for (size_t i = 0; i < n; ++i) {
-            memcpy(stage + i * size, src + (i0 + i) * stride_data, size);
-        }
-        ctx->staging.events[slot]    = stream->memcpy(dst + i0 * size, stage, n * size);
-        ctx->staging.submitted[slot] = true;
+    // Rows are uploaded one at a time; the copy path stages and chunks internally.
+    for (size_t i = 0; i < n_copies; ++i) {
+        ggml_backend_sycl_buffer_set_tensor(buffer, tensor, src + i * stride_data, offset + i * stride_tensor, size);
     }
 }
 catch (sycl::exception const &exc) {
@@ -1047,9 +1048,7 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
     ggml_sycl_set_device(ctx->device);
     auto stream = dpct::dev_mgr::instance().get_device(ctx->device).default_queue();
 
-    SYCL_CHECK(CHECK_TRY_ERROR(
-        stream.memcpy(data, (const char *)tensor->data + offset, size)
-            .wait()));
+    SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_copy_device_to_host(ctx->device, stream, (char *) data, (const char *) tensor->data + offset, size)));
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__

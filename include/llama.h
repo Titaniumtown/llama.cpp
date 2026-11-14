@@ -847,6 +847,10 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // Check if a suffix of the memory can be dropped at an arbitrary position. When it
+    // cannot, a saved state only resumes at the position it was saved at.
+    LLAMA_API bool llama_memory_can_truncate(llama_memory_t mem);
+
     //
     // State / sessions
     //

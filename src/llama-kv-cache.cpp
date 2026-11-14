@@ -1233,6 +1233,11 @@ bool llama_kv_cache::get_can_shift() const {
     return true;
 }
 
+bool llama_kv_cache::get_can_truncate() const {
+    // a cell's K/V is independent of the cells after it: a suffix can be dropped anywhere
+    return true;
+}
+
 uint32_t llama_kv_cache::get_size() const {
     const auto & cells = v_cells[seq_to_stream[0]];
 

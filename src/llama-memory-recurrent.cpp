@@ -783,6 +783,11 @@ bool llama_memory_recurrent::get_can_shift() const {
     return true;
 }
 
+bool llama_memory_recurrent::get_can_truncate() const {
+    // a recurrent state summarizes every token before it: only a saved snapshot resumes it
+    return false;
+}
+
 bool llama_memory_recurrent::is_empty() const {
     const bool res = ctxs_bufs.empty();
     assert(!res || total_size() == 0);

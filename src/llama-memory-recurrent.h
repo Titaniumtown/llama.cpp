@@ -62,6 +62,7 @@ public:
     bool find_slot(const llama_ubatch & ubatch);
 
     bool get_can_shift() const override;
+    bool get_can_truncate() const override;
 
     // state write/load
 

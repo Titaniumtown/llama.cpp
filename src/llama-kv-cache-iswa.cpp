@@ -254,6 +254,10 @@ bool llama_kv_cache_iswa::get_can_shift() const {
            kv_base->get_size() == kv_swa->get_size();
 }
 
+bool llama_kv_cache_iswa::get_can_truncate() const {
+    return true;
+}
+
 void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     kv_base->state_write(io, seq_id, flags);
     kv_swa ->state_write(io, seq_id, flags);

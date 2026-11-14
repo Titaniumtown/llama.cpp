@@ -132,6 +132,10 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // whether a suffix can be dropped at an arbitrary position: a memory that cannot can
+    // resume a saved state only from the checkpoint it was saved at
+    virtual bool get_can_truncate() const = 0;
+
     //
     // ops
     //

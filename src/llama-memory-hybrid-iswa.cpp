@@ -142,6 +142,10 @@ bool llama_memory_hybrid_iswa::get_can_shift() const {
     return mem_attn->get_can_shift();
 }
 
+bool llama_memory_hybrid_iswa::get_can_truncate() const {
+    return mem_attn->get_can_truncate() && mem_recr->get_can_truncate();
+}
+
 void llama_memory_hybrid_iswa::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);

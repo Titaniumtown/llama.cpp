@@ -606,8 +606,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     }
 
     // the fetch gate (read cost vs. saved prefill, absolute floor) lives in
-    // server-prompt-cache-disk.h, where the test pins it
-    const bool disk_wins = server_prompt_cache_disk_wins(hit.lcp, lcp_ram, hit.size, hit.first_rung, fetch_bpt.load());
+    // server-prompt-cache-disk.h, where the test pins it. a memory that can drop a suffix
+    // resumes the entry at the request's common prefix; a recurrent one only at a saved
+    // checkpoint, so its first rung is the floor. the gain is over the slot's own head as
+    // well, as disk_prepare() prices it, or a read it skipped would run here, blocking
+    const int first_rung = llama_memory_can_truncate(llama_get_memory(ctx_tgt)) ? hit.lcp : hit.first_rung;
+    const bool disk_wins = server_prompt_cache_disk_wins(hit.lcp, std::max(lcp_ram, dec.slot_lcp), hit.size, first_rung, fetch_bpt.load());
 
     if (disk_wins) {
         server_prompt_cache_state fetched;

@@ -107,29 +107,70 @@ static void set_rows_sycl_q(const char * __restrict__ src0_d,
             }
             srcf = src_block_f32;
         }
-        if constexpr (std::is_same_v<blockType, block_q8_0>) {
+        // The KV store is set_rows (llama-kv-cache.cpp), so THIS is the writer the row-split
+        // readers were verified against -- not the cpy quantizer. Every registered type must
+        // be written in the segment layout, or the readers walk a buffer that was never
+        // written that way. Layouts and packing mirror ggml_sycl_quantize_rows_q exactly.
+        if constexpr (std::is_same_v<blockType, block_q8_0> || std::is_same_v<blockType, block_q4_0> ||
+                      std::is_same_v<blockType, block_q5_1>) {
             if (reorder_seg > 0) {
-                // Row-split KV layout: within each seg-element segment the qs bytes form one
-                // contiguous plane and the block scales follow as a half array. Same bytes
-                // per segment, same row stride -- only intra-segment addresses change.
                 const int64_t blk      = i00 / qk;
                 const int64_t segblk   = reorder_seg / qk;
                 const int64_t g        = blk / segblk;
                 const int64_t jb       = blk - g * segblk;
-                const size_t  segbytes = (size_t) reorder_seg + (size_t) segblk * sizeof(sycl::half);
+                const size_t  segbytes = std::is_same_v<blockType, block_q8_0>
+                                             ? (size_t) reorder_seg + (size_t) segblk * sizeof(sycl::half)
+                                         : std::is_same_v<blockType, block_q4_0>
+                                             ? (size_t) (reorder_seg / 2) + (size_t) segblk * sizeof(sycl::half)
+                                             : (size_t) (reorder_seg / 2) + (size_t) segblk * 4 + (size_t) segblk * 4;
                 char * segp = reinterpret_cast<char *>(dst_d) +
                               calculate_offset<3>({ nb1, nb2, nb3 }, { dst_row, i02, i03 }) + (size_t) g * segbytes;
-                float amax = 0.0f;
-                for (int j = 0; j < qk; j++) {
-                    amax = sycl::fmax(amax, sycl::fabs(srcf[j]));
+                if constexpr (std::is_same_v<blockType, block_q8_0>) {
+                    float amax = 0.0f;
+                    for (int j = 0; j < qk; j++) {
+                        amax = sycl::fmax(amax, sycl::fabs(srcf[j]));
+                    }
+                    const float d  = amax / 127.0f;
+                    const float id = d ? 1.0f / d : 0.0f;
+                    int8_t * qs = reinterpret_cast<int8_t *>(segp) + jb * qk;
+                    for (int j = 0; j < qk; ++j) {
+                        qs[j] = static_cast<int8_t>(sycl::round(srcf[j] * id));
+                    }
+                    reinterpret_cast<sycl::half *>(segp + reorder_seg)[jb] = sycl::half(d);
+                } else if constexpr (std::is_same_v<blockType, block_q4_0>) {
+                    float amax = 0.0f, vmax = 0.0f;
+                    for (int j = 0; j < qk; ++j) {
+                        if (amax < sycl::fabs(srcf[j])) { amax = sycl::fabs(srcf[j]); vmax = srcf[j]; }
+                    }
+                    const float d  = vmax / -8.0f;
+                    const float id = d ? 1.0f / d : 0.0f;
+                    uint8_t * nib = reinterpret_cast<uint8_t *>(segp) + jb * (qk / 2);
+                    for (int e = 0; e < qk; ++e) {
+                        const uint8_t q = dpct::min(15, (int8_t) (srcf[e] * id + 8.5f));
+                        nib[e >> 1] = (e & 1) ? (uint8_t) ((nib[e >> 1] & 0x0F) | (q << 4))
+                                              : (uint8_t) ((nib[e >> 1] & 0xF0) | q);
+                    }
+                    reinterpret_cast<sycl::half *>(segp + reorder_seg / 2)[jb] = sycl::half(d);
+                } else {
+                    float mn = srcf[0], mx = srcf[0];
+                    for (int j = 1; j < qk; ++j) {
+                        mn = srcf[j] < mn ? srcf[j] : mn;
+                        mx = srcf[j] > mx ? srcf[j] : mx;
+                    }
+                    const float d  = (mx - mn) / 31.0f;
+                    const float id = d ? 1.0f / d : 0.0f;
+                    uint32_t qh = 0;
+                    uint8_t * nib = reinterpret_cast<uint8_t *>(segp) + jb * (qk / 2);
+                    for (int e = 0; e < qk; ++e) {
+                        const uint8_t q = (uint8_t) ((srcf[e] - mn) * id + 0.5f);
+                        nib[e >> 1] = (e & 1) ? (uint8_t) ((nib[e >> 1] & 0x0F) | ((q & 0x0F) << 4))
+                                              : (uint8_t) ((nib[e >> 1] & 0xF0) | (q & 0x0F));
+                        qh |= ((q & 0x10u) >> 4) << e;
+                    }
+                    memcpy(segp + reorder_seg / 2 + (size_t) jb * 4, &qh, sizeof(qh));
+                    reinterpret_cast<sycl::half2 *>(segp + reorder_seg / 2 + (size_t) segblk * 4)[jb] =
+                        sycl::half2(sycl::half(d), sycl::half(mn));
                 }
-                const float d  = amax / 127.0f;
-                const float id = d ? 1.0f / d : 0.0f;
-                int8_t * qs = reinterpret_cast<int8_t *>(segp) + jb * qk;
-                for (int j = 0; j < qk; ++j) {
-                    qs[j] = static_cast<int8_t>(sycl::round(srcf[j] * id));
-                }
-                reinterpret_cast<sycl::half *>(segp + reorder_seg)[jb] = sycl::half(d);
                 return;
             }
         }
@@ -426,12 +467,17 @@ static void set_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor * s
                 ne10, ne11, ne12, ne13, nb00, nb01,
                 nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, 0, stream);
             break;
-        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q5_1: {
+            int kvseg = ggml_sycl_kv_reorder_seg(dst);
+            if (kvseg > 0 && (kvseg % QK5_1 != 0 || ne00 % kvseg != 0)) {
+                kvseg = 0;
+            }
             set_rows_sycl_q<TIn, TIdx, block_q5_1, QK5_1, cpy_blck_f32_q5_1>(
                 src0_d, src1_d, (block_q5_1 *) dst->data, ne00, ne01, ne02, ne03,
                 ne10, ne11, ne12, ne13, nb00, nb01,
-                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, 0, stream);
+                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, kvseg, stream);
             break;
+        }
         case GGML_TYPE_Q5_0:
             set_rows_sycl_q<TIn, TIdx, block_q5_0, QK5_0, cpy_blck_f32_q5_0>(
                 src0_d, src1_d, (block_q5_0 *) dst->data, ne00, ne01, ne02, ne03,
@@ -444,12 +490,17 @@ static void set_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor * s
                 ne10, ne11, ne12, ne13, nb00, nb01,
                 nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, 0, stream);
             break;
-        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_0: {
+            int kvseg = ggml_sycl_kv_reorder_seg(dst);
+            if (kvseg > 0 && (kvseg % QK4_0 != 0 || ne00 % kvseg != 0)) {
+                kvseg = 0;
+            }
             set_rows_sycl_q<TIn, TIdx, block_q4_0, QK4_0, cpy_blck_f32_q4_0>(
                 src0_d, src1_d, (block_q4_0 *) dst->data, ne00, ne01, ne02, ne03,
                 ne10, ne11, ne12, ne13, nb00, nb01,
-                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, 0, stream);
+                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, kvseg, stream);
             break;
+        }
         case GGML_TYPE_IQ4_NL:
             set_rows_sycl_q<TIn, TIdx, block_iq4_nl, QK4_NL, cpy_blck_f32_iq4_nl>(
                 src0_d, src1_d, (block_iq4_nl *) dst->data, ne00, ne01, ne02, ne03,

@@ -1100,20 +1100,19 @@ void launch_fattn(
     if (need_f16_K && K->type != GGML_TYPE_F16) {
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
-        const int    kseg = K->type == GGML_TYPE_Q8_0 ? ggml_sycl_kv_reorder_seg(K) : 0;
-
+        const int    kseg = ggml_sycl_kv_reorder_seg(K);
 
         GGML_ASSERT(extra.K_buffer_ptr);
         sycl::half * K_f16_ptr = (sycl::half *) extra.K_buffer_ptr;
         if (kseg > 0 && ggml_is_contiguously_allocated(K)) {
             // flat walk, elementwise in place: same layout mapping as the AoS branch below
-            ggml_sycl_q8_0_reordered_to_fp16(K_data, K_f16_ptr, ggml_nelements(K), kseg, main_stream);
+            ggml_sycl_reordered_to_fp16(K->type, K_data, K_f16_ptr, ggml_nelements(K), kseg, main_stream);
             nb11 = nb11 * bs * sizeof(sycl::half) / ts;
             nb12 = nb12 * bs * sizeof(sycl::half) / ts;
             nb13 = nb13 * bs * sizeof(sycl::half) / ts;
         } else if (kseg > 0) {
-            ggml_sycl_q8_0_reordered_to_fp16_nc(K_data, K_f16_ptr, K->ne[0], K->ne[1], K->ne[2],
-                                                K->ne[3], nb11, nb12, nb13, kseg, main_stream);
+            ggml_sycl_reordered_to_fp16_nc(K->type, K_data, K_f16_ptr, K->ne[0], K->ne[1], K->ne[2],
+                                           K->ne[3], nb11, nb12, nb13, kseg, main_stream);
             nb11 = K->ne[0] * sizeof(sycl::half);
             nb12 = K->ne[1] * nb11;
             nb13 = K->ne[2] * nb12;
@@ -1157,19 +1156,19 @@ void launch_fattn(
         } else {
             const size_t bs = ggml_blck_size(V->type);
             const size_t ts = ggml_type_size(V->type);
-            const int    vseg = V->type == GGML_TYPE_Q8_0 ? ggml_sycl_kv_reorder_seg(V) : 0;
+            const int    vseg = ggml_sycl_kv_reorder_seg(V);
 
             GGML_ASSERT(extra.V_buffer_ptr);
             sycl::half * V_f16_ptr = (sycl::half *) extra.V_buffer_ptr;
             if (vseg > 0 && ggml_is_contiguously_allocated(V)) {
-                ggml_sycl_q8_0_reordered_to_fp16(V_data, V_f16_ptr, ggml_nelements(V), vseg, main_stream);
+                ggml_sycl_reordered_to_fp16(V->type, V_data, V_f16_ptr, ggml_nelements(V), vseg, main_stream);
                 V_data = (char *) V_f16_ptr;
                 nb21 = nb21 * bs * sizeof(sycl::half) / ts;
                 nb22 = nb22 * bs * sizeof(sycl::half) / ts;
                 nb23 = nb23 * bs * sizeof(sycl::half) / ts;
             } else if (vseg > 0) {
-                ggml_sycl_q8_0_reordered_to_fp16_nc(V_data, V_f16_ptr, V->ne[0], V->ne[1], V->ne[2],
-                                                    V->ne[3], nb21, nb22, nb23, vseg, main_stream);
+                ggml_sycl_reordered_to_fp16_nc(V->type, V_data, V_f16_ptr, V->ne[0], V->ne[1], V->ne[2],
+                                               V->ne[3], nb21, nb22, nb23, vseg, main_stream);
                 V_data = (char *) V_f16_ptr;
                 nb21 = V->ne[0] * sizeof(sycl::half);
                 nb22 = V->ne[1] * nb21;

@@ -933,6 +933,69 @@ static void ggml_sycl_quantize_rows_q(const char * cx, char * cdst, const int64_
             }
         }
 
+        if constexpr (qk == QK4_0 || qk == QK5_1) {
+            if (reorder_seg > 0) {
+                // Row-split layout for q4_0/q5_1, written ELEMENT-MAJOR so the tile
+                // loader walks a segment as one contiguous run:
+                //     [seg/2 nibble bytes][seg/8 5th-bit plane][seg/8 (d,m) half2 tail]
+                // byte l of the nibble plane holds elements 2l (low) and 2l+1 (high);
+                // bit e of the qh plane (byte e/8, bit e%8) is element e's 5th bit;
+                // the scale pair for elements [32*jb,32*jb+32) is half2 jb of the tail.
+                //
+                // This is deliberately NOT the block layout. block_q4_0 packs elements
+                // j and j+16 into byte j; block_q5_1 packs them with a separate 5th-bit
+                // plane. The reader decides the order, so the writer must match the
+                // reader -- and the reader is the side that has to be right.
+                const int64_t blk    = i10 / qk;
+                const int64_t segblk = reorder_seg / qk;
+                const int64_t g      = blk / segblk;
+                const int64_t jb     = blk - g * segblk;
+                const float   *xb    = xf;
+                char * segp  = cdst + i11*nb11 + i12*nb12 + i13*nb13
+                             + (size_t) g * (qk == QK4_0 ? segbytes_q4(reorder_seg, segblk)
+                                                         : segbytes_q5(reorder_seg, segblk));
+                // Per BLOCK, not per segment: e below is the block-local element index,
+                // so without the jb offset every block in a segment writes its 32
+                // nibbles onto the SAME 16 bytes and block 7 overwrites blocks 0..6.
+                // The tile loader reads nibbles at row + eg/2 with eg ABSOLUTE, i.e.
+                // segp + jb*(qk/2) -- which was never written, so it read
+                // uninitialised device memory for 7 of every 8 blocks and the logits
+                // came back NaN. The 5th-bit plane and the (d,m) tail were already
+                // indexed by jb; only this plane was not.
+                uint8_t     * nib   = (uint8_t *) segp + (size_t) jb * (qk / 2);
+                if constexpr (qk == QK4_0) {
+                    float amax = 0.0f, vmax = 0.0f;
+                    for (int j = 0; j < qk; ++j) {
+                        const float v = xb[j];
+                        if (amax < sycl::fabs(v)) { amax = sycl::fabs(v); vmax = v; }
+                    }
+                    const float d  = vmax / -8;
+                    const float id = d ? 1.0f/d : 0.0f;
+                    for (int e = 0; e < qk; ++e) {
+                        const uint8_t q = dpct::min(15, (int8_t)(xb[e]*id + 8.5f));
+                        nib[e>>1] = (e & 1) ? (uint8_t)((nib[e>>1] & 0x0F) | (q << 4))
+                                             : (uint8_t)((nib[e>>1] & 0xF0) |  q);
+                    }
+                    ((sycl::half *) (segp + reorder_seg/2))[jb] = sycl::half(d);
+                } else {
+                    float mn = xb[0], mx = xb[0];
+                    for (int j = 1; j < qk; ++j) { mn = xb[j] < mn ? xb[j] : mn; mx = xb[j] > mx ? xb[j] : mx; }
+                    const float d  = (mx - mn) / 31;
+                    const float id = d ? 1.0f/d : 0.0f;
+                    uint32_t qh = 0;
+                    for (int e = 0; e < qk; ++e) {
+                        const uint8_t q = (uint8_t)((xb[e] - mn) * id + 0.5f);
+                        nib[e>>1] = (e & 1) ? (uint8_t)((nib[e>>1] & 0x0F) | ((q & 0x0F) << 4))
+                                             : (uint8_t)((nib[e>>1] & 0xF0) |  (q & 0x0F));
+                        qh |= ((q & 0x10u) >> 4) << e;
+                    }
+                    memcpy(segp + reorder_seg/2 + (size_t) jb*4, &qh, sizeof(qh));
+                    ((sycl::half2 *) (segp + reorder_seg/2 + (size_t) segblk*4))[jb] =
+                        sycl::half2(sycl::half(d), sycl::half(mn));
+                }
+                return;
+            }
+        }
         if constexpr (qk == QK8_0) {
             if (reorder_seg > 0) {
                 // row-split KV layout (see common.hpp): qs plane + half d tail per segment
@@ -990,11 +1053,19 @@ static void ggml_sycl_quantize_rows_sycl(const char * cx, char * cdst, const ggm
                                                                             nb02, nb03, ne10, ne11, ne12, nb10, nb11,
                                                                             nb12, nb13, stream);
             break;
-        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q5_1: {
+            int kvseg = ggml_sycl_kv_reorder_seg(src1);
+            if (kvseg > 0 && (kvseg % QK5_1 != 0 || ne10 % kvseg != 0)) {
+                // D23: SILENT fallback to the standard block layout, while the tile
+                // loader still reads row-split because its reachability comes from
+                // registration, not from what this writer did.
+                kvseg = 0;
+            }
             ggml_sycl_quantize_rows_q<SrcScalar, cpy_blck_f32_q5_1, QK5_1>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01,
-                                                                            nb02, nb03, ne10, ne11, ne12, nb10, nb11,
-                                                                            nb12, nb13, stream);
+                    nb02, nb03, ne10, ne11, ne12, nb10, nb11,
+                    nb12, nb13, stream, kvseg);
             break;
+        }
         case GGML_TYPE_Q5_0:
             ggml_sycl_quantize_rows_q<SrcScalar, cpy_blck_f32_q5_0, QK5_0>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01,
                                                                             nb02, nb03, ne10, ne11, ne12, nb10, nb11,
@@ -1005,11 +1076,19 @@ static void ggml_sycl_quantize_rows_sycl(const char * cx, char * cdst, const ggm
                                                                             nb02, nb03, ne10, ne11, ne12, nb10, nb11,
                                                                             nb12, nb13, stream);
             break;
-        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_0: {
+            int kvseg = ggml_sycl_kv_reorder_seg(src1);
+            if (kvseg > 0 && (kvseg % QK4_0 != 0 || ne10 % kvseg != 0)) {
+                // D23: SILENT fallback to the standard block layout, while the tile
+                // loader still reads row-split because its reachability comes from
+                // registration, not from what this writer did.
+                kvseg = 0;
+            }
             ggml_sycl_quantize_rows_q<SrcScalar, cpy_blck_f32_q4_0, QK4_0>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01,
-                                                                            nb02, nb03, ne10, ne11, ne12, nb10, nb11,
-                                                                            nb12, nb13, stream);
+                    nb02, nb03, ne10, ne11, ne12, nb10, nb11,
+                    nb12, nb13, stream, kvseg);
             break;
+        }
         case GGML_TYPE_IQ4_NL:
             ggml_sycl_quantize_rows_q<SrcScalar, cpy_blck_f32_iq4_nl, QK4_NL>(cx, cdst, ne, ne00, ne01, ne02, nb00,
                                                                                nb01, nb02, nb03, ne10, ne11, ne12,
@@ -1613,12 +1692,31 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, co
     } else if (src0->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_F32) {
         ggml_cpy_i32_f32_sycl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10,
                               nb11, nb12, nb13, main_stream);
-    } else if (src0->type == GGML_TYPE_Q4_0 && src1->type == GGML_TYPE_F32) {
-        ggml_cpy_q4_0_f32_sycl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10,
-                               nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_Q4_1 && src1->type == GGML_TYPE_F32) {
         ggml_cpy_q4_1_f32_sycl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10,
                                nb11, nb12, nb13, main_stream);
+    } else if ((src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q5_1) &&
+               src1->type == GGML_TYPE_F32) {
+        // Registered ("KV reorder") caches store rows as split planes; the AoS walk
+        // would misread them. Without the Q4_0/Q5_1
+        // arms the K-shift read corrupts every reordered row (campaign D29).
+        const int kvseg = ggml_sycl_kv_reorder_seg(src0);
+        if (kvseg > 0) {
+            GGML_ASSERT(ggml_is_contiguous(src1));
+            if (src0->type == GGML_TYPE_Q4_0) {
+                ggml_sycl_q4_0_reordered_to_fp32(src0_ddc, (float *) src1_ddc,
+                                                  ggml_nelements(src0), kvseg, main_stream);
+            } else {
+                ggml_sycl_q5_1_reordered_to_fp32(src0_ddc, (float *) src1_ddc,
+                                                  ggml_nelements(src0), kvseg, main_stream);
+            }
+        } else if (src0->type == GGML_TYPE_Q4_0) {
+            ggml_cpy_q4_0_f32_sycl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10,
+                                   nb11, nb12, nb13, main_stream);
+        } else {
+            ggml_cpy_q5_1_f32_sycl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10,
+                                   nb11, nb12, nb13, main_stream);
+        }
     } else if (src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32) {
         // Registered ("KV reorder") caches store rows as split planes; the AoS walk
         // below would misread them. This is the K-shift read (cast cache -> f32).

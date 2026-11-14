@@ -9938,6 +9938,90 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
     }
 };
 
+// GGML_OP_SET_ROWS into a quantized cache + GGML_OP_FLASH_ATTN_EXT over views of it, the
+// shape llama builds for decode. A backend may keep such a cache in a private layout
+// (SYCL's GGML_SYCL_KV_REORDER*) because both halves are in one graph; the AoS-only FA
+// tests never reach that reader. Only `out` is compared: the cache bytes are layout.
+struct test_fa_kv_cache : public test_case {
+    const int64_t   hs;
+    const int64_t   nh;   // K/V heads
+    const int64_t   gqa;
+    const int64_t   n_kv;
+    const int64_t   nq;   // query tokens per stream
+    const int64_t   ns;   // streams
+    const ggml_type type_K;
+    const ggml_type type_V;
+
+    std::string vars() override {
+        return VARS_TO_STR8(hs, nh, gqa, n_kv, nq, ns, type_K, type_V);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FA_KV_CACHE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_fa_kv_cache(int64_t hs, int64_t nh, int64_t gqa, int64_t n_kv, int64_t nq, int64_t ns,
+                     ggml_type type_K, ggml_type type_V)
+        : hs(hs), nh(nh), gqa(gqa), n_kv(n_kv), nq(nq), ns(ns), type_K(type_K), type_V(type_V) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nq, nh*gqa, ns);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv*ns);
+        ggml_set_name(idx, "idx");
+
+        auto cache_view = [&](ggml_type type, const char * name) {
+            ggml_tensor * c   = ggml_new_tensor_2d(ctx, type, hs*nh, n_kv*ns);
+            ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hs*nh, n_kv*ns);
+            ggml_set_name(c, name);
+            ggml_set_name(src, (std::string(name) + "_src").c_str());
+            c = ggml_set_rows(ctx, c, src, idx);
+            // [hs, n_kv, nh, ns] over [hs*nh, n_kv] rows, as llama's get_k/get_v + permute
+            return ggml_view_4d(ctx, c, hs, n_kv, nh, ns, c->nb[1], ggml_row_size(type, hs),
+                                c->nb[1]*n_kv, 0);
+        };
+        ggml_tensor * k = cache_view(type_K, "kc");
+        ggml_tensor * v = cache_view(type_V, "vc");
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, nq, 1, ns);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) {
+                continue;
+            }
+            if (strcmp(t->name, "idx") == 0) {
+                std::vector<int64_t> r(ggml_nelements(t));
+                for (size_t i = 0; i < r.size(); ++i) { r[i] = (int64_t) i; }
+                ggml_backend_tensor_set(t, r.data(), 0, r.size()*sizeof(int64_t));
+            } else if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else if (strcmp(t->name, "q") == 0) {
+                // a peaked softmax: a flat one averages V to ~0 over a deep cache and
+                // would pass a reader that returns garbage
+                init_tensor_uniform(t, -8.0f, 8.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -14478,6 +14562,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 768, 1, 1, 17, kv_rows, true, type));
             test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 768, 7, 2, 17, kv_rows, true, type));
         }
+    }
+
+    // decode FA over a SET_ROWS-written quantized cache, at production's head geometry
+    // (q5_1 K / q4_0 V, D 256, 4 KV heads x GQA 6) and the draft's q8_0 cache: solo and
+    // paired MTP verify (5), plain decode (1), the 2- and 4-wide verify tiles, across the
+    // depths the KV split changes at, and a depth that ends inside a key tile
+    for (auto [type_K, type_V] : std::vector<std::pair<ggml_type, ggml_type>>{
+             { GGML_TYPE_Q5_1, GGML_TYPE_Q4_0 }, { GGML_TYPE_Q4_0, GGML_TYPE_Q4_0 }, { GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 } }) {
+        for (int64_t n_kv : {4096, 16384, 98304}) {
+            for (int64_t nq : {1, 2, 4, 5}) {
+                for (int64_t ns : {1, 2}) {
+                    test_cases.emplace_back(new test_fa_kv_cache(256, 4, 6, n_kv, nq, ns, type_K, type_V));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_fa_kv_cache(256, 4, 6, 5000, 5, 1, type_K, type_V));
     }
 
     // sparse mask with large batch size

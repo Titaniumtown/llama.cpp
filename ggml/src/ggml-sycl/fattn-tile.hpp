@@ -469,6 +469,245 @@ static __dpct_inline__ void flash_attn_tile_load_tile_q8r(const char * const __r
     ggml_sycl_unroll<7>{}(load);
 }
 
+// ---------------------------------------------------------------------------
+// Row-split readers for q4_0 and q5_1, read natively by the tile kernel.
+// These are the q8_0 loader's twins. The layout they read is written by
+// ggml_sycl_quantize_rows_q in cpy.cpp and is ELEMENT-MAJOR, deliberately not
+// the block layout: byte l of the nibble plane holds elements 2l (low nibble)
+// and 2l+1 (high nibble), so a tile walks a segment as one contiguous run.
+//
+//   q4_0 : [seg/2 nibble bytes][seg/32 f16 scales]            -> 144 B at seg=256
+//   q5_1 : [seg/2 nibble bytes][seg/8 5th-bit plane]
+//                               [seg/8 (d,m) half2 tail]      -> 192 B at seg=256
+//
+// The 5th-bit plane here is ELEMENT-MAJOR and OWN TO THIS LAYOUT: bit e of a
+// block's 32-bit plane is element e's fifth bit. That is deliberately NOT what
+// block_q5_1 does, and conflating the two is the trap here. Check
+// ggml-quants.c:540-549 (dequantize_row_q5_1) for the reference and you will
+// find it reads, for j = 0..15:
+//
+//     xh_0 = ((qh >> (j +  0)) << 4) & 0x10;   // element j
+//     xh_1 = ((qh >> (j + 12))     ) & 0x10;   // element j + 16
+//
+// so in the BLOCK layout element e's fifth bit is bit e for e < 16 but bit
+// e - 4 for e >= 16; bits 12..15 serve double duty (element 12 and element 16
+// both read bit 12) and bits 28..31 are never read at all. This layout drops
+// that reuse: packing is this patch's choice, the VALUES are not. What must
+// match dequantize_row_q5_1 is the arithmetic -- value = (nibble | fifth<<4)*d + m
+// with d the half2's x and m its y, and the nibble pairing element j in byte j's
+// low nibble against element j+16 in its high nibble.
+//
+// The q5_1 pairing is NOT the q4_0 pairing and is the single easiest thing to
+// get wrong here. block_q5_1 packs element j in byte j's LOW nibble and
+// element j+16 in its HIGH nibble, with the fifth bits in a separate 32-bit
+// plane. dequantize_row_q5_1 therefore reconstructs element e as
+//     value = (nibble(e) | (fifth(e) << 4)) * d + m
+// where fifth(e) is bit e of qh and m is the half2's y. That is affine in TWO
+// terms, not a pure scale like q4_0 and q8_0, so a q5_1 reader written by
+// analogy with the q4_0 one returns a plausible tile that is quietly wrong.
+// ecs is the elements one work-item converts per chunk. 32 is one scale block; 16 puts
+// 2x the work-items on a tile whose rows x chunks would otherwise leave most of a wide
+// work-group idle at the barrier (480 threads, 64 rows x 2 chunks of K = 128).
+template <int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check, typename T_slm, int ecs = 32>
+static __dpct_inline__ void flash_attn_tile_load_tile_q4_0r(const char * const __restrict__ KV,
+                                                           T_slm * const __restrict__ tile_KV,
+                                                           const int stride_KV_b,
+                                                           const int seg,
+                                                           const int elem0,
+                                                           const int i_sup) {
+    auto          item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    constexpr int cpy_nb   = ggml_sycl_get_max_cpy_bytes();
+    constexpr int cpy_ne   = cpy_nb / 4;
+    constexpr bool slm_h2  = std::is_same<T_slm, sycl::half2>::value;
+    static_assert(QK4_0 % ecs == 0 && ecs >= 8, "a chunk must sit inside one scale block");
+    constexpr int  ucs     = slm_h2 ? ecs/2 : ecs;
+    constexpr int  sub     = slm_h2 ? ecs/(2*cpy_ne) : ecs/cpy_ne;
+    constexpr int  slm_row = slm_h2 ? (J/2 + J_padding) : (J + J_padding);
+    static_assert(J % ecs == 0, "bad J");
+    constexpr int  N       = ecs/2;  // nibble bytes per chunk
+    static_assert(ucs == sub * cpy_ne, "bad substep");
+    auto load = [&] (const int n) {
+        const int stride_j = warp_size >> n;
+        if (stride_j == 0) { return; }
+        constexpr int nchunk = J / ecs;
+        const int j0_start = stride_j == warp_size ? 0 : nchunk - nchunk % (2*stride_j);
+        const int j0_stop  =                            nchunk - nchunk % (1*stride_j);
+        const int stride_i = warp_size / stride_j;
+        if (j0_start == j0_stop) { return; }
+#pragma unroll
+        for (int i0 = 0; i0 < I; i0 += nwarps*stride_i) {
+            const int i = i0 + item_ct1.get_local_id(1) * stride_i +
+                          (stride_j == warp_size ? 0 : item_ct1.get_local_id(2) / stride_j);
+            if (i0 + nwarps*stride_i <= I || i < I) {
+#pragma unroll
+                for (int j0 = j0_start; j0 < j0_stop; j0 += stride_j) {
+                    const int c = j0 + (stride_j == warp_size ? item_ct1.get_local_id(2) :
+                                                                item_ct1.get_local_id(2) % stride_j);
+                    __dpct_align__(16) T_slm out[ucs];
+                    if (!oob_check || i < i_sup) {
+                        const char * const row = KV + (size_t) i * stride_KV_b;
+                        const int          eg  = elem0 + c*ecs;
+                        __dpct_align__(16) uint8_t qv[N];
+                        ggml_sycl_memcpy_1<N>(qv, row + eg/2);
+                        const float d = (float) ((const sycl::half *) (row + seg/2))[eg >> 5];
+                        if constexpr (slm_h2) {
+                            // ONE 32-bit lane per byte of the nibble plane: byte l holds
+                            // elements 2l (low nibble) and 2l+1 (high nibble), so the two
+                            // halves of the lane are the two elements of one half2 unit.
+                            // The per-element form this replaces could only widen four
+                            // 32-bit lanes at a time.
+                            sycl::vec<int32_t, N> nb;
+#pragma unroll
+                            for (int j = 0; j < N; ++j) { nb[j] = qv[j]; }
+                            const sycl::vec<int32_t, N> lo = (nb & 0x0F) - 8;
+                            const sycl::vec<int32_t, N> hi = (nb >> 4)    - 8;
+                            sycl::vec<float, N> f0, f1;
+#pragma unroll
+                            for (int j = 0; j < N; ++j) {
+                                f0[j] = d * (float) lo[j];
+                                f1[j] = d * (float) hi[j];
+                            }
+#pragma unroll
+                            for (int l = 0; l < N; ++l) { out[l] = make_half2(f0[l], f1[l]); }
+                        } else {
+#pragma unroll
+                            for (int l = 0; l < ucs; ++l) {
+                                const uint8_t b = qv[l >> 1];
+                                const int     q = (l & 1) ? (b >> 4) : (b & 0x0F);
+                                out[l] = (float)(sycl::half)(d * (float)(q - 8));
+                            }
+                        }
+                    } else {
+#pragma unroll
+                        for (int l = 0; l < ucs; ++l) {
+                            if constexpr (slm_h2) { out[l] = make_half2(0.0f, 0.0f); }
+                            else                  { out[l] = 0.0f; }
+                        }
+                    }
+#pragma unroll
+                    for (int t = 0; t < sub; ++t) {
+                        ggml_sycl_memcpy_1<cpy_nb>(tile_KV + i*slm_row + c*ucs + t*cpy_ne, out + t*cpy_ne);
+                    }
+                }
+            }
+        }
+    };
+    ggml_sycl_unroll<7>{}(load);
+}
+
+template <int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check, typename T_slm, int ecs = 32>
+static __dpct_inline__ void flash_attn_tile_load_tile_q5_1r(const char * const __restrict__ KV,
+                                                           T_slm * const __restrict__ tile_KV,
+                                                           const int stride_KV_b,
+                                                           const int seg,
+                                                           const int elem0,
+                                                           const int i_sup) {
+    auto          item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    constexpr int cpy_nb   = ggml_sycl_get_max_cpy_bytes();
+    constexpr int cpy_ne   = cpy_nb / 4;
+    constexpr bool slm_h2  = std::is_same<T_slm, sycl::half2>::value;
+    static_assert(QK5_1 % ecs == 0 && ecs >= 8, "a chunk must sit inside one (d,m) block");
+    constexpr int  ucs     = slm_h2 ? ecs/2 : ecs;
+    constexpr int  sub     = slm_h2 ? ecs/(2*cpy_ne) : ecs/cpy_ne;
+    constexpr int  slm_row = slm_h2 ? (J/2 + J_padding) : (J + J_padding);
+    constexpr int  N       = ecs/2;  // nibble bytes per chunk
+    static_assert(J % ecs == 0, "bad J");
+    static_assert(ucs == sub * cpy_ne, "bad substep");
+    const int segblk = seg / QK5_1;                  // (d,m) pairs per segment
+    auto load = [&] (const int n) {
+        const int stride_j = warp_size >> n;
+        if (stride_j == 0) { return; }
+        constexpr int nchunk = J / ecs;
+        const int j0_start = stride_j == warp_size ? 0 : nchunk - nchunk % (2*stride_j);
+        const int j0_stop  =                            nchunk - nchunk % (1*stride_j);
+        const int stride_i = warp_size / stride_j;
+        if (j0_start == j0_stop) { return; }
+#pragma unroll
+        for (int i0 = 0; i0 < I; i0 += nwarps*stride_i) {
+            const int i = i0 + item_ct1.get_local_id(1) * stride_i +
+                          (stride_j == warp_size ? 0 : item_ct1.get_local_id(2) / stride_j);
+            if (i0 + nwarps*stride_i <= I || i < I) {
+#pragma unroll
+                for (int j0 = j0_start; j0 < j0_stop; j0 += stride_j) {
+                    const int c = j0 + (stride_j == warp_size ? item_ct1.get_local_id(2) :
+                                                                item_ct1.get_local_id(2) % stride_j);
+                    __dpct_align__(16) T_slm out[ucs];
+                    if (!oob_check || i < i_sup) {
+                        const char * const row = KV + (size_t) i * stride_KV_b;
+                        const int          eg  = elem0 + c*ecs;
+                        __dpct_align__(16) uint8_t qv[N];
+                        ggml_sycl_memcpy_1<N>(qv, row + eg/2);
+                        // 5th bits, THIS layout's element-major plane: bit e at byte
+                        // e/8, bit e%8, of the plane at row+seg/2. Not the block
+                        // layout's reuse -- see the header comment and ggml-quants.c:540-549.
+                        // eg is a multiple of ecs (>= 8), so this is ecs/8 whole bytes.
+                        // qh is therefore CHUNK-RELATIVE: bit j is element eg+j's
+                        // 5th bit, and must be indexed with j. Indexing by (eg+j)
+                        // shifts a uint32_t by up to 254 -- UB, and it produced NaN.
+                        const uint8_t * const hv = (const uint8_t *) (row + seg/2 + eg/8);
+                        uint32_t qh = 0;
+#pragma unroll
+                        for (int b = 0; b < ecs/8; ++b) { qh |= (uint32_t) hv[b] << (8*b); }
+                        const sycl::half2 dm =
+                            ((const sycl::half2 *) (row + seg/2 + segblk*4))[eg / QK5_1];
+                        const float d = (float) dm.x();
+                        const float m = (float) dm.y();
+                        if constexpr (slm_h2) {
+                            // ONE 32-bit lane per byte of the nibble plane: byte l holds
+                            // elements 2l (low nibble) and 2l+1 (high nibble), so the two
+                            // 5th bits of that byte are bits 2l and 2l+1 of the plane.
+                            // Taking them as a PAIR -- one variable shift for all sixteen
+                            // bytes -- leaves each element's 5th bit in its own half of the
+                            // lane, which is the shape the float conversion wants.
+                            //
+                            // The per-element form this replaces could only widen four
+                            // 32-bit lanes at a time, and the expansion is the bulk of the
+                            // instructions this kernel issues per KV position.
+                            sycl::vec<int32_t, N> nb;
+                            sycl::vec<int32_t, N> sh;
+#pragma unroll
+                            for (int j = 0; j < N; ++j) { nb[j] = qv[j]; sh[j] = 2*j; }
+                            const sycl::vec<int32_t, N> pair = (sycl::vec<int32_t, N>((int) qh) >> sh) & 3;
+                            const sycl::vec<int32_t, N> n0 = (nb & 0x0F) | ((pair & 1) << 4);
+                            const sycl::vec<int32_t, N> n1 = (nb >> 4)    | ((pair & 2) << 3);
+                            sycl::vec<float, N> f0, f1;
+#pragma unroll
+                            for (int j = 0; j < N; ++j) {
+                                f0[j] = (float) n0[j]*d + m;
+                                f1[j] = (float) n1[j]*d + m;
+                            }
+#pragma unroll
+                            for (int l = 0; l < N; ++l) { out[l] = make_half2(f0[l], f1[l]); }
+                        } else {
+#pragma unroll
+                            for (int l = 0; l < ucs; ++l) {
+                                // Float tile: out has ecs slots and unit l IS element
+                                // eg+l. Indexing out[2*l] here would run 32 slots past
+                                // the end of the array for l >= 16.
+                                const uint8_t b = qv[l >> 1];
+                                const int     n = ((l & 1) ? (b >> 4) : (b & 0x0F))
+                                                | (int)(((qh >> l) & 1u) << 4);
+                                out[l] = (float)(sycl::half)(n*d + m);
+                            }
+                        }
+                    } else {
+#pragma unroll
+                        for (int l = 0; l < ucs; ++l) {
+                            if constexpr (slm_h2) { out[l] = make_half2(0.0f, 0.0f); }
+                            else                  { out[l] = 0.0f; }
+                        }
+                    }
+#pragma unroll
+                    for (int t = 0; t < sub; ++t) {
+                        ggml_sycl_memcpy_1<cpy_nb>(tile_KV + i*slm_row + c*ucs + t*cpy_ne, out + t*cpy_ne);
+                    }
+                }
+            }
+        }
+    };
+    ggml_sycl_unroll<7>{}(load);
+}
+
 // Integer-QK^T variant of the q8r loader: copies the RAW q8_0 bytes into an int8
 // SRAM tile (pitch J + 4 bytes -- an odd word count, so lane-per-row reads are
 // bank-conflict-free) and the per-32 block scales into an f32 array, converting
@@ -542,6 +781,9 @@ template <int  warp_size,
           bool oob_check,
           bool q8_KV,
           bool int_qk,
+          bool q4_0_KV,
+          bool q5_1_KV,
+          int  kv_ecs,
           typename T_vec_dot>
 static __dpct_inline__ void flash_attn_tile_iter_KQ(T_vec_dot * const Q_tmp,
                                                     const sycl::half2 * const __restrict__ K_h2,
@@ -613,6 +855,14 @@ static __dpct_inline__ void flash_attn_tile_iter_KQ(T_vec_dot * const Q_tmp,
         return;
     }
 
+    if constexpr (q5_1_KV) {
+        flash_attn_tile_load_tile_q5_1r<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check, T_vec_dot, kv_ecs>
+            ((const char *) K_h2 + int64_t(k_VKQ_0)*stride_K_b, KV_tmp, stride_K_b, DKQ, k_KQ_0, k_VKQ_sup);
+    } else
+    if constexpr (q4_0_KV) {
+        flash_attn_tile_load_tile_q4_0r<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check, T_vec_dot, kv_ecs>
+            ((const char *) K_h2 + int64_t(k_VKQ_0)*stride_K_b, KV_tmp, stride_K_b, DKQ, k_KQ_0, k_VKQ_sup);
+    } else
     if constexpr (q8_KV) {
         // seg == DKQ is a precondition of the dispatch (see ggml_sycl_fattn_tile_q8r_usable).
         flash_attn_tile_load_tile_q8r<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
@@ -688,6 +938,9 @@ template <int  warp_size,
           bool oob_check,
           bool q8_KV,
           bool int_qk,
+          bool q4_0_KV,
+          bool q5_1_KV,
+          int  kv_ecs,
           typename T_vec_dot,
           typename T_KQ,
           typename T_acc>
@@ -748,13 +1001,11 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
     constexpr int nbatch_K_last = DKQ % nbatch_K;
 #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < DKQ - nbatch_K_last; k_KQ_0 += nbatch_K) {
-        flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, q8_KV, int_qk>(
-            Q_tmp, K_h2, KV_tmp, Q_i8, Q_d, K_d, stride_K2, stride_K_b, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
+        flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, q8_KV, int_qk, q4_0_KV, q5_1_KV, kv_ecs>(Q_tmp, K_h2, KV_tmp, Q_i8, Q_d, K_d, stride_K2, stride_K_b, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
     }
     if (nbatch_K_last > 0) {
         constexpr int k_KQ_0 = DKQ - nbatch_K_last;
-        flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K_last, use_logit_softcap, oob_check, q8_KV, int_qk>(
-            Q_tmp, K_h2, KV_tmp, Q_i8, Q_d, K_d, stride_K2, stride_K_b, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
+        flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K_last, use_logit_softcap, oob_check, q8_KV, int_qk, q4_0_KV, q5_1_KV, kv_ecs>(Q_tmp, K_h2, KV_tmp, Q_i8, Q_d, K_d, stride_K2, stride_K_b, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
     }
 
     // Apply logit softcap + mask, update KQ_max:
@@ -868,6 +1119,11 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
     static_assert(nbatch_V % np == 0, "bad nbatch_V");
 #pragma unroll
     for (int k0 = 0; k0 < nbatch_fa; k0 += nbatch_V) {
+        if constexpr (q4_0_KV) {
+            flash_attn_tile_load_tile_q4_0r<warp_size, nwarps, nbatch_V, DV, 0, oob_check, T_vec_dot, kv_ecs>
+                ((const char *) V_h2 + int64_t(k_VKQ_0 + k0)*stride_V_b, KV_tmp, stride_V_b, DV, 0,
+                 k_VKQ_sup - k0);
+        } else
         if constexpr (q8_KV) {
             flash_attn_tile_load_tile_q8r<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
                 ((const char *) V_h2 + int64_t(k_VKQ_0 + k0)*stride_V_b, KV_tmp, stride_V_b, DV, 0,
@@ -949,7 +1205,9 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
 }
 
 template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, int warp_size,
-          bool q8_KV = false, bool int_qk = false>  // D == head size
+          bool q8_KV = false, bool int_qk = false,
+          bool q4_0_KV = false, bool q5_1_KV = false,
+          int kv_ecs = 32>  // D == head size; kv_ecs: see flash_attn_tile_load_tile_q4_0r
 /*
 The total declared local variable size in device function flash_attn_tile exceeds 128 bytes and may cause high register pressure. Consult with your hardware vendor to find the total register size available and adjust the code, or use smaller sub-group size to avoid high register pressure.
 */
@@ -1223,7 +1481,7 @@ static void flash_attn_tile(const char *  Q,
         while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap,
-                                 oob_check, q8_KV, int_qk>(Q_tmp, K_h2, V_h2, Q_i8, Q_d, K_d, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
+                                 oob_check, q8_KV, int_qk, q4_0_KV, q5_1_KV, kv_ecs>(Q_tmp, K_h2, V_h2, Q_i8, Q_d, K_d, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
                                             stride_V2, stride_K_b, stride_V_b, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
                                             KQ_max_new_shared);
             k_VKQ_0 += item_ct1.get_group_range(1) * nbatch_fa;
@@ -1231,7 +1489,7 @@ static void flash_attn_tile(const char *  Q,
         if (k_VKQ_0 < k_VKQ_max) {
             constexpr bool oob_check = true;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap,
-                                 oob_check, q8_KV, int_qk>(Q_tmp, K_h2, V_h2, Q_i8, Q_d, K_d, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
+                                 oob_check, q8_KV, int_qk, q4_0_KV, q5_1_KV, kv_ecs>(Q_tmp, K_h2, V_h2, Q_i8, Q_d, K_d, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
                                             stride_V2, stride_K_b, stride_V_b, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
                                             KQ_max_new_shared);
         }
@@ -1242,7 +1500,7 @@ static void flash_attn_tile(const char *  Q,
 
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap,
-                                 oob_check, q8_KV, int_qk>(Q_tmp, K_h2, V_h2, Q_i8, Q_d, K_d, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
+                                 oob_check, q8_KV, int_qk, q4_0_KV, q5_1_KV, kv_ecs>(Q_tmp, K_h2, V_h2, Q_i8, Q_d, K_d, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
                                             stride_V2, stride_K_b, stride_V_b, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
                                             KQ_max_new_shared);
         }
@@ -1444,6 +1702,31 @@ static bool ggml_sycl_fattn_tile_q8r_usable(const ggml_tensor * dst, const int D
            K->nb[1] % 16 == 0 && V->nb[1] % 16 == 0;
 }
 
+// The deployed target pair is q5_1 K over q4_0 V, so this gate accepts a MIXED
+// pair rather than requiring both tensors to be one type. That is the whole
+// reason the first direct-tile arm never fired: it required both q4_0, and no
+// deployed configuration is both q4_0. Each side is decided independently, which is
+// safe because launch_fattn's need_f16_K and need_f16_V are separate arguments
+// and TQ-3 established that BOTH must go false for the staging pass to vanish.
+static bool ggml_sycl_fattn_tile_mixed_r_usable(const ggml_tensor * dst, const int DKQ, const int DV) {
+    // No flag of its own. The single switch is GGML_SYCL_KV_REORDER_Q5_1, and it lives in
+    // ggml_sycl_kv_reorder_try_register: with it unset nothing is registered as reordered,
+    // so kv_reorder_seg() is 0 below and this predicate fails. Writer and reader are
+    // therefore coupled through the registration itself and cannot be enabled apart.
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    // ONLY the two pairs this patch adds. q8_0/q8_0 is deliberately NOT handled here:
+    // it belongs to the q8r arm, which is live production and which this patch
+    // must not perturb. Taking it here would also silently flip its int_qk arm off.
+    const bool newpair = (K->type == GGML_TYPE_Q5_1 && V->type == GGML_TYPE_Q4_0) ||
+                         (K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0);
+    return newpair &&
+           K->ne[0] == DKQ && V->ne[0] == DV &&
+           ggml_sycl_kv_reorder_seg(K) == K->ne[0] &&
+           ggml_sycl_kv_reorder_seg(V) == V->ne[0] &&
+           K->nb[1] % 16 == 0 && V->nb[1] % 16 == 0;
+}
+
 // Every tile launch goes through here so the two arms cannot drift. The q8r arm is
 // instantiated only for the 256/256 head size it was measured on, in the same spirit
 // as the ncols2 == 6 tile below: widening it instantiates the kernel twice for every
@@ -1452,6 +1735,32 @@ template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, int w
 static void launch_fattn_tile_one(ggml_backend_sycl_context & ctx, ggml_tensor * dst, const int nwarps,
                                   const size_t nbytes_shared, const int nbatch_fa) {
     if constexpr (DKQ == 256 && DV == 256) {
+        if (ggml_sycl_fattn_tile_mixed_r_usable(dst, DKQ, DV)) {
+            // Flags are the flash_attn_tile params (q8_KV, int_qk, q4_0_KV, q5_1_KV)
+            // and they must be LITERALS: a non-type template argument has to be a
+            // constant expression, so a runtime `const bool` is ill-formed.
+            //
+            // Per side, not one flag for both. q5_1_KV drives the K loader and
+            // q4_0_KV drives the V loader, which is why the deployed pair needs
+            // both true at once: K=q5_1 read by the q5_1 reader, V=q4_0 read by the
+            // q4_0 reader. A single flag would put the q5_1 reader on a q4_0 V.
+            const ggml_tensor * K = dst->src[1];
+            if (K->type == GGML_TYPE_Q5_1) {
+                // 16-element chunks: at 32 (one scale block) the n_q=5 tile leaves 352 of
+                // its 480 work-items idle at the dequant barrier.
+                launch_fattn<DV, ncols1, ncols2,
+                    flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, warp_size,
+                                    /*q8_KV=*/false, /*int_qk=*/false,
+                                    /*q4_0_KV=*/true, /*q5_1_KV=*/true, /*kv_ecs=*/16>, warp_size>
+                    (ctx, dst, nwarps, nbytes_shared, nbatch_fa, false, false, false);
+            } else {
+                launch_fattn<DV, ncols1, ncols2,
+                    flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, warp_size,
+                                    false, false, true, false>, warp_size>
+                    (ctx, dst, nwarps, nbytes_shared, nbatch_fa, false, false, false);
+            }
+            return;
+        }
         if (ggml_sycl_fattn_tile_q8r_usable(dst, DKQ, DV)) {
             // GGML_SYCL_FA_INT_QK=0 restores the q8_0 -> half2 convert path for a
             // same-binary A/B; default is the integer QK^T arm.

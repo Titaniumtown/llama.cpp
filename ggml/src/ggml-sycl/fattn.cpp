@@ -108,6 +108,18 @@ enum best_fattn_kernel {
 };
 
 
+// MKL dequantizes K/V with the standard block walk, which reads a row-split
+// buffer as if it were AoS. Its staging now dispatches on the tensor's type
+// (ggml_sycl_reordered_to_fp16), so q8_0, q4_0 and q5_1 are all readable there; any
+// other registered type must be declined here rather than misread. The registration
+// switch is binary-wide, so this is where the invariant "a registered cache is only
+// read by a consumer that can read it" is actually enforced.
+static bool ggml_sycl_fattn_kv_reorder_foreign(const ggml_tensor * K, const ggml_tensor * V) {
+    const bool k_ok = K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q5_1;
+    const bool v_ok = V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q5_1;
+    return (ggml_sycl_kv_reorder_seg(K) > 0 && !k_ok) ||
+           (ggml_sycl_kv_reorder_seg(V) > 0 && !v_ok);
+}
 static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef SYCL_FLASH_ATTN
     GGML_UNUSED(dst);
@@ -170,6 +182,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
 
     if (g_ggml_sycl_enable_mkl_fa == 1 && mask && !sinks && gqa_ratio >= 2 &&
+        !ggml_sycl_fattn_kv_reorder_foreign(K, V) &&
         (standard_shape || glm_mla_shape) &&
         Q->ne[1] >= 32 && K->ne[1] >= 1024 &&
         max_bias == 0.0f && logit_softcap == 0.0f &&

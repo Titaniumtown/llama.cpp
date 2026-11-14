@@ -3554,7 +3554,14 @@ static const void * kv_reorder_base(const ggml_tensor * t) {
 }
 
 void ggml_sycl_kv_reorder_try_register(const ggml_tensor * t) {
-    if (!ggml_sycl_kv_reorder_enabled() || t == nullptr || t->type != GGML_TYPE_Q8_0) { return; }
+    // q4_0 and q5_1 join q8_0 for the tile kernel. The register stays type-agnostic: it
+    // only records that the view is a run of whole head segments, and the reader that
+    // consumes the layout is chosen by the tile predicate. Gated, because a binary
+    // without the matching reader must never be handed a reordered cache.
+    static const int q51 = ggml_sycl_get_env("GGML_SYCL_KV_REORDER_Q5_1", 0);
+    if (!ggml_sycl_kv_reorder_enabled() || t == nullptr ||
+        (t->type != GGML_TYPE_Q8_0 &&
+         (q51 == 0 || (t->type != GGML_TYPE_Q4_0 && t->type != GGML_TYPE_Q5_1)))) { return; }
     // Only rows made of whole, densely packed head segments qualify: nb[2] must be the
     // natural segment byte size and the row stride a multiple of it. That is exactly the
     // unified-cache shape ([D, n_kv, H] view of [D*H, n_ctx] storage); anything else --
@@ -3563,7 +3570,9 @@ void ggml_sycl_kv_reorder_try_register(const ggml_tensor * t) {
     if (base == nullptr || t->view_src == nullptr) { return; }
     const int64_t seg = t->ne[0];
     if (seg <= 0 || seg % QK8_0 != 0 || (seg & (seg - 1)) != 0) { return; }
-    const size_t segbytes = (size_t) seg / QK8_0 * sizeof(block_q8_0);
+    const size_t segbytes = t->type == GGML_TYPE_Q8_0  ? segbytes_q8(seg, seg / QK8_0)
+                          : t->type == GGML_TYPE_Q4_0 ? segbytes_q4(seg, seg / QK4_0)
+                                                     : segbytes_q5(seg, seg / QK5_1);
     if ((size_t) t->nb[2] != segbytes) { return; }
     if (t->nb[1] % segbytes != 0) { return; }
     std::lock_guard<std::mutex> lock(g_kv_reorder_mutex);

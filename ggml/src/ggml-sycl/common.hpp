@@ -1291,6 +1291,20 @@ void ggml_sycl_kv_reorder_scan_graph(ggml_backend_sycl_context & ctx, const ggml
 void ggml_sycl_kv_reorder_try_register(const ggml_tensor * t);
 void ggml_sycl_kv_reorder_purge_range(const void * base, size_t bytes);
 // segment length in elements when `t`'s base allocation holds reordered rows, else 0
+// Bytes one row of a row-split KV segment occupies, per quant type. q8_0 is one
+// byte per element plus one half per 32; q4_0 a nibble per element plus one half
+// per 32; q5_1 a nibble per element plus a 5th-bit plane and a half2 (d,m) per 32.
+// All three stay 16-aligned at seg=256 (272 / 144 / 192).
+static inline size_t segbytes_q8(const int seg, const int segblk) {
+    return (size_t) seg + (size_t) segblk * sizeof(sycl::half);
+}
+static inline size_t segbytes_q4(const int seg, const int segblk) {
+    return (size_t) seg/2 + (size_t) segblk * sizeof(sycl::half);
+}
+static inline size_t segbytes_q5(const int seg, const int segblk) {
+    return (size_t) seg/2 + (size_t) segblk*4 + (size_t) segblk*4;
+}
+
 int  ggml_sycl_kv_reorder_seg(const ggml_tensor * t);
 // Aligned memory transfers of 8/16 bytes can be faster than 2 transfers with 4 bytes.
 template <int nbytes, int alignment = 0>

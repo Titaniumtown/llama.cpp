@@ -857,6 +857,213 @@ static void ggml_sycl_q8_0_reordered_to_fp16_nc_t(const void * vx, T * y, int64_
         }
     });
 }
+// ---- row-split ("KV reorder") q4_0 -> f16/f32 ----
+// Strided form of the two readers below, for the oneDNN prepass: it reads the unified
+// cache ([D, n_kv, Hkv] view of [D*Hkv, n_ctx] storage), where nb[1] is the whole token
+// row, so the flat form (a row is one segment) cannot be used. The q8_0 strided reader
+// that used to serve this branch is a q8_0 layout and produces garbage for these types.
+template <typename T>
+static void ggml_sycl_q4_0_reordered_to_fp16_nc_t(const void * vx, T * y, int64_t ne00, int64_t ne01,
+                                         int64_t ne02, int64_t ne03, size_t nb01, size_t nb02, size_t nb03,
+                                         int seg, dpct::queue_ptr stream) {
+    GGML_ASSERT(seg > 0 && seg % QK4_0 == 0 && ne00 % seg == 0);
+    GGML_ASSERT((seg & (seg - 1)) == 0);
+    GGML_ASSERT((ne00 & (ne00 - 1)) == 0);   // head sizes are powers of two
+    GGML_ASSERT(ne00 % 8 == 0);
+    const uint32_t rowoct       = (uint32_t) (ne00 / 8);
+    const int64_t  noct64       = (int64_t) rowoct * ne01 * ne02 * ne03;
+    GGML_ASSERT(noct64 <= INT32_MAX);
+    const uint32_t noct         = (uint32_t) noct64;
+    const uint32_t seg_u        = (uint32_t) seg;
+    const uint32_t seg_shift    = (uint32_t) __builtin_ctz(seg_u);
+    const uint32_t rowoct_shift = (uint32_t) __builtin_ctz(rowoct);
+    const uint32_t segbytes     = seg_u / 2 + (seg_u / QK4_0) * (uint32_t) sizeof(sycl::half);
+    const sycl::uint3 ne01_fd   = init_fastdiv_values((uint32_t) ne01);
+    const sycl::uint3 ne02_fd   = init_fastdiv_values((uint32_t) ne02);
+    const uint32_t ne00u        = (uint32_t) ne00;
+    constexpr int WGS = 256;
+    const int64_t ng = ((int64_t) noct + WGS - 1) / WGS;
+    stream->parallel_for(sycl::nd_range<1>(ng * WGS, WGS), [=](sycl::nd_item<1> it) {
+        const uint32_t i = (uint32_t) it.get_global_linear_id();
+        if (i >= noct) { return; }
+        const uint32_t row = i >> rowoct_shift;
+        const sycl::uint2 dm01 = fast_div_modulo(row, ne01_fd);
+        const uint32_t i01 = dm01.y();
+        const sycl::uint2 dm02 = fast_div_modulo(dm01.x(), ne02_fd);
+        const uint32_t i02 = dm02.y();
+        const uint32_t i03 = dm02.x();
+        const uint32_t e0  = (i - (row << rowoct_shift)) * 8;
+        const uint32_t g   = e0 >> seg_shift;
+        const uint32_t o   = e0 & (seg_u - 1);
+        const char *  segp = (const char *) vx + i01 * nb01 + i02 * nb02 + i03 * nb03 + (size_t) g * segbytes;
+        uint8_t qv[8];
+        *(sycl::vec<int32_t, 2> *) qv =
+            *(const sycl::vec<int32_t, 2> *) ((const uint8_t *) segp + (o >> 1));
+        const float d = (float) ((const sycl::half *) (segp + seg_u / 2))[o >> 5];
+        sycl::vec<T, 8> dst;
+#pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const int q = (l & 1) ? ((int) (qv[l >> 1] >> 4) & 0x0F) : ((int) qv[l >> 1] & 0x0F);
+            dst[l] = (T) (d * (float) (q - 8));
+        }
+        *(sycl::vec<T, 8> *) (y + ((size_t) row * ne00u) + e0) = dst;
+    });
+}
+template <typename T>
+static void ggml_sycl_q5_1_reordered_to_fp16_nc_t(const void * vx, T * y, int64_t ne00, int64_t ne01,
+                                         int64_t ne02, int64_t ne03, size_t nb01, size_t nb02, size_t nb03,
+                                         int seg, dpct::queue_ptr stream) {
+    GGML_ASSERT(seg > 0 && seg % QK5_1 == 0 && ne00 % seg == 0);
+    GGML_ASSERT((seg & (seg - 1)) == 0);
+    GGML_ASSERT((ne00 & (ne00 - 1)) == 0);   // head sizes are powers of two
+    GGML_ASSERT(ne00 % 8 == 0);
+    const uint32_t rowoct       = (uint32_t) (ne00 / 8);
+    const int64_t  noct64       = (int64_t) rowoct * ne01 * ne02 * ne03;
+    GGML_ASSERT(noct64 <= INT32_MAX);
+    const uint32_t noct         = (uint32_t) noct64;
+    const uint32_t seg_u        = (uint32_t) seg;
+    const uint32_t seg_shift    = (uint32_t) __builtin_ctz(seg_u);
+    const uint32_t rowoct_shift = (uint32_t) __builtin_ctz(rowoct);
+    const uint32_t segblk       = seg_u / QK5_1;
+    const uint32_t segbytes     = seg_u / 2 + segblk * 4 + segblk * 4;
+    const sycl::uint3 ne01_fd   = init_fastdiv_values((uint32_t) ne01);
+    const sycl::uint3 ne02_fd   = init_fastdiv_values((uint32_t) ne02);
+    const uint32_t ne00u        = (uint32_t) ne00;
+    constexpr int WGS = 256;
+    const int64_t ng = ((int64_t) noct + WGS - 1) / WGS;
+    stream->parallel_for(sycl::nd_range<1>(ng * WGS, WGS), [=](sycl::nd_item<1> it) {
+        const uint32_t i = (uint32_t) it.get_global_linear_id();
+        if (i >= noct) { return; }
+        const uint32_t row = i >> rowoct_shift;
+        const sycl::uint2 dm01 = fast_div_modulo(row, ne01_fd);
+        const uint32_t i01 = dm01.y();
+        const sycl::uint2 dm02 = fast_div_modulo(dm01.x(), ne02_fd);
+        const uint32_t i02 = dm02.y();
+        const uint32_t i03 = dm02.x();
+        const uint32_t e0  = (i - (row << rowoct_shift)) * 8;
+        const uint32_t g   = e0 >> seg_shift;
+        const uint32_t o   = e0 & (seg_u - 1);
+        const char *  segp = (const char *) vx + i01 * nb01 + i02 * nb02 + i03 * nb03 + (size_t) g * segbytes;
+        uint8_t qv[8];
+        *(sycl::vec<int32_t, 2> *) qv =
+            *(const sycl::vec<int32_t, 2> *) ((const uint8_t *) segp + (o >> 1));
+        const uint8_t qh = ((const uint8_t *) segp)[seg_u / 2 + (o >> 3)];
+        const sycl::half2 dm =
+            ((const sycl::half2 *) (segp + seg_u / 2 + segblk * 4))[o >> 5];
+        const float d = (float) dm.x();
+        const float m = (float) dm.y();
+        sycl::vec<T, 8> dst;
+#pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const int e = o + l;
+            const int q = (l & 1) ? (((int) (qv[l >> 1] >> 4) & 0x0F) | (int) (((qh >> (e & 7)) & 1u) << 4))
+                                  : (((int) qv[l >> 1] & 0x0F) | (int) (((qh >> (e & 7)) & 1u) << 4));
+            dst[l] = (T) (q * d + m);
+        }
+        *(sycl::vec<T, 8> *) (y + ((size_t) row * ne00u) + e0) = dst;
+    });
+}
+// Layout, per segment, matching the writer in cpy.cpp EXACTLY:
+//   [seg/2 nibble bytes][seg/32 f16 scales]      segbytes = seg/2 + (seg/32)*2
+// byte l holds element 2l in the low nibble and 2l+1 in the high nibble.
+// The scale for elements [32*j, 32*j+32) is half j of the tail.
+template <typename T>
+static void ggml_sycl_q4_0_reordered_to_fp16_t(const void * vx, T * y, int64_t k, int seg,
+                                               dpct::queue_ptr stream) {
+    GGML_ASSERT(seg > 0 && seg % QK4_0 == 0 && k % seg == 0);
+    GGML_ASSERT((seg & (seg - 1)) == 0);
+    const uint32_t noct      = (uint32_t) (k / 8);
+    const uint32_t seg_u     = (uint32_t) seg;
+    const uint32_t seg_shift = (uint32_t) __builtin_ctz(seg_u);
+    const uint32_t segbytes  = seg_u / 2 + (seg_u / QK4_0) * (uint32_t) sizeof(sycl::half);
+    constexpr int WGS = 256;
+    const int64_t ng = ((int64_t) noct + WGS - 1) / WGS;
+    stream->parallel_for(sycl::nd_range<1>(ng * WGS, WGS), [=](sycl::nd_item<1> it) {
+        const uint32_t i = (uint32_t) it.get_global_linear_id();
+        if (i >= noct) { return; }
+        const uint32_t e0 = i * 8;
+        const uint32_t g  = e0 >> seg_shift;
+        const uint32_t o  = e0 & (seg_u - 1);
+        const char *  segp = (const char *) vx + (size_t) g * segbytes;
+        uint8_t qv[8];
+        *(sycl::vec<int32_t, 2> *) qv =
+            *(const sycl::vec<int32_t, 2> *) ((const uint8_t *) segp + (o >> 1));
+        const float d = (float) ((const sycl::half *) (segp + seg_u / 2))[o >> 5];
+        sycl::vec<T, 8> dst;   // vec, not T[8] -- DPC++ will not assign from a raw array (D39)
+#pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const int q = (l & 1) ? ((int) (qv[l >> 1] >> 4) & 0x0F) : ((int) qv[l >> 1] & 0x0F);
+            dst[l] = (T) (d * (float) (q - 8));
+        }
+        *(sycl::vec<T, 8> *) (y + e0) = dst;   // 8xT bytes, not vec<int32_t,2> (D39)
+    });
+}
+void ggml_sycl_q4_0_reordered_to_fp16(const void * vx, sycl::half * y, int64_t k, int seg,
+                                      dpct::queue_ptr stream) {
+    ggml_sycl_q4_0_reordered_to_fp16_t<sycl::half>(vx, y, k, seg, stream);
+}
+void ggml_sycl_q4_0_reordered_to_fp32(const void * vx, float * y, int64_t k, int seg,
+                                      dpct::queue_ptr stream) {
+    ggml_sycl_q4_0_reordered_to_fp16_t<float>(vx, y, k, seg, stream);
+}
+
+// ---- row-split ("KV reorder") q5_1 -> f16/f32 ----
+// Layout, per segment, matching the writer in cpy.cpp EXACTLY:
+//   [seg/2 nibble bytes][seg/8 5th-bit plane][seg/8 (d,m) half2 tail]
+// The plane is ELEMENT-MAJOR and this layout's own: bit e is element e's 5th bit,
+// so it must be indexed with the chunk-relative e -- indexing a uint32_t by an
+// absolute element offset would shift by up to 254, which is UB (that was a real
+// bug in the tile loader, recorded as D23-adjacent in the campaign notes).
+template <typename T>
+static void ggml_sycl_q5_1_reordered_to_fp16_t(const void * vx, T * y, int64_t k, int seg,
+                                               dpct::queue_ptr stream) {
+    GGML_ASSERT(seg > 0 && seg % QK5_1 == 0 && k % seg == 0);
+    GGML_ASSERT((seg & (seg - 1)) == 0);
+    const uint32_t noct      = (uint32_t) (k / 8);
+    const uint32_t seg_u     = (uint32_t) seg;
+    const uint32_t seg_shift = (uint32_t) __builtin_ctz(seg_u);
+    const uint32_t segblk    = seg_u / QK5_1;
+    const uint32_t segbytes  = seg_u / 2 + segblk * 4 + segblk * 4;
+    constexpr int WGS = 256;
+    const int64_t ng = ((int64_t) noct + WGS - 1) / WGS;
+    stream->parallel_for(sycl::nd_range<1>(ng * WGS, WGS), [=](sycl::nd_item<1> it) {
+        const uint32_t i = (uint32_t) it.get_global_linear_id();
+        if (i >= noct) { return; }
+        const uint32_t e0 = i * 8;
+        const uint32_t g  = e0 >> seg_shift;
+        const uint32_t o  = e0 & (seg_u - 1);
+        const char *  segp = (const char *) vx + (size_t) g * segbytes;
+        uint8_t qv[8];   // 8 bytes: the vec<int32_t,2> load below stores 8 (D38)
+        *(sycl::vec<int32_t, 2> *) qv =
+            *(const sycl::vec<int32_t, 2> *) ((const uint8_t *) segp + (o >> 1));
+        // 5th-bit plane, element-major: one byte covers 8 elements, bit e%8 is element e.
+        const uint8_t qh = ((const uint8_t *) segp)[seg_u / 2 + (o >> 3)];
+        const sycl::half2 dm =
+            ((const sycl::half2 *) (segp + seg_u / 2 + segblk * 4))[o >> 5];
+        const float d = (float) dm.x();
+        const float m = (float) dm.y();
+        sycl::vec<T, 8> dst;   // vec, not T[8] -- DPC++ will not assign from a raw array (D39)
+#pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const int e = o + l;                       // ABSOLUTE within the segment,
+            const int q = (l & 1) ? (((int) (qv[l >> 1] >> 4) & 0x0F)
+                                  |  (int) (((qh >> (e & 7)) & 1u) << 4))
+                                 : (((int) qv[l >> 1] & 0x0F)
+                                  |  (int) (((qh >> (e & 7)) & 1u) << 4));
+            dst[l] = (T) (q * d + m);
+        }
+        *(sycl::vec<T, 8> *) (y + e0) = dst;   // 8xT bytes, not vec<int32_t,2> (D39)
+    });
+}
+void ggml_sycl_q5_1_reordered_to_fp16(const void * vx, sycl::half * y, int64_t k, int seg,
+                                      dpct::queue_ptr stream) {
+    ggml_sycl_q5_1_reordered_to_fp16_t<sycl::half>(vx, y, k, seg, stream);
+}
+void ggml_sycl_q5_1_reordered_to_fp32(const void * vx, float * y, int64_t k, int seg,
+                                      dpct::queue_ptr stream) {
+    ggml_sycl_q5_1_reordered_to_fp16_t<float>(vx, y, k, seg, stream);
+}
+
 void ggml_sycl_q8_0_reordered_to_fp16(const void * vx, sycl::half * y, int64_t k, int seg,
                                       dpct::queue_ptr stream) {
     ggml_sycl_q8_0_reordered_to_fp16_t<sycl::half>(vx, y, k, seg, stream);
@@ -879,6 +1086,51 @@ void ggml_sycl_q8_0_reordered_to_fp32_nc(const void * vx, float * y, int64_t ne0
     ggml_sycl_q8_0_reordered_to_fp16_nc_t<float>(vx, y, ne00, ne01, ne02, ne03, nb01, nb02, nb03, seg, stream);
 }
 
+void ggml_sycl_q4_0_reordered_to_fp16_nc(const void * vx, sycl::half * y, int64_t ne00, int64_t ne01,
+                                         int64_t ne02, int64_t ne03, size_t nb01, size_t nb02, size_t nb03, int seg,
+                                         dpct::queue_ptr stream) {
+    ggml_sycl_q4_0_reordered_to_fp16_nc_t<sycl::half>(vx, y, ne00, ne01, ne02, ne03, nb01, nb02, nb03, seg, stream);
+}
+void ggml_sycl_q5_1_reordered_to_fp16_nc(const void * vx, sycl::half * y, int64_t ne00, int64_t ne01,
+                                         int64_t ne02, int64_t ne03, size_t nb01, size_t nb02, size_t nb03, int seg,
+                                         dpct::queue_ptr stream) {
+    ggml_sycl_q5_1_reordered_to_fp16_nc_t<sycl::half>(vx, y, ne00, ne01, ne02, ne03, nb01, nb02, nb03, seg, stream);
+}
+
+void ggml_sycl_reordered_to_fp16(ggml_type type, const void * vx, sycl::half * y, int64_t k, int seg,
+                                 dpct::queue_ptr stream) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+            ggml_sycl_q4_0_reordered_to_fp16(vx, y, k, seg, stream);
+            break;
+        case GGML_TYPE_Q5_1:
+            ggml_sycl_q5_1_reordered_to_fp16(vx, y, k, seg, stream);
+            break;
+        case GGML_TYPE_Q8_0:
+            ggml_sycl_q8_0_reordered_to_fp16(vx, y, k, seg, stream);
+            break;
+        default:
+            GGML_ABORT("reordered_to_fp16: type %d has no row-split reader", (int) type);
+    }
+}
+
+void ggml_sycl_reordered_to_fp16_nc(ggml_type type, const void * vx, sycl::half * y, int64_t ne00, int64_t ne01,
+                                    int64_t ne02, int64_t ne03, size_t nb01, size_t nb02, size_t nb03, int seg,
+                                    dpct::queue_ptr stream) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+            ggml_sycl_q4_0_reordered_to_fp16_nc(vx, y, ne00, ne01, ne02, ne03, nb01, nb02, nb03, seg, stream);
+            break;
+        case GGML_TYPE_Q5_1:
+            ggml_sycl_q5_1_reordered_to_fp16_nc(vx, y, ne00, ne01, ne02, ne03, nb01, nb02, nb03, seg, stream);
+            break;
+        case GGML_TYPE_Q8_0:
+            ggml_sycl_q8_0_reordered_to_fp16_nc(vx, y, ne00, ne01, ne02, ne03, nb01, nb02, nb03, seg, stream);
+            break;
+        default:
+            GGML_ABORT("reordered_to_fp16_nc: type %d has no row-split reader", (int) type);
+    }
+}
 static bool is_reordered_src0(const ggml_tensor * dst) {
     return dst->src[0]->extra &&
            ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder;

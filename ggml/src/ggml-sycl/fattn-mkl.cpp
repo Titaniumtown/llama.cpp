@@ -449,7 +449,7 @@ struct mkl_fa_kv_desc {
     int64_t              ts   = 0;      // type size (mode 3 base offset)
     int64_t              s01  = 0;      // nc row stride in blocks (mode 3)
     int64_t              s02  = 0;      // nc head stride in blocks (mode 3)
-    int                  reorder_seg = 0;  // row-split q8_0 segment elems (0 = AoS)
+    int                  reorder_seg = 0;  // row-split cache segment elems (0 = AoS)
 };
 
 static mkl_fa_kv_desc mkl_fa_make_desc(const ggml_tensor * T, bool interleaved) {
@@ -460,7 +460,8 @@ static mkl_fa_kv_desc mkl_fa_make_desc(const ggml_tensor * T, bool interleaved) 
     d.nb1  = (int64_t)T->nb[1];
     d.nb2  = (int64_t)T->nb[2];
     d.nb3  = (int64_t)T->nb[3];
-    d.reorder_seg = T->type == GGML_TYPE_Q8_0 ? ggml_sycl_kv_reorder_seg(T) : 0;
+    d.reorder_seg = (T->type == GGML_TYPE_Q8_0 || T->type == GGML_TYPE_Q4_0 ||
+                     T->type == GGML_TYPE_Q5_1) ? ggml_sycl_kv_reorder_seg(T) : 0;
     d.ts   = (int64_t)ggml_type_size(T->type);
 
     if (T->type == GGML_TYPE_F16) {
@@ -511,11 +512,11 @@ static void mkl_fa_dequant_chunk(
                 + (int64_t)chunk_start * d.nb1 + (int64_t)ib * d.nb3;
             if (d.reorder_seg > 0) {
                 // contiguous chunk: rows dense at natural stride -> flat walk
-                if ((size_t) d.nb1 == ggml_row_size(GGML_TYPE_Q8_0, D)) {
-                    ggml_sycl_q8_0_reordered_to_fp16(base, out, (int64_t) this_chunk * D, d.reorder_seg, stream);
+                if ((size_t) d.nb1 == ggml_row_size(d.type, D)) {
+                    ggml_sycl_reordered_to_fp16(d.type, base, out, (int64_t) this_chunk * D, d.reorder_seg, stream);
                 } else {
-                    ggml_sycl_q8_0_reordered_to_fp16_nc(base, out, D, this_chunk, 1, 1,
-                                                        (size_t) d.nb1, 0, 0, d.reorder_seg, stream);
+                    ggml_sycl_reordered_to_fp16_nc(d.type, base, out, D, this_chunk, 1, 1,
+                                                   (size_t) d.nb1, 0, 0, d.reorder_seg, stream);
                 }
                 break;
             }
@@ -527,8 +528,8 @@ static void mkl_fa_dequant_chunk(
             if (d.reorder_seg > 0) {
                 const char * base = d.data + (int64_t)ikvh * d.nb2
                     + (int64_t)chunk_start * d.nb1 + (int64_t)ib * d.nb3;
-                ggml_sycl_q8_0_reordered_to_fp16_nc(base, out, D, this_chunk, 1, 1,
-                                                    (size_t) d.nb1, 0, 0, d.reorder_seg, stream);
+                ggml_sycl_reordered_to_fp16_nc(d.type, base, out, D, this_chunk, 1, 1,
+                                               (size_t) d.nb1, 0, 0, d.reorder_seg, stream);
                 break;
             }
             to_fp16_nc_sycl_t to_fp16 = ggml_get_to_fp16_nc_sycl(d.type);

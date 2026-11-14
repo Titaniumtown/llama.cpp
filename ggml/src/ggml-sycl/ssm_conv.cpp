@@ -553,6 +553,20 @@ static bool ggml_sycl_op_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor *
     const int dst_stride_token = d_inner;
     const int dst_stride_seq   = d_inner * n_t;
 
+    // The three strides above are dense arithmetic, not reads of nb[]. The
+    // asserts above pin src0's first two dims but say nothing about dim 2,
+    // nor about src1's row stride, nor about dst at all -- so a tensor
+    // strided in any of those is read as if contiguous. The CPU reference
+    // has no such gap because it reads the real strides instead of deriving
+    // them (ggml-cpu/ops.cpp:9735-9737). The fused SYCL paths in this same
+    // file already read nb[2] from every tensor they touch (lines 425, 427,
+    // 430, 681, 728); this is the one that does not.
+    GGML_ASSERT(src0->nb[2] == src0->ne[0] * src0->ne[1] * sizeof(float));
+    GGML_ASSERT(src1->nb[1] == src1->ne[0] * sizeof(float));
+    GGML_ASSERT(dst->nb[0]  == sizeof(float));
+    GGML_ASSERT(dst->nb[1]  == dst->ne[0]  * sizeof(float));
+    GGML_ASSERT(dst->nb[2]  == dst->ne[0]  * dst->ne[1] * sizeof(float));
+
     try {
         queue *q = ctx.stream();
 

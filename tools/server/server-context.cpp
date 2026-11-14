@@ -2424,6 +2424,15 @@ private:
             }
         }
 
+        // a recurrent half (GDN, Mamba) cannot follow a KV shift: the shift aborts inside
+        // llm_graph_input_k_shift::set_input, called from llama_kv_cache::update under
+        // llama_memory_hybrid_context::apply, so --cache-reuse takes the server down instead
+        // of reusing anything.
+        if ((llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) && params_base.n_cache_reuse) {
+            params_base.n_cache_reuse = 0;
+            SRV_WRN("%s\n", "cache_reuse is not supported by recurrent or hybrid memory, it will be disabled");
+        }
+
         if (llama_model_n_swa(model_tgt) == 0) {
             if (params_base.swa_full) {
                 params_base.swa_full = false;
@@ -5434,6 +5443,8 @@ private:
 
                                 const bool can_cache_reuse =
                                     llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
+                                    !llama_model_is_recurrent(llama_get_model(ctx_tgt)) &&
+                                    !llama_model_is_hybrid(llama_get_model(ctx_tgt)) &&
                                     !slot.prompt.tokens.has_mtmd;
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {

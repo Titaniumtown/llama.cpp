@@ -6706,76 +6706,6 @@ static bool ggml_sycl_mul_mat_glu_fused(ggml_backend_sycl_context & ctx, ggml_cg
                                                /*stride_col_dst=*/(int) glu->ne[0], stream);
 }
 
-// Batch the run of consecutive L2_NORM siblings starting at node_idx into one launch.
-// Returns the number of extra graph nodes consumed, or 0 if the run is shorter than two
-// (the caller then runs the norm through the per-tensor kernel).
-static int ggml_sycl_l2_norm_batch_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx) {
-    const ggml_tensor * node = cgraph->nodes[node_idx];
-    if (ggml_sycl_info().device_count != 1 || node->type != GGML_TYPE_F32 ||
-        node->src[0]->type != GGML_TYPE_F32 || node->src[0]->ne[0] >= 1024) {
-        return 0;
-    }
-
-    ggml_tensor * batch[GGML_SYCL_L2_BATCH_MAX];
-    int           count = 0;
-    int           last  = node_idx;
-    float         eps0;
-    memcpy(&eps0, node->op_params, sizeof(float));
-
-    // Conservative aliasing test: the batched norms run concurrently in one kernel,
-    // so none may read what another writes, and none may write where another writes.
-    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
-        const char * ab = (const char *) a->data;
-        const char * bb = (const char *) b->data;
-        return ab < bb + ggml_nbytes(b) && bb < ab + ggml_nbytes(a);
-    };
-
-    for (int j = node_idx; j < cgraph->n_nodes && count < GGML_SYCL_L2_BATCH_MAX; ++j) {
-        ggml_tensor * nj = cgraph->nodes[j];
-        if (ggml_is_empty(nj) || nj->op == GGML_OP_RESHAPE || nj->op == GGML_OP_TRANSPOSE ||
-            nj->op == GGML_OP_VIEW || nj->op == GGML_OP_PERMUTE || nj->op == GGML_OP_NONE ||
-            (nj->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-            continue;  // not a launch; cannot break a run of adjacent norms
-        }
-        if (nj->op != GGML_OP_L2_NORM || nj->type != GGML_TYPE_F32 ||
-            nj->src[0]->type != GGML_TYPE_F32 || !ggml_are_same_shape(nj, node) ||
-            !ggml_are_same_shape(nj->src[0], node->src[0])) {
-            break;  // any other launch ends the run
-        }
-        bool same_nb = true;
-        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-            if (nj->nb[d] != node->nb[d] || nj->src[0]->nb[d] != node->src[0]->nb[d]) {
-                same_nb = false;
-                break;
-            }
-        }
-        if (!same_nb) {
-            break;  // one nb[] stride set is shared by the whole batch
-        }
-        float epsj;
-        memcpy(&epsj, nj->op_params, sizeof(float));
-        if (epsj != eps0) {
-            break;  // eps mismatch ends the run
-        }
-        bool indep = true;
-        for (int k = 0; k < count; ++k) {
-            if (overlaps(nj->src[0], batch[k]) || overlaps(nj, batch[k])) {
-                indep = false;
-                break;
-            }
-        }
-        if (!indep) {
-            break;  // an overlapping tensor would race inside one launch
-        }
-        batch[count++] = nj;
-        last           = j;
-    }
-    if (count < 2) {
-        return 0;  // a lone norm falls through to the per-tensor kernel
-    }
-    ggml_sycl_l2_norm_batch(ctx, batch, count);
-    return last - node_idx;
-}
 
 
 __dpct_inline__ static void k_copy_src1_to_contiguous(
@@ -9826,8 +9756,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             i++;
             continue;
         }
-        // qwen35 GDN l2 norms are emitted as rms_norm + scalar scale (models.h
-        // build_gdn_l2_norm), which the rms_norm+mul fusion above cannot match
+        // qwen35 GDN q/k norms are emitted as rms_norm + scalar scale (qwen35.cpp
+        // build_gdn_l2_norm), so this -- not an L2_NORM batching hook -- is what serves
+        // them.
         if (node->op == GGML_OP_RMS_NORM &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
             ggml_sycl_op_rms_norm_scale_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
@@ -9844,17 +9775,6 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
 
 
-        // Batch consecutive independent same-shape F32 L2_NORM siblings (the GDN q/k
-        // norms) into one launch; sources are strided views of the fused qkv buffer, so
-        // the scan skips the interleaved view nodes instead of breaking on them.
-        if (node->op == GGML_OP_L2_NORM) {
-            const int l2_batch_skip = ggml_sycl_l2_norm_batch_fused(*sycl_ctx, cgraph, i);
-            if (l2_batch_skip > 0) {
-                prof.mark(node, cgraph, i, l2_batch_skip);
-                i += l2_batch_skip;
-                continue;
-            }
-        }
 
         if (node->op == GGML_OP_CPY && g_ggml_sycl_enable_fusion && ssm_wb_conv == nullptr) {
             if (ggml_tensor * conv = find_ssm_conv_for_writeback(cgraph, i)) {

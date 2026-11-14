@@ -14,6 +14,8 @@
 #include "server-step-sched-budget.h"
 #include "server-step-sched-inject.h"
 #include "server-stream.h"
+#include "server-agent-cache-plan.h"
+
 
 #include "build-info.h"
 #include "common.h"
@@ -326,6 +328,12 @@ struct server_slot {
     std::unique_ptr<const server_task> task;
     std::unique_ptr<const server_task> task_prev; // used for debugging
 
+    // the agent that owns the KV in this slot. set when a task is launched and when a
+    // cache state is restored. reset() does not clear them: prompt_save runs on an idle
+    // slot, after release has moved task to task_prev
+    std::string agent;
+    std::string session;
+
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
 
@@ -386,6 +394,15 @@ struct server_slot {
         if (cur == nullptr) {
             return false;
         }
+        // idle: task is null. the slot fields are the launch/restore stamp. task_prev
+        // is only the fallback when those fields were never set
+        if (!agent.empty() || !session.empty()) {
+            cur->agent = agent;
+            cur->session = session;
+        } else if (task_prev) {
+            cur->agent = task_prev->params.agent;
+            cur->session = task_prev->params.session;
+        }
 
         const size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t n_dft = ctx_dft ? llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
@@ -400,8 +417,15 @@ struct server_slot {
         return true;
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::vector<common_adapter_lora_info> & lora_new, int task_id = -1) {
-        bool res = prompt_cache.load(prompt, tokens, lora_new, ctx_tgt, ctx_dft, id, &cache_decision, task_id);
+    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::vector<common_adapter_lora_info> & lora_new, int task_id = -1,
+                     const std::string & task_agent = "", const std::string & task_session = "") {
+        cache_decision = server_prompt_cache_decision();
+        bool res = prompt_cache.load(prompt, tokens, lora_new, ctx_tgt, ctx_dft, id, &cache_decision, task_id, task_agent, task_session);
+        if (res && cache_decision.restored_id) {
+            // before the restored entry is gone: load() copied the stamp out, then erased it
+            agent = std::move(cache_decision.restored_agent);
+            session = std::move(cache_decision.restored_session);
+        }
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -482,6 +506,8 @@ struct server_slot {
 
         task_prev = std::move(task);
         task.reset();
+        // agent and session stay. the KV still in the slot belongs to the task that
+        // just released it, and prompt_save reads those fields, not task
 
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
@@ -2042,6 +2068,10 @@ public:
 
     server_state_callback_t callback_state = [](server_state, json) -> void {};
 
+    int agent_plan_set(const std::string & session, std::vector<agent_plan_item> items, int pin_count);
+    bool agent_plan_is_protected(const std::string & agent, const std::string & session);
+    std::vector<agent_plan_item> agent_plan_copy();
+
     server_context_impl() {
         mtmd_helper_log_set(common_log_default_callback, nullptr);
     }
@@ -2110,6 +2140,8 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+    std::mutex agent_plan_mu;
+    std::vector<agent_plan_item> agent_plan;
     std::mutex disk_hold_mu;
     std::map<int, server_task> disk_held;
     std::unordered_set<int> disk_cancelled;
@@ -2621,6 +2653,11 @@ private:
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, params_base.cache_entry_checkpoints,
                     params_base.checkpoint_min_step);
+            // pin_count reads params_base.cache_ram_slots inside the callback. the
+            // constructor stays on the byte cap; wiring the slot count in would resize it
+            prompt_cache->protect = [this](const std::string & agent, const std::string & session) {
+                return agent_plan_is_protected(agent, session);
+            };
             prompt_cache->on_read_ready = [this](int id) {
                 server_task held;
                 {
@@ -2854,7 +2891,7 @@ private:
     std::vector<server_slot_info> get_slot_infos() const {
         std::vector<server_slot_info> res;
         for (const server_slot & slot : slots) {
-            res.push_back({ slot.id, slot.task.get(), slot.is_processing(), slot.t_last_used, &slot.prompt });
+            res.push_back({ slot.id, slot.task.get(), slot.is_processing(), slot.t_last_used, &slot.prompt, &slot.agent, &slot.session });
         }
         return res;
     }
@@ -2949,7 +2986,7 @@ private:
 
         const auto lora = get_task_lora(task);
 
-        if (!slot.prompt_load(*prompt_cache, task.tokens, lora, task.id)) {
+        if (!slot.prompt_load(*prompt_cache, task.tokens, lora, task.id, task.params.agent, task.params.session)) {
             slot.prompt_clear();
 
             // with a unified KV cache, the restore can fail because idle slots still hold the cells it needs
@@ -2959,7 +2996,7 @@ private:
 
                 SLT_INF(slot, "%s", "retrying prompt restore after clearing idle slots\n");
 
-                if (!slot.prompt_load(*prompt_cache, task.tokens, lora, task.id)) {
+                if (!slot.prompt_load(*prompt_cache, task.tokens, lora, task.id, task.params.agent, task.params.session)) {
                     slot.prompt_clear();
                 }
             }
@@ -3208,6 +3245,8 @@ private:
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+        slot.agent = slot.task->params.agent;
+        slot.session = slot.task->params.session;
 
         if (slot.task->type == SERVER_TASK_TYPE_TTS) {
             slot.state = SLOT_STATE_PROCESSING_PROMPT;
@@ -4114,7 +4153,7 @@ private:
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
-        if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
+        if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET && task.type != SERVER_TASK_TYPE_AGENT_CACHE) {
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
             return false;
         }
@@ -4149,6 +4188,7 @@ private:
                         break;
                     }
 
+                    bool read_ready = false;
                     // the disk tier holds only states made without a lora config
                     if (prompt_cache && prompt_cache->disk_enabled() && !task.is_stateless() && task.tokens.size() > 0 && get_task_lora(task).empty()) {
                         server_tokens tokens = task.tokens.clone();
@@ -4159,6 +4199,7 @@ private:
                         }
 
                         const auto wait = prompt_cache->disk_prepare(id_task, tokens, prompt_slot);
+                        read_ready = wait == server_prompt_cache::disk_wait::ready;
                         if (wait == server_prompt_cache::disk_wait::pending) {
                             SRV_INF("prompt cache: disk read in flight for task %d, slot loop continues\n", id_task);
                             break;
@@ -4176,9 +4217,14 @@ private:
                         }
                     }
 
-                    const auto plan = fits_unified_kv(task) ? slot_sched.select(get_slot_infos(), task, get_task_lora(task), prompt_cache.get()) : server_slot_plan {};
+                    auto plan = fits_unified_kv(task) ? slot_sched.select(get_slot_infos(), task, get_task_lora(task), prompt_cache.get()) : server_slot_plan {};
 
                     server_slot * slot = plan.id_slot == -1 ? nullptr : get_slot_by_id(plan.id_slot);
+
+                    // a read this task waited for is taken whatever the pick keeps of the slot
+                    if (slot && read_ready && !task.is_stateless()) {
+                        plan.update_cache = true;
+                    }
 
                     //
                     // slot scheduling logic
@@ -4335,6 +4381,11 @@ private:
                     res->id                  = task.id;
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
+                    {
+                        // a task waiting on its disk read is deferred as well
+                        std::lock_guard<std::mutex> lock(disk_hold_mu);
+                        res->n_tasks_deferred += disk_held.size();
+                    }
                     res->metrics             = metrics;
 
                     if (task.metrics_reset_bucket) {
@@ -4362,6 +4413,87 @@ private:
                     res->slots_data   = std::move(slots_data);
                     res->n_idle_slots = n_idle_slots;
 
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_AGENT_CACHE:
+                {
+                    struct row {
+                        std::string agent;
+                        std::string session;
+                        agent_plan_tier tier = agent_plan_tier::cold;
+                        int64_t tokens = 0;
+                        int slot = -1;
+                    };
+                    std::map<std::pair<std::string, std::string>, row> rows;
+                    auto consider = [&](row in) {
+                        if (in.agent.empty()) {
+                            return;
+                        }
+                        const auto key = std::make_pair(in.agent, in.session);
+                        auto it = rows.find(key);
+                        if (it == rows.end()) {
+                            rows.emplace(key, std::move(in));
+                            return;
+                        }
+                        row & cur = it->second;
+                        if ((int) in.tier < (int) cur.tier
+                                || (in.tier == cur.tier && in.tokens > cur.tokens)
+                                || (in.tier == cur.tier && in.tokens == cur.tokens && in.slot >= 0
+                                        && (cur.slot < 0 || in.slot < cur.slot))) {
+                            cur = std::move(in);
+                        }
+                    };
+
+                    for (const server_slot & slot : slots) {
+                        if (slot.prompt.n_tokens() <= 0) {
+                            continue;
+                        }
+                        std::string agent_id = slot.agent;
+                        std::string session_id = slot.session;
+                        if (agent_id.empty() && session_id.empty()) {
+                            const server_task * src = slot.is_processing() ? slot.task.get() : slot.task_prev.get();
+                            if (src != nullptr) {
+                                agent_id = src->params.agent;
+                                session_id = src->params.session;
+                            }
+                        }
+                        consider({ agent_id, session_id, agent_plan_tier::vram, (int64_t) slot.prompt.n_tokens(), slot.id });
+                    }
+
+                    if (prompt_cache) {
+                        for (const auto & state : prompt_cache->states) {
+                            consider({ state.agent, state.session, agent_plan_tier::ram,
+                                    (int64_t) state.prompt.n_tokens(), -1 });
+                        }
+                        // disk mutex inside, released before the plan mutex below
+                        for (const auto & e : prompt_cache->disk_agent_rows()) {
+                            consider({ e.agent, e.session, agent_plan_tier::disk, (int64_t) e.tokens, -1 });
+                        }
+                    }
+
+                    for (const auto & item : agent_plan_copy()) {
+                        consider({ item.agent, item.session, agent_plan_tier::cold, 0, -1 });
+                    }
+
+                    json agents = json::array();
+                    for (const auto & kv : rows) {
+                        const row & r = kv.second;
+                        json item = {
+                            {"agent", r.agent},
+                            {"session", r.session},
+                            {"tier", agent_plan_tier_name(r.tier)},
+                            {"tokens", r.tokens},
+                        };
+                        if (r.tier == agent_plan_tier::vram) {
+                            item["slot"] = r.slot;
+                        }
+                        agents.push_back(std::move(item));
+                    }
+
+                    auto res = std::make_unique<server_task_result_agent_cache>();
+                    res->id = task.id;
+                    res->data = json::object();
+                    res->data["agents"] = std::move(agents);
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
@@ -6658,6 +6790,34 @@ private:
     }
 };
 
+int server_context_impl::agent_plan_set(const std::string & session, std::vector<agent_plan_item> items, int pin_count) {
+    std::lock_guard<std::mutex> lock(agent_plan_mu);
+    agent_plan.erase(std::remove_if(agent_plan.begin(), agent_plan.end(),
+            [&](const agent_plan_item & it) { return it.session == session; }), agent_plan.end());
+    agent_plan.insert(agent_plan.end(), items.begin(), items.end());
+    const int64_t now = ggml_time_us();
+    int pinned = 0;
+    for (const auto & row : items) {
+        if (agent_plan_protected(agent_plan, row.agent, row.session, pin_count, now)) {
+            pinned++;
+        }
+    }
+    return pinned;
+}
+
+bool server_context_impl::agent_plan_is_protected(const std::string & agent, const std::string & session) {
+    std::lock_guard<std::mutex> lock(agent_plan_mu);
+    return agent_plan_protected(agent_plan, agent, session, params_base.cache_ram_slots, ggml_time_us());
+}
+
+std::vector<agent_plan_item> server_context_impl::agent_plan_copy() {
+    std::lock_guard<std::mutex> lock(agent_plan_mu);
+    // empty agent drops expired and protects nothing
+    agent_plan_protected(agent_plan, "", "", 0, ggml_time_us());
+    return agent_plan;
+}
+
+
 //
 // server_context (public API)
 //
@@ -7404,6 +7564,78 @@ void server_routes::init_routes() {
         }
 
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    };
+
+    this->post_agent_plan = [this](const server_http_req & req) {
+        auto res = create_response();
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const std::exception &) {
+            res->error(format_error_response("invalid JSON", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!body.is_object()) {
+            res->error(format_error_response("request body must be an object", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const std::string session = agent_plan_sanitize(json_value(body, "session", std::string()));
+        if (session.empty()) {
+            res->error(format_error_response("session is required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (body.contains("agents") && !body.at("agents").is_array()) {
+            res->error(format_error_response("agents must be an array", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        std::vector<agent_plan_item> incoming;
+        const int64_t expires = ggml_time_us() + AGENT_PLAN_TTL_US;
+        if (body.contains("agents")) {
+            for (const auto & item : body.at("agents")) {
+                if (!item.is_object()) {
+                    res->error(format_error_response("agent plan item must be an object", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                if (item.contains("rank") && !item.at("rank").is_number()) {
+                    res->error(format_error_response("rank must be a number", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                agent_plan_item row;
+                row.agent = agent_plan_sanitize(json_value(item, "agent", std::string()));
+                row.session = session;
+                row.rank = json_value(item, "rank", 0);
+                row.expires_us = expires;
+                if (row.agent.empty()) {
+                    continue;
+                }
+                incoming.push_back(std::move(row));
+            }
+        }
+        const int pinned = ctx_server.agent_plan_set(session, std::move(incoming), params.cache_ram_slots);
+        res->ok({{"ok", true}, {"pinned", pinned}});
+        return res;
+    };
+
+    this->get_agent_cache = [this](const server_http_req & req) {
+        auto res = create_response();
+        {
+            server_task task(SERVER_TASK_TYPE_AGENT_CACHE);
+            task.id = res->rd.get_new_id();
+            res->rd.post_task(std::move(task), true);
+        }
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        auto * res_task = dynamic_cast<server_task_result_agent_cache *>(result.get());
+        GGML_ASSERT(res_task != nullptr);
+        res->ok(res_task->to_json());
         return res;
     };
 

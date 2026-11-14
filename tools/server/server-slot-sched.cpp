@@ -5,6 +5,7 @@
 #include "log.h"
 
 #include "server-prompt-cache-entry.h"
+#include "server-agent-cache-plan.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -209,14 +210,55 @@ float server_prompt_cache::value(const server_prompt_cache_state & state) const 
 
 std::list<server_prompt_cache_state>::iterator server_prompt_cache::victim() {
     auto worst = states.begin();
+    if (states.empty()) {
+        return worst;
+    }
 
     for (auto it = states.begin(); it != states.end(); ++it) {
         if (value(*it) < value(*worst)) {
             worst = it;
         }
     }
+    // absent a plan, this is the same scan as before: the first strict minimum
+    if (!protect) {
+        return worst;
+    }
 
-    return worst;
+    std::vector<float> values;
+    std::vector<char> prot;
+    values.reserve(states.size());
+    bool any = false;
+    size_t i = 0;
+    size_t min_i = 0;
+    for (auto it = states.begin(); it != states.end(); ++it, ++i) {
+        values.push_back(value(*it));
+        if (i > 0 && values[i] < values[min_i]) {
+            min_i = i;
+        }
+        const bool p = protect(it->agent, it->session);
+        prot.push_back(p ? 1 : 0);
+        any = any || p;
+    }
+    if (!any) {
+        return worst;
+    }
+
+    const size_t vi = agent_plan_victim(values.size(),
+            [&](size_t j) { return values[j]; },
+            [&](size_t j) { return prot[j] != 0; });
+    auto at = [&](size_t index) {
+        auto it = states.begin();
+        for (size_t j = 0; j < index && it != states.end(); j++) {
+            ++it;
+        }
+        return it;
+    };
+    auto chosen = at(vi);
+    if (vi != min_i) {
+        SRV_INF("prompt cache: keeping agent '%s', spilling '%s' instead\n",
+                at(min_i)->agent.c_str(), chosen->agent.c_str());
+    }
+    return chosen;
 }
 
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
@@ -383,15 +425,13 @@ static bool pcache_restore_state(const server_prompt_data & data, llama_context 
         }
     }
 
-    if (!data.drft.empty()) {
-        GGML_ASSERT(ctx_dft);
-
+    // the draft only speeds decoding up: a state saved beside a draft this server does not run,
+    // or under another draft cache type, still restores the target, and the draft starts cold
+    if (!data.drft.empty() && ctx_dft != nullptr) {
         const size_t size = data.drft.size();
         const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.drft.data(), size, id_slot, 0);
         if (n != size) {
-            SRV_WRN("failed to restore state with size %zu\n", size);
-
-            return false;
+            SRV_WRN("failed to restore draft state with size %zu, the draft starts cold\n", size);
         }
     }
 
@@ -453,10 +493,12 @@ bool server_prompt_cache::has_better(const server_prompt & prompt, const server_
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
-        server_prompt_cache_decision * decision, int task_id) {
+        server_prompt_cache_decision * decision, int task_id, const std::string & agent, const std::string & session) {
     // a prompt made with another lora config is cleared before the new one starts, so it counts as empty
     const bool is_empty = prompt.tokens.empty() || lora_should_clear_cache(prompt.lora, lora_new);
 
+    // an entry another (agent, session) saved is lent, whatever share of it the head keeps
+    const auto owns = [&](const std::string & a, const std::string & s) { return a == agent && s == session; };
     if (task_id >= 0) {
         disk_taken taken = disk_take(task_id);
 
@@ -478,13 +520,17 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                     taken.state->data.main.size() / (1024 * 1024), (ggml_time_us() - t_restore) / 1000.0);
 
             prompt = taken.state->prompt.clone();
-            disk_commit(taken.hit, taken.unlink);
+            const bool lend = taken.hit.partial || !owns(taken.state->agent, taken.state->session);
+            disk_commit(taken.hit, taken.unlink && !lend);
 
             if (decision != nullptr) {
                 server_prompt_cache_decision dec;
-                dec.chosen_lcp     = taken.hit.lcp;
-                dec.chosen_disk    = true;
-                dec.chosen_partial = taken.hit.partial;
+                dec.chosen_lcp       = taken.hit.lcp;
+                dec.chosen_disk      = true;
+                dec.chosen_partial   = lend;
+                dec.restored_agent   = taken.state->agent;
+                dec.restored_session = taken.state->session;
+                dec.restored_id      = true;
                 *decision = dec;
             }
 
@@ -542,7 +588,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         // fractions skipped a longer head inside a larger entry
         if (lcp_cur > lcp_ram && lcp_cur > lcp_best) {
             lcp_ram     = lcp_cur;
-            ram_partial = !keeps;
+            ram_partial = !keeps || !owns(it->agent, it->session);
             it_best     = it;
         }
     }
@@ -573,16 +619,19 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 return false;
             }
 
-            disk_commit(hit, !hit.partial);
+            const bool lend = hit.partial || !owns(fetched.agent, fetched.session);
+            disk_commit(hit, !lend);
 
             SRV_INF("prompt cache: restored %zu MB from disk in %.2f ms\n",
                     fetched.data.main.size() / (1024 * 1024), (ggml_time_us() - t_restore) / 1000.0);
-
+            dec.restored_agent   = fetched.agent;
+            dec.restored_session = fetched.session;
+            dec.restored_id      = true;
             prompt = std::move(fetched.prompt);
 
             dec.chosen_lcp     = hit.lcp;
             dec.chosen_disk    = true;
-            dec.chosen_partial = hit.partial;
+            dec.chosen_partial = lend;
         }
         // a refused fetch (memory, I/O) falls through to the RAM entry
     }
@@ -599,6 +648,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_RESTORE__\n");
         SRV_INF("prompt cache: restored %zu MB from RAM in %.2f ms\n",
                 it_best->data.main.size() / (1024 * 1024), (ggml_time_us() - t_restore) / 1000.0);
+        // the slot takes the identity before the entry is erased below
+        dec.restored_agent   = it_best->agent;
+        dec.restored_session = it_best->session;
+        dec.restored_id      = true;
+
 
         if (ram_partial) {
             // a borrowed head: the entry is another conversation's state and its owner's next
@@ -809,7 +863,12 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
             }
 
             // if we are about to lose a large portion of the existing context - save it in the prompt cache
-            if (f_keep < 0.5f) {
+            // another agent's pick drops the rest of this one's state: save it as well
+            const auto differs = [](const std::string * held, const std::string & wanted) {
+                return held ? *held != wanted : !wanted.empty();
+            };
+            if (f_keep < 0.5f || (f_keep < 1.0f && (differs(ret->agent, task.params.agent) ||
+                                                    differs(ret->session, task.params.session)))) {
                 update_cache = true;
             }
         }
@@ -938,6 +997,82 @@ server_prompt_cache::~server_prompt_cache() {
     }
 }
 
+// a ".bin.agent" sidecar names the entry. the sweep must not delete it: the matching
+// .bin reads it. a missing or malformed sidecar leaves the stamp empty and keeps the entry
+static bool pcache_is_agent_sidecar(const std::string & path) {
+    static const char k_suffix[] = ".agent";
+    const size_t n = sizeof(k_suffix) - 1;
+    return path.size() > n && path[path.size() - n - 1] != '/' &&
+            path.compare(path.size() - n, n, k_suffix) == 0;
+}
+
+static void pcache_remove_agent_sidecar(const std::string & path) {
+    std::error_code ec;
+    std::filesystem::remove(path + ".agent", ec);
+}
+
+static void pcache_write_agent_sidecar(const std::string & path, const std::string & agent, const std::string & session) {
+    const std::string side = path + ".agent";
+    const std::string tmp  = side + ".tmp";
+    FILE * file = fopen(tmp.c_str(), "wb");
+    if (file == nullptr) {
+        SRV_WRN("prompt cache: cannot write agent sidecar '%s': %s\n", side.c_str(), strerror(errno));
+        return;
+    }
+    const std::string body = agent + "\t" + session + "\n";
+    const bool ok = fwrite(body.data(), 1, body.size(), file) == body.size() && fflush(file) == 0;
+    fclose(file);
+    std::error_code ec;
+    if (!ok) {
+        std::filesystem::remove(tmp, ec);
+        SRV_WRN("prompt cache: failed to write agent sidecar '%s'\n", side.c_str());
+        return;
+    }
+    std::filesystem::rename(tmp, side, ec);
+    if (ec) {
+        std::filesystem::remove(tmp, ec);
+        SRV_WRN("prompt cache: cannot rename agent sidecar '%s': %s\n", side.c_str(), ec.message().c_str());
+    }
+}
+
+static void pcache_read_agent_sidecar(const std::string & path, std::string & agent, std::string & session) {
+    agent.clear();
+    session.clear();
+    FILE * file = fopen((path + ".agent").c_str(), "rb");
+    if (file == nullptr) {
+        return;
+    }
+    char buf[80];
+    const size_t n = fread(buf, 1, sizeof(buf), file);
+    const int extra = fgetc(file);
+    fclose(file);
+    // 32 + tab + 32 + newline is 66. a full buffer, or another byte, is not that line
+    if (n == 0 || n == sizeof(buf) || extra != EOF) {
+        return;
+    }
+    std::string line(buf, n);
+    if (!line.empty() && line.back() == '\n') {
+        line.pop_back();
+    }
+    if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+    }
+    if (line.find('\n') != std::string::npos) {
+        return;
+    }
+    const auto tab = line.find('\t');
+    if (tab == std::string::npos || line.find('\t', tab + 1) != std::string::npos) {
+        return;
+    }
+    const std::string a = line.substr(0, tab);
+    const std::string s = line.substr(tab + 1);
+    if (agent_plan_sanitize(a) != a || agent_plan_sanitize(s) != s) {
+        return;
+    }
+    agent = a;
+    session = s;
+}
+
 bool server_prompt_cache::disk_init(const std::string & dir, size_t limit, const std::string & model_path,
         const llama_model * model, const llama_context * ctx, ggml_type type_k, ggml_type type_v, bool fsync) {
     disk_dir   = dir;
@@ -966,8 +1101,11 @@ bool server_prompt_cache::disk_init(const std::string & dir, size_t limit, const
 
         const auto & path = de.path();
         if (!server_prompt_cache_is_entry_path(path.string())) {
-            // an orphan .bin.tmp: the writer died between the write and the rename; it is
-            // never loaded, never counted, never evicted
+            // a sidecar stays: the matching .bin reads it. anything else, including a
+            // .bin.tmp the writer died on, is swept
+            if (pcache_is_agent_sidecar(path.string())) {
+                continue;
+            }
             std::filesystem::remove(path, ec);
             n_swept++;
             continue;
@@ -987,6 +1125,7 @@ bool server_prompt_cache::disk_init(const std::string & dir, size_t limit, const
 
         if (!ok) {
             std::filesystem::remove(path, ec);
+            pcache_remove_agent_sidecar(path.string());
             n_stale++;
             continue;
         }
@@ -1002,6 +1141,7 @@ bool server_prompt_cache::disk_init(const std::string & dir, size_t limit, const
         const int64_t use = ec ? 0 : server_prompt_cache_use_from_write_time(mt, ggml_time_us());
 
         disk_states.push_back({ std::move(tokens), path.string(), (size_t) sz, use });
+        pcache_read_agent_sidecar(disk_states.back().path, disk_states.back().agent, disk_states.back().session);
         disk_used += (size_t) sz;
     }
 
@@ -1054,6 +1194,7 @@ void server_prompt_cache::disk_drop_path(const std::string & path) {
 
     std::error_code ec;
     std::filesystem::remove(path, ec);
+    pcache_remove_agent_sidecar(path);
 }
 
 void server_prompt_cache::disk_commit(const disk_hit & hit, bool unlink_file) {
@@ -1080,6 +1221,7 @@ void server_prompt_cache::disk_commit(const disk_hit & hit, bool unlink_file) {
     if (unlink_file && !hit.partial) {
         std::error_code ec;
         std::filesystem::remove(hit.path, ec);
+        pcache_remove_agent_sidecar(hit.path);
     }
 }
 
@@ -1121,6 +1263,7 @@ bool server_prompt_cache::disk_read_file(const disk_hit & hit, server_prompt_cac
         const double mb_s = t_read_us > 0 ? 1e6 * (double) hit.size / (double) t_read_us / (1024.0 * 1024.0) : 0.0;
         SRV_INF("prompt cache: read %s in %.2f ms (%.0f MB/s)\n", hit.path.c_str(), t_read_us / 1000.0, mb_s);
         note_read_rate(mb_s);
+        disk_copy_identity(hit.path, out);
 
         return true;
     }
@@ -1416,19 +1559,27 @@ void server_prompt_cache::disk_write(server_prompt_cache_state & state) {
     // the tier already holds this entry: its name is the hash of the tokens and its size
     // is the size of the state those tokens produce, so writing it again would put the
     // same bytes on the device a second time
+    bool already = false;
     {
         std::lock_guard<std::mutex> lock(disk_mutex);
 
         for (auto & e : disk_states) {
             if (e.path == path && e.size == size_expected) {
                 e.last_use_us = ggml_time_us();
-
-                SRV_TRC("prompt cache: entry '%s' is already on disk with the same size, not writing it again\n",
-                        name.c_str());
-
-                return;
+                e.agent = state.agent;
+                e.session = state.session;
+                already = true;
+                break;
             }
         }
+    }
+    if (already) {
+        // the bin is unchanged, but the owner may not be. the sidecar is the stamp a
+        // restart reads, and this write is outside the lock
+        pcache_write_agent_sidecar(path, state.agent, state.session);
+        SRV_TRC("prompt cache: entry '%s' is already on disk with the same size, not writing it again\n",
+                name.c_str());
+        return;
     }
 
     FILE * file = fopen(tmp.c_str(), "wb");
@@ -1506,6 +1657,12 @@ void server_prompt_cache::disk_write(server_prompt_cache_state & state) {
         std::filesystem::remove(tmp, ec);
         return;
     }
+    // before the tokens are moved into the index. a failed sidecar leaves the bin, and
+    // the next load treats a missing sidecar as an unstamped entry
+    const std::string agent = state.agent;
+    const std::string session = state.session;
+    pcache_write_agent_sidecar(path, agent, session);
+
 
     const auto sz = std::filesystem::file_size(path, ec);
     if (ec) {
@@ -1530,11 +1687,13 @@ void server_prompt_cache::disk_write(server_prompt_cache_state & state) {
             disk_used    += (size_t) sz - e.size;
             e.size        = (size_t) sz;
             e.last_use_us = now;
+            e.agent       = agent;
+            e.session     = session;
             return;
         }
     }
 
-    disk_states.push_back({ std::move(state.prompt.tokens), path, (size_t) sz, now });
+    disk_states.push_back({ std::move(state.prompt.tokens), path, (size_t) sz, now, agent, session });
     disk_used += (size_t) sz;
 
     disk_prune();
@@ -1546,8 +1705,29 @@ void server_prompt_cache::disk_prune() {
         // first-in-first-out deleted a hot conversation's state on every write while small stale
         // prefixes survived; the victim is the least valuable entry, priced like the RAM tier's
         const int64_t now = ggml_time_us();
-        const std::size_t vi = server_prompt_cache_disk_victim(disk_states, [](const auto & s) { return s.tokens.size(); },
+        const std::size_t vi_value = server_prompt_cache_disk_victim(disk_states, [](const auto & s) { return s.tokens.size(); },
                 slot_tokens, now);
+        std::size_t vi = vi_value;
+        if (protect) {
+            std::vector<char> prot(disk_states.size());
+            bool any = false;
+            for (std::size_t i = 0; i < disk_states.size(); i++) {
+                prot[i] = protect(disk_states[i].agent, disk_states[i].session) ? 1 : 0;
+                any = any || prot[i];
+            }
+            if (any) {
+                vi = agent_plan_victim(disk_states.size(),
+                        [&](std::size_t i) {
+                            return server_prompt_cache_value((int64_t) disk_states[i].tokens.size(),
+                                    disk_states[i].size, disk_states[i].last_use_us, slot_tokens, now);
+                        },
+                        [&](std::size_t i) { return prot[i] != 0; });
+                if (vi != vi_value) {
+                    SRV_INF("prompt cache: keeping agent '%s', spilling '%s' instead\n",
+                            disk_states[vi_value].agent.c_str(), disk_states[vi].agent.c_str());
+                }
+            }
+        }
         auto & victim = disk_states[vi];
 
         SRV_INF("prompt cache: disk tier limit reached, removing '%s' (%zu tokens, %.2f MiB)\n",
@@ -1555,11 +1735,37 @@ void server_prompt_cache::disk_prune() {
 
         std::error_code ec;
         std::filesystem::remove(victim.path, ec);
+        pcache_remove_agent_sidecar(victim.path);
 
         disk_used -= victim.size;
         disk_states.erase(disk_states.begin() + vi);
     }
 }
+
+std::vector<server_prompt_cache::disk_agent_row> server_prompt_cache::disk_agent_rows() {
+    std::lock_guard<std::mutex> lock(disk_mutex);
+    std::vector<disk_agent_row> out;
+    out.reserve(disk_states.size());
+    for (const auto & e : disk_states) {
+        if (e.agent.empty()) {
+            continue;
+        }
+        out.push_back({ e.agent, e.session, e.tokens.size() });
+    }
+    return out;
+}
+
+void server_prompt_cache::disk_copy_identity(const std::string & path, server_prompt_cache_state & out) {
+    std::lock_guard<std::mutex> lock(disk_mutex);
+    for (const auto & e : disk_states) {
+        if (e.path == path) {
+            out.agent = e.agent;
+            out.session = e.session;
+            return;
+        }
+    }
+}
+
 
 server_prompt_cache::disk_hit server_prompt_cache::disk_find(const server_prompt & prompt_slot, const server_tokens & tokens_new, server_prompt_cache_decision & dec) {
     disk_hit hit;
@@ -1675,6 +1881,7 @@ bool server_prompt_cache::disk_fetch(const disk_hit & hit, server_prompt_cache_s
         SRV_INF("prompt cache: read %s in %.2f ms (%.0f MB/s)\n",
                 hit.path.c_str(), t_read_us / 1000.0, mb_s);
         note_read_rate(mb_s);
+        disk_copy_identity(hit.path, out);
     }
 
     if (server_prompt_cache_disk_failed_read_unlinks(ok, corrupt)) {

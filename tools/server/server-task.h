@@ -32,6 +32,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_TTS,
+    SERVER_TASK_TYPE_AGENT_CACHE,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -111,9 +112,9 @@ struct task_params {
     std::string        oaicompat_model;
     std::string        oaicompat_cmpl_id;
 
-    // client-supplied attribution (x-omp-*): the feature behind the request, the root
-    // session with its title, the agent and the model role that issued it. the server
-    // never interprets any of it, it only names the request in the log and on /slots
+    // client-supplied attribution (x-omp-*). kind, session_name and role only name the
+    // request in the log and on /slots. agent and session also name the prompt state the
+    // cache keeps, so a plan can pin that state and /agent-cache can report its tier
     std::string        kind;
     std::string        session;
     std::string        session_name;
@@ -651,6 +652,13 @@ struct server_task_result_slots : server_task_result {
     json slots_data = json::array();
 
     virtual json to_json() override;
+};
+
+// used by /agent-cache
+struct server_task_result_agent_cache : server_task_result {
+    json data = json::object();
+
+    virtual json to_json() override { return data; }
 };
 
 struct server_task_result_slot_save_load : server_task_result {

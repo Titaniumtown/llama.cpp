@@ -124,6 +124,10 @@ struct server_prompt_cache_state {
     // nothing continues decays out of the tier and one asked for a minute ago keeps its place
     int64_t last_use_us = 0;
 
+    // who owned the slot this state was saved from. empty if the client sent no header
+    std::string agent;
+    std::string session;
+
     size_t size() const {
         size_t res = data.size();
 
@@ -149,6 +153,10 @@ struct server_prompt_cache_decision {
     int  chosen_lcp  = -1;    // lcp of the entry that was restored
     bool chosen_disk = false; // the restored entry came off the disk
     bool chosen_partial = false; // ... and reused under a quarter of it, so it was kept
+    // set when load() restored a state, so the slot can take its identity before the erase
+    std::string restored_agent;
+    std::string restored_session;
+    bool restored_id = false;
 };
 
 struct server_prompt_cache {
@@ -209,11 +217,16 @@ struct server_prompt_cache {
 
     // restore the entry with the longest usable head, from either tier, into the slot `id_slot`
     bool load(server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
-            server_prompt_cache_decision * decision = nullptr, int task_id = -1);
+            server_prompt_cache_decision * decision = nullptr, int task_id = -1,
+            const std::string & agent = "", const std::string & session = "");
 
     // what a state is worth keeping: the tokens a future request takes from it per byte it
     // holds, decayed by the time since it was last used
     float value(const server_prompt_cache_state & state) const;
+
+    // set by the server. true when this (agent, session) is inside the live plan's pin
+    // cap. empty: no plan, and victim() is the value minimum. must not do disk IO
+    std::function<bool(const std::string &, const std::string &)> protect;
 
     // the state to make room with: the least valuable one, not the oldest
     std::list<server_prompt_cache_state>::iterator victim();
@@ -230,6 +243,8 @@ struct server_prompt_cache {
         std::string   path;
         size_t        size        = 0; // bytes on disk
         int64_t       last_use_us = 0;
+        std::string   agent;
+        std::string   session;
     };
 
     bool disk_init(const std::string & dir, size_t limit, const std::string & model_path,
@@ -293,12 +308,20 @@ struct server_prompt_cache {
 
     std::vector<disk_state> disk_states;
 
+    struct disk_agent_row {
+        std::string agent;
+        std::string session;
+        size_t tokens = 0;
+    };
+    std::vector<disk_agent_row> disk_agent_rows();
+
 private:
     void disk_writer();
     void disk_reader();
     void disk_write(server_prompt_cache_state & state);
     void disk_prune();
     bool disk_read_file(const disk_hit & hit, server_prompt_cache_state & out);
+    void disk_copy_identity(const std::string & path, server_prompt_cache_state & out);
     void disk_drop_path(const std::string & path);
     void disk_commit(const disk_hit & hit, bool unlink_file);
     void note_read_rate(double mb_s);
@@ -331,6 +354,10 @@ struct server_slot_info {
     int64_t t_last_used = -1;
 
     const server_prompt * prompt = nullptr;
+
+    // the agent and session whose prompt state the slot holds, nullptr when unknown
+    const std::string * agent   = nullptr;
+    const std::string * session = nullptr;
 };
 
 struct server_slot_plan {

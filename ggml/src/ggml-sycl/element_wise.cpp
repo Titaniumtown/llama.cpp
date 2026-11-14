@@ -435,6 +435,80 @@ static void unary_gated_op_flat_kernel(const T * x, const T * g, T * dst, sycl::
     }
 }
 
+// W elements per work-item, one vector load/store per stream instead of W of them.
+//
+// This kernel is pure streaming and it is bound by request count, not by anything it
+// computes. A standalone bench at the production shape (17408 x 2048, 2 f32 reads + an
+// f32 store + the f16 mirror = 499 MB) measured, two passes agreeing to 0.5%:
+//
+//     scalar, silu as shipped (sycl::exp + divide) : 1123.7 / 1123.8 GB/s
+//     scalar, no silu at all -- pure copy          : 1119.9 / 1120.1 GB/s
+//     float4, silu as shipped                      : 1289.6 / 1290.0 GB/s
+//     float4, no silu at all                       : 1282.0 / 1267.6 GB/s
+//     float8, silu as shipped                      : 1020.4 GB/s
+//
+// Two facts fall out. The precise transcendental and the precise divide are *free* --
+// removing both changes nothing -- so there is no accuracy trade to make here and
+// op_exp is left alone. And four elements per work-item is the width that matters:
+// +15%, with eight already past the turn. 1288 GB/s is the ceiling for this access
+// shape on this device (a 1-2 GiB two-stream copy reaches 2729, but this kernel runs
+// four concurrent streams), so the vector form sits on it rather than near it.
+//
+// Every element's arithmetic is untouched, so this is bit-identical by construction.
+template <int W, bool MIRROR, typename T, typename F>
+static void unary_gated_op_vec_kernel(const T * x, const T * g, T * dst, sycl::half * mir,
+                                      const uint64_t nvec, const sycl::nd_item<1> & item_ct1, F func) {
+    using vecT = sycl::vec<T, W>;
+    SYCL_GLOBAL_ID_LOOP(nvec, item_ct1) {
+        const vecT xv = *reinterpret_cast<const vecT *>(x + i * W);
+        const vecT gv = *reinterpret_cast<const vecT *>(g + i * W);
+        vecT       ov;
+#pragma unroll
+        for (int c = 0; c < W; c++) {
+            ov[c] = func(xv[c]) * gv[c];
+        }
+        *reinterpret_cast<vecT *>(dst + i * W) = ov;
+        if constexpr (MIRROR) {
+            sycl::vec<sycl::half, W> hv;
+#pragma unroll
+            for (int c = 0; c < W; c++) {
+                hv[c] = static_cast<sycl::half>(ov[c]);
+            }
+            *reinterpret_cast<sycl::vec<sycl::half, W> *>(mir + i * W) = hv;
+        }
+    }
+}
+
+// Width for the vector path; 1 restores the scalar kernel for a same-binary A/B.
+static int ggml_sycl_ew_vec_width() {
+    static const int v = [] {
+        const int req = ggml_sycl_get_env("GGML_SYCL_EW_VEC", 4);
+        if (req == 1 || req == 2 || req == 4) {
+            return req;
+        }
+        GGML_LOG_INFO("GGML_SYCL_EW_VEC: requested %d, using 4 (accepted: 1, 2, 4)\n", req);
+        return 4;
+    }();
+    return v;
+}
+
+// The vector path needs k divisible by W and every stream 16-byte aligned. It also
+// cannot serve the Q8 case: producer_q8_emit walks the launch grid, and the vector
+// launch is W times narrower, so it would emit a fraction of the rows. MIRROR (prefill,
+// f16 GEMM consumer) and Q8 (decode, mat-vec consumer) are mutually exclusive by
+// construction, and the shapes that matter here are the prefill ones.
+template <typename T>
+static bool ew_vec_ok(int W, const T * x, const T * g, const T * dst,
+                      const sycl::half * mir, uint64_t k, bool q8) {
+    if (W <= 1 || q8 || (k % (uint64_t) W) != 0) {
+        return false;
+    }
+    const size_t need = sizeof(T) * (size_t) W;
+    return ((uintptr_t) x % need == 0) && ((uintptr_t) g % need == 0) &&
+           ((uintptr_t) dst % need == 0) &&
+           (mir == nullptr || (uintptr_t) mir % (sizeof(sycl::half) * (size_t) W) == 0);
+}
+
 template<bool MIRROR, bool Q8, typename T, typename F>
 static void unary_gated_op_generic_kernel(
         const T * x,
@@ -796,6 +870,25 @@ static inline void ggml_sycl_op_unary_gated(
                 constexpr bool MIR = decltype(mirror_tag)::value;
                 constexpr bool Q8  = decltype(q8_tag)::value;
                 if (o0 == n && o1 == n) {
+                    const int W = ggml_sycl_ew_vec_width();
+                    if (ew_vec_ok(W, x_ptr, g_ptr, dst_ptr, mir, k, Q8)) {
+                        const uint64_t          nvec = k / (uint64_t) W;
+                        const uint32_t          nb   = (uint32_t) ceil_div(nvec, SYCL_GLU_BLOCK_SIZE);
+                        const sycl::nd_range<1> vr(nb * sycl::range<1>(SYCL_GLU_BLOCK_SIZE),
+                                                   sycl::range<1>(SYCL_GLU_BLOCK_SIZE));
+                        if (W == 4) {
+                            main_stream->parallel_for(vr,
+                                [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                    unary_gated_op_vec_kernel<4, MIR>(x_ptr, g_ptr, dst_ptr, mir, nvec, item_ct1, func);
+                                });
+                        } else {
+                            main_stream->parallel_for(vr,
+                                [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                    unary_gated_op_vec_kernel<2, MIR>(x_ptr, g_ptr, dst_ptr, mir, nvec, item_ct1, func);
+                                });
+                        }
+                        return;
+                    }
                     main_stream->parallel_for(launch_range,
                         [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                             unary_gated_op_flat_kernel<MIR, Q8>(x_ptr, g_ptr, dst_ptr, mir, q8_out, q8_kx, k, item_ct1, func);

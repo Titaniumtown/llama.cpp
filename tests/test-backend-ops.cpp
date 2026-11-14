@@ -75,6 +75,23 @@ static int test_parallel_workers(int default_workers) {
     return default_workers;
 }
 
+// -1 means "draw at random", which is the behaviour this file has always had
+// and the default, so a suite run without --seed is byte-for-byte the run that
+// produced every measurement recorded in this series. Set by --seed only.
+static int64_t g_test_seed = -1;
+
+// splitmix64: the mixer. The point of using one and not `seed + slice` is that
+// adjacent integers make std::default_random_engine's first outputs correlated --
+// consecutive slices got consecutive seeds, consecutive seeds got similar first
+// draws, and the slices stopped being independent samples. The first seed-by-slice
+// attempt failed on that, and blamed the seed itself.
+static inline uint64_t mix64(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     if (ggml_is_empty(tensor)) {
         return;
@@ -86,8 +103,25 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         // parallel initialization
         static const size_t n_threads = std::max<size_t>(1, std::min<size_t>(nels/1024, std::min<size_t>(4, N_THREADS/2)));
 
+        // Seeded per SLICE, not per thread. The old line was
+        //   thread_local std::default_random_engine gen(std::random_device{}());
+        // which is two faults: a fresh stream every run, AND -- because the
+        // generators are thread_local while the slices are handed out by
+        // std::async -- a slice's data depending on WHICH THREAD ran it, which is
+        // a scheduling decision. Seeding by slice index removes the second fault
+        // outright: the same index gets the same values whatever the schedule.
+        // The tensor's name and shape join the seed: with the slice index alone, every tensor's first
+        // slice drew the same stream, so Q and K came out proportional and the FA cases saw a one-hot
+        // softmax (NMSE 10x below the unseeded runs) that no reader error could disturb.
+        const uint64_t tensor_key = std::hash<std::string>{}(std::string(tensor->name)) ^
+            mix64((uint64_t) tensor->ne[0] ^ ((uint64_t) tensor->ne[1] << 20) ^
+                  ((uint64_t) tensor->ne[2] << 40) ^ ((uint64_t) tensor->ne[3] << 52));
         auto init_thread = [&](size_t start, size_t end) {
-            thread_local std::default_random_engine gen(std::random_device{}());
+            std::default_random_engine gen =
+                g_test_seed < 0
+                    ? std::default_random_engine(std::random_device{}())
+                    : std::default_random_engine(mix64((uint64_t) g_test_seed * 0x100000001B3ULL
+                                                       + (uint64_t) (start / 1024 + 1)) ^ tensor_key);
             std::uniform_real_distribution<float> distribution(min, max);
             for (size_t i = start; i < end; i++) {
                 data[i] = distribution(gen);
@@ -16116,6 +16150,18 @@ int main(int argc, char ** argv) {
         } else if (strcmp(argv[i], "--output") == 0) {
             if (i + 1 < argc) {
                 if (!output_format_from_str(argv[++i], output_format)) {
+                    usage(argv);
+                    return 1;
+                }
+            } else {
+                usage(argv);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--seed") == 0) {
+            if (i + 1 < argc) {
+                g_test_seed = strtoll(argv[++i], NULL, 10);
+                if (g_test_seed < 0) {
+                    fprintf(stderr, "%s: --seed takes a non-negative integer\n", __func__);
                     usage(argv);
                     return 1;
                 }

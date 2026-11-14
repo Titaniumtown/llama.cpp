@@ -1733,6 +1733,26 @@ static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T * 
         seq_first[seq_id]   = std::min(seq_first[seq_id],   i);
     }
 
+    // without SWA and ALiBi a row is the cell bitmap of its sequence minus the cells after the query,
+    // O(n_kv/64) words instead of a lookup per cell
+    if constexpr (!swa && !alibi) {
+        if (rows_all == nullptr) {
+            for (uint32_t i = 0; i < n_stream*n_tps; ++i) {
+                const llama_seq_id seq_id = ubatch->seq_id[i][0];
+
+                const uint32_t iq = args.block_uniform ? seq_first[seq_id] : i;
+
+                const llama_pos p1_x = is_2d ? ubatch->pos[iq + ubatch->n_tokens*2] : 0;
+                const llama_pos p1_y = is_2d ? ubatch->pos[iq + ubatch->n_tokens]   : 0;
+
+                v_cells.at(seq_to_stream[seq_id]).seq_mask_row(data + n_kv*i, (uint32_t) n_kv, seq_id, causal, is_2d,
+                        ubatch->pos[iq], p1_x, p1_y, mask_keep, mask_drop);
+            }
+
+            return;
+        }
+    }
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         // bookkeeping of the KQ mask cells that could change for other tokens of the same sequence
         std::unordered_map<llama_seq_id, uint32_t>              seq_srct;

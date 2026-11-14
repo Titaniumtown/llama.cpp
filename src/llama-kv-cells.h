@@ -491,6 +491,50 @@ public:
         }
     }
 
+    // the KQ mask row over the cells [0, n) of a query of sequence seq_id at position p1:
+    // v_keep for the cells of the sequence, v_drop for the rest
+    // causal: the cells of the sequence after p1 are dropped too, and with 2D positions a cell at p1 is
+    //         dropped when its 2D position is after (p1_x, p1_y)
+    template <typename T>
+    void seq_mask_row(T * dst, uint32_t n, llama_seq_id seq_id, bool causal, bool is_2d,
+            llama_pos p1, llama_pos p1_x, llama_pos p1_y, T v_keep, T v_drop) const {
+        assert(n <= pos.size());
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+
+        const auto & bits = seq_bits[seq_id];
+
+        for (uint32_t c0 = 0; c0 < n; c0 += 64) {
+            const uint32_t nc   = std::min<uint32_t>(64, n - c0);
+            const uint64_t word = c0/64 < bits.size() ? bits[c0/64] : 0;
+
+            T * d = dst + c0;
+
+            if (word == ~0ull) {
+                std::fill_n(d, nc, v_keep);
+            } else if (word == 0) {
+                std::fill_n(d, nc, v_drop);
+            } else {
+                for (uint32_t b = 0; b < nc; ++b) {
+                    d[b] = (word >> b) & 1 ? v_keep : v_drop;
+                }
+            }
+        }
+
+        if (!causal) {
+            return;
+        }
+
+        const auto & sp = seq_pos[seq_id];
+
+        for (auto it = sp.lower_bound({ p1, 0 }); it != sp.end(); ++it) {
+            const uint32_t i = it->second;
+
+            if (i < n && (it->first > p1 || (is_2d && ext[i].is_2d_gt(p1_x, p1_y)))) {
+                dst[i] = v_drop;
+            }
+        }
+    }
+
     // the minimum position of sequence seq_id currently present in any of the cells
     // return -1 if the sequence is not present
     llama_pos seq_pos_min(llama_seq_id seq_id) const {

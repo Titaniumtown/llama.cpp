@@ -13,6 +13,7 @@
 
 #include <oneapi/mkl.hpp>
 #include <cstdio>
+#include <climits>
 #include <chrono>
 #include <vector>
 
@@ -110,15 +111,93 @@ static void mkl_fa_init_softmax_state(
 // The tile spans absolute rows [q0, q0 + q_rows). Score buffers
 // (KQ_f32/S_f16) are indexed RELATIVE to the tile; the persistent state
 // (VKQ_accum/KQ_max/KQ_sum) and mask are indexed by ABSOLUTE row.
-// One WORK-GROUP per query row (local size = wg_size): work-items stride
-// over the chunk so adjacent items touch adjacent elements (coalesced),
-// the row max/sum come from group reductions, and the DV-long VKQ
-// rescale is spread across the items. Item 0 is the sole writer of
-// KQ_max/KQ_sum; its writes are ordered after every other item's reads
-// by the second group reduction (a collective). Per-element math is
-// identical to the original one-item-per-row kernel: softcap before
-// mask, native::exp, -1e30 sentinel, half-precision S. Only the float
-// summation order differs (tree vs serial), i.e. last-ulp level.
+// For each row: find local max → rescale previous VKQ_accum →
+// compute exp(s - max) → write S_f16 → update running max/sum.
+//
+// One sub-group (32 lanes) cooperates on one row: lane l handles the
+// interleaved float4s (l, l+32, l+64, ...), so the loads/stores coalesce
+// across the sub-group and each lane's max/sum chain is only nv/32 deep
+// (16 at chunk_size 8192). The original kernel walked one row per work-item
+// with a serial 8192-deep dependency chain and ran ~9x off the DRAM wall
+// (73% of the FA call at depth); the per-row semantics are unchanged (the
+// max/sum values are identical, the sum grouping differs by ~1e-7).
+// The three mask forms (implicit causal, materialized mask, no mask) share the
+// same 4-wide strided row walk; only the per-float4 mask application differs.
+// Both passes are templated on it so each instantiation compiles to the same
+// code as a hand-written variant (no per-iteration mask branch).
+template <typename TApply>
+static inline void mkl_fa_row_max4(
+        const sycl::float4 * __restrict KQ4, int lane, int sg_size, int nv,
+        float & m0, float & m1, float & m2, float & m3, TApply apply) {
+    int i = lane;
+    for (; i + 3 * sg_size < nv; i += 4 * sg_size) {
+        // load all four KQ vectors before masking: the original access order
+        // (batch the KQ stream, then the mask stream) measured faster than
+        // interleaving them.
+        sycl::float4 a = KQ4[i];
+        sycl::float4 b = KQ4[i + sg_size];
+        sycl::float4 c = KQ4[i + 2 * sg_size];
+        sycl::float4 d = KQ4[i + 3 * sg_size];
+        a = apply(i, a);
+        b = apply(i + sg_size, b);
+        c = apply(i + 2 * sg_size, c);
+        d = apply(i + 3 * sg_size, d);
+        m0 = sycl::fmax(sycl::fmax(sycl::fmax(m0, a.x()), b.x()), sycl::fmax(c.x(), d.x()));
+        m1 = sycl::fmax(sycl::fmax(sycl::fmax(m1, a.y()), b.y()), sycl::fmax(c.y(), d.y()));
+        m2 = sycl::fmax(sycl::fmax(sycl::fmax(m2, a.z()), b.z()), sycl::fmax(c.z(), d.z()));
+        m3 = sycl::fmax(sycl::fmax(sycl::fmax(m3, a.w()), b.w()), sycl::fmax(c.w(), d.w()));
+    }
+    for (; i < nv; i += sg_size) {
+        const sycl::float4 a = apply(i, KQ4[i]);
+        m0 = sycl::fmax(m0, a.x());
+        m1 = sycl::fmax(m1, a.y());
+        m2 = sycl::fmax(m2, a.z());
+        m3 = sycl::fmax(m3, a.w());
+    }
+}
+
+static inline sycl::float4 mkl_fa_exp4(sycl::float4 v, float new_max) {
+    return sycl::float4(sycl::native::exp(v.x() - new_max),
+                        sycl::native::exp(v.y() - new_max),
+                        sycl::native::exp(v.z() - new_max),
+                        sycl::native::exp(v.w() - new_max));
+}
+
+template <typename TApply>
+static inline void mkl_fa_row_exp4(
+        sycl::half4 * __restrict S4, const sycl::float4 * __restrict KQ4,
+        int lane, int sg_size, int nv, float new_max,
+        float & s0, float & s1, float & s2, float & s3, TApply apply) {
+    int i = lane;
+    for (; i + 3 * sg_size < nv; i += 4 * sg_size) {
+        // load all four KQ vectors before masking (see mkl_fa_row_max4).
+        sycl::float4 a = KQ4[i];
+        sycl::float4 b = KQ4[i + sg_size];
+        sycl::float4 c = KQ4[i + 2 * sg_size];
+        sycl::float4 d = KQ4[i + 3 * sg_size];
+        const sycl::float4 e0 = mkl_fa_exp4(apply(i, a), new_max);
+        const sycl::float4 e1 = mkl_fa_exp4(apply(i + sg_size, b), new_max);
+        const sycl::float4 e2 = mkl_fa_exp4(apply(i + 2 * sg_size, c), new_max);
+        const sycl::float4 e3 = mkl_fa_exp4(apply(i + 3 * sg_size, d), new_max);
+        S4[i]               = e0.convert<sycl::half>();
+        S4[i + sg_size]     = e1.convert<sycl::half>();
+        S4[i + 2 * sg_size] = e2.convert<sycl::half>();
+        S4[i + 3 * sg_size] = e3.convert<sycl::half>();
+        s0 += (e0.x() + e1.x()) + (e2.x() + e3.x());
+        s1 += (e0.y() + e1.y()) + (e2.y() + e3.y());
+        s2 += (e0.z() + e1.z()) + (e2.z() + e3.z());
+        s3 += (e0.w() + e1.w()) + (e2.w() + e3.w());
+    }
+    for (; i < nv; i += sg_size) {
+        const sycl::float4 e = mkl_fa_exp4(apply(i, KQ4[i]), new_max);
+        S4[i] = e.convert<sycl::half>();
+        s0 += e.x();
+        s1 += e.y();
+        s2 += e.z();
+        s3 += e.w();
+    }
+}
+
 static void mkl_fa_online_softmax_chunk(
     dpct::queue_ptr stream,
     float * __restrict KQ_f32,
@@ -127,90 +206,186 @@ static void mkl_fa_online_softmax_chunk(
     float * __restrict KQ_sum,
     float * __restrict VKQ_accum,
     int q0, int q_rows, int n_queries, int DV,
-    int chunk_size, int chunk_start,
+    int chunk_size, int row_ld, int chunk_start,
     int kvh_head,
     const sycl::half * mask_data, int64_t mask_head_stride,
     int64_t mask_row_stride, int mask_n_heads,
+    bool implicit_causal, int n_past,
     float logit_softcap, int64_t wg_size,
     const sycl::event & dep_event) {
 
-    // One work-group per query row: exactly q_rows groups of wg_size
-    // items. q_rows * wg_size is already a multiple of wg_size, so unlike
-    // the one-item-per-row kernels there is no round-up / tail guard.
-    const int64_t wg         = q_rows * wg_size;
-    const int     local_size = (int) wg_size;  // stride in the loops below
+    // The kernel-selection gate (fattn.cpp) only routes logit_softcap == 0
+    // to the MKL kernel; the vectorized body below drops the tanh path.
+    GGML_ASSERT(logit_softcap == 0.0f && "MKL FA requires logit_softcap == 0 (gated in fattn.cpp)");
+
+    // One sub-group (32 lanes) processes one row: lanes cover the row's
+    // float4s strided, then tree-reduce. Launch rows * 32 items so padding
+    // is whole sub-groups (the row guard is sub-group-uniform, keeping the
+    // shuffles divergence-free).
+    constexpr int MKL_FA_SG = 32;
+    const int64_t wg = ((q_rows * MKL_FA_SG + wg_size - 1) / wg_size) * wg_size;
+
     stream->submit([&](sycl::handler & cgh) {
         cgh.depends_on(dep_event);
         cgh.parallel_for(sycl::nd_range<1>(wg, wg_size),
-            [=](sycl::nd_item<1> item) {
-                const int local_id = (int)item.get_local_id(0);
-                const int row = (int)item.get_group(0); // tile-relative
-                const int jc_abs    = q0 + row;
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                const sycl::sub_group sg = item.get_sub_group();
+                const int sg_size = sg.get_local_linear_range();
+                const int lane    = sg.get_local_linear_id();
+                const int jc_rel  = item.get_global_id(0) / sg_size;  // == row within the tile
+                if (jc_rel >= q_rows) return;  // sub-group-uniform: only whole padded sub-groups exit
+
+                const int jc_abs = q0 + jc_rel;
                 const int gqa_group = jc_abs / n_queries;
                 const int q_row     = jc_abs % n_queries;
-                // Score buffers are tile-local (relative index).
+
+                // row_ld (not chunk_size) is the row pitch: it is padded to a
+                // multiple of 8 by the caller so every row's base stays
+                // 16B-aligned for the float4/half4 accesses below. A raw
+                // chunk_size pitch misaligns every odd row whenever
+                // chunk_size % 4 != 0 (e.g. n_kv = 1025).
                 const float * __restrict KQ_row = KQ_f32
-                    + row * (int64_t)chunk_size;
+                    + jc_rel * (int64_t) row_ld;
                 sycl::half * __restrict S_row = S_f16
-                    + row * (int64_t)chunk_size;
-                // Persistent accumulator is full-sized (absolute index).
+                    + jc_rel * (int64_t) row_ld;
                 float * __restrict vkq = VKQ_accum
-                    + jc_abs * (int64_t)DV;
-                const sycl::half * mask_h = nullptr;
-                int64_t m_stride = 0;
-                if (mask_data) {
-                    int m_head = (mask_n_heads > 1)
-                        ? (kvh_head + gqa_group) % mask_n_heads : 0;
-                    mask_h   = mask_data + (int64_t)m_head * mask_head_stride;
-                    m_stride = mask_row_stride;
-                }
-                // Score at chunk offset i — original per-element math.
-                auto score = [&](int i) {
-                    float s = KQ_row[i];
-                    if (logit_softcap != 0.0f) {
-                        s = logit_softcap * sycl::tanh(s);
+                    + jc_abs * (int64_t) DV;
+
+                // implicit causal: cols >= bd are masked (-inf); the
+                // materialized mask path reads the mask per element.
+                const int bd = implicit_causal ? n_past + q_row + 1
+                                               : INT_MAX;
+                const sycl::half * mask_h = (mask_data && !implicit_causal)
+                    ? mask_data
+                        + (int64_t) ((mask_n_heads > 1) ? (kvh_head + gqa_group) % mask_n_heads : 0) * mask_head_stride
+                        + (int64_t) q_row * mask_row_stride + chunk_start
+                    : nullptr;
+
+                const sycl::float4 neg_inf4(-INFINITY, -INFINITY, -INFINITY, -INFINITY);
+
+                // Each lane walks the row's float4s strided by sg_size. nv is
+                // NOT guaranteed to be a multiple of sg_size -- this_chunk is
+                // n_kv % MKL_FA_CHUNK_SIZE_KV on the final chunk -- so the
+                // 4-way-unrolled loop is followed by a strided cleanup over the
+                // leftover float4s and a lane-0 scalar tail for the
+                // chunk_size % 4 leftover columns (the newest keys).
+                const int nv  = chunk_size / 4;
+                const int rem = chunk_size - nv * 4;
+                const sycl::float4 * __restrict KQ4 = (const sycl::float4 *) KQ_row;
+                // The mask pitch is the tensor's, not ours: a half4 load needs
+                // the row base 4-half aligned, which an odd n_kv breaks.
+                const bool mask_vec_ok = mask_h &&
+                    ((mask_row_stride & 3) == 0) && ((mask_head_stride & 3) == 0);
+                const sycl::half4 * __restrict M4 =
+                    (const sycl::half4 *) mask_h;   // mask path: 4 halves per float4
+                const auto load_mask4 = [=](int i) {
+                    if (mask_vec_ok) {
+                        return M4[i].convert<float>();
                     }
-                    if (mask_h) {
-                        s += (float)mask_h[q_row * m_stride
-                            + (chunk_start + i)];
-                    }
-                    return s;
+                    const sycl::half * __restrict p = mask_h + (int64_t) i * 4;
+                    return sycl::float4((float) p[0], (float) p[1],
+                                        (float) p[2], (float) p[3]);
                 };
-                // Pass 1: strided (coalesced) row-wise local maximum.
-                float local_max = -1e30f;
-                for (int i = local_id; i < chunk_size; i += local_size) {
-                    float s = score(i);
-                    if (s > local_max) local_max = s;
+
+                // --- pass 1: row local maximum ---
+                float m0 = -1e30f, m1 = -1e30f, m2 = -1e30f, m3 = -1e30f;
+                if (implicit_causal) {
+                    mkl_fa_row_max4(KQ4, lane, sg_size, nv, m0, m1, m2, m3,
+                        [=](int i, sycl::float4 v) {
+                            const int c0 = chunk_start + i * 4;
+                            // select(a, b, c) is msbIsSet(c) ? b : a -- masked
+                            // columns (key index >= bd) must take -inf.
+                            return sycl::select(v, neg_inf4,
+                                sycl::int4(c0, c0 + 1, c0 + 2, c0 + 3) >= bd);
+                        });
+                } else if (mask_h) {
+                    mkl_fa_row_max4(KQ4, lane, sg_size, nv, m0, m1, m2, m3,
+                        [=](int i, sycl::float4 v) { return v + load_mask4(i); });
+                } else {
+                    mkl_fa_row_max4(KQ4, lane, sg_size, nv, m0, m1, m2, m3,
+                        [](int, sycl::float4 v) { return v; });
                 }
-                const float final_local_max = sycl::reduce_over_group(
-                    item.get_group(), local_max, sycl::maximum<float>());
-                // Rescale previous accumulator by exp(old_max - new_max)
-                float old_max = KQ_max[jc_abs];
-                float new_max = (old_max > final_local_max) ? old_max : final_local_max;
-                float rescale = (old_max < -1e29f) ? 1.0f
+
+                // Tail: chunk_size % 4 leftover columns folded in by lane 0.
+                if (lane == 0) {
+                    for (int t = 0; t < rem; t++) {
+                        const int col = nv * 4 + t;
+                        float s = KQ_row[col];
+                        if (implicit_causal) {
+                            if (chunk_start + col >= bd) s += -INFINITY;
+                        } else if (mask_h) {
+                            s += (float) mask_h[col];
+                        }
+                        m0 = sycl::fmax(m0, s);
+                    }
+                }
+
+                float local_max = sycl::fmax(sycl::fmax(m0, m1), sycl::fmax(m2, m3));
+                #pragma unroll
+                for (int m = sg_size / 2; m > 0; m >>= 1) {
+                    local_max = sycl::fmax(local_max,
+                        dpct::permute_sub_group_by_xor(sg, local_max, m));
+                }
+                // --- rescale previous accumulator (every lane: DV/sg_size) ---
+                const float old_max = KQ_max[jc_abs];
+                const float new_max = sycl::fmax(old_max, local_max);
+                const float rescale = (old_max < -1e29f) ? 1.0f
                     : sycl::native::exp(old_max - new_max);
-                for (int v = local_id; v < DV; v += local_size) {
-                    vkq[v] *= rescale;
+                {
+                    const int nv_v = DV / 4;   // DV % 4 == 0 (head_dim % 64 == 0)
+                    sycl::float4 * vkq4 = (sycl::float4 *) vkq;
+                    for (int j = lane; j < nv_v; j += sg_size) {
+                        vkq4[j] *= rescale;
+                    }
                 }
-                // Pass 2: softmax numerators, strided; S row written once.
-                float local_sum = 0.0f;
-                for (int i = local_id; i < chunk_size; i += local_size) {
-                    float s = score(i);
-                    float val = sycl::native::exp(s - new_max);
-                    S_row[i] = sycl::half(val);
-                    local_sum += val;
+
+                // --- pass 2: exp(s - max) -> S_f16, partial sums ---
+                float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+                {
+                    sycl::half4 * S4 = (sycl::half4 *) S_row;
+                    if (implicit_causal) {
+                        mkl_fa_row_exp4(S4, KQ4, lane, sg_size, nv, new_max, s0, s1, s2, s3,
+                            [=](int i, sycl::float4 v) {
+                                const int c0 = chunk_start + i * 4;
+                                return sycl::select(v, neg_inf4,
+                                    sycl::int4(c0, c0 + 1, c0 + 2, c0 + 3) >= bd);
+                            });
+                    } else if (mask_h) {
+                        mkl_fa_row_exp4(S4, KQ4, lane, sg_size, nv, new_max, s0, s1, s2, s3,
+                            [=](int i, sycl::float4 v) { return v + load_mask4(i); });
+                    } else {
+                        mkl_fa_row_exp4(S4, KQ4, lane, sg_size, nv, new_max, s0, s1, s2, s3,
+                            [](int, sycl::float4 v) { return v; });
+                    }
                 }
-                const float total_sum = sycl::reduce_over_group(
-                    item.get_group(), local_sum, sycl::plus<float>());
-                if (local_id == 0) {
-                    KQ_sum[jc_abs] = KQ_sum[jc_abs] * rescale + total_sum;
+
+                if (lane == 0) {
+                    for (int t = 0; t < rem; t++) {
+                        const int col = nv * 4 + t;
+                        float s = KQ_row[col];
+                        if (implicit_causal) {
+                            if (chunk_start + col >= bd) s += -INFINITY;
+                        } else if (mask_h) {
+                            s += (float) mask_h[col];
+                        }
+                        const float e = sycl::native::exp(s - new_max);
+                        S_row[col] = sycl::half(e);
+                        s0 += e;
+                    }
+                }
+
+                float local_sum = (s0 + s1) + (s2 + s3);
+                #pragma unroll
+                for (int m = sg_size / 2; m > 0; m >>= 1) {
+                    local_sum += dpct::permute_sub_group_by_xor(sg, local_sum, m);
+                }
+                if (lane == 0) {
+                    KQ_sum[jc_abs] = KQ_sum[jc_abs] * rescale + local_sum;
                     KQ_max[jc_abs] = new_max;
                 }
             });
     });
 }
-
-// Write one GQA group's normalized output to its destination head.
 static void mkl_fa_normalize_head(
     dpct::queue_ptr stream,
     float * __restrict dst_batch,
@@ -506,6 +681,13 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
         mask_n_heads     = (int)mask->ne[2];
     }
 
+    // Implicit causal: a sentinel (ne[0]==1) mask signals the causal boundary
+    // is computed in-kernel (key index <= n_past + q_row) rather than read from
+    // a materialized [n_kv, n_tokens] mask. n_past is carried in ne[1]-1 because
+    // K->ne[1] is padded to a 256-multiple and n_kv - n_queries overstates it.
+    const bool implicit_causal = mask && mask->ne[0] == 1;
+    const int  n_past = implicit_causal ? (int)(mask->ne[1] - 1) : (n_kv - n_queries);
+
     // --- Allocate intermediates from pool ---
     ggml_sycl_pool & pool = ctx.pool();
 
@@ -519,8 +701,12 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     ggml_sycl_pool_alloc<sycl::half> K_chunk_f16(pool); // [chunk x DKQ] (per-chunk dequant)
     ggml_sycl_pool_alloc<sycl::half> V_chunk_f16(pool); // [chunk x DV] (per-chunk dequant)
 
-    KQ_f32.alloc((size_t)q_tile_rows * chunk_size);
-    S_f16.alloc((size_t)q_tile_rows * chunk_size);
+    // Score-buffer row pitch is padded to a multiple of 8 so every row base is
+    // 16B-aligned for the softmax's float4/half4 accesses; the GEMMs take the
+    // same padded ld and simply leave the pad columns untouched/unread.
+    const int chunk_ld_max = (chunk_size + 7) & ~7;
+    KQ_f32.alloc((size_t)q_tile_rows * chunk_ld_max);
+    S_f16.alloc((size_t)q_tile_rows * chunk_ld_max);
     VKQ_chunk.alloc((size_t)q_tile_rows * DV);
     VKQ_accum.alloc((size_t)n_query_rows * DV);
     KQ_max.alloc(n_query_rows);
@@ -579,6 +765,8 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
             // 3. KV chunk loop (OUTER): dequant each chunk once, then tile queries.
             for (int chunk_start = 0; chunk_start < n_kv; chunk_start += chunk_size) {
                 int this_chunk = std::min(chunk_size, n_kv - chunk_start);
+                // Padded row pitch for the score buffers (see chunk_ld_max).
+                const int chunk_ld = (this_chunk + 7) & ~7;
 
                 // 3a. Dequant this KV chunk to dense fp16 (once per chunk)
                 {
@@ -607,7 +795,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                             K_chunk_f16_ptr, DKQ,
                             Q_head_f16_ptr + (int64_t)q0 * DKQ, DKQ,
                             beta,
-                            KQ_f32_ptr, this_chunk,
+                            KQ_f32_ptr, chunk_ld,
                             std::vector<sycl::event>{*stream->ext_oneapi_get_last_event()});
                         MKL_ACCUM(gemm_kq_time_us, t0);
                     }
@@ -618,10 +806,11 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                             KQ_f32_ptr, S_f16_ptr,
                             KQ_max_ptr, KQ_sum_ptr, VKQ_accum_ptr,
                             q0, q_rows, n_queries, DV,
-                            this_chunk, chunk_start,
+                            this_chunk, chunk_ld, chunk_start,
                             kvh_base_head,
                             mask_batch, mask_head_stride,
                             mask_row_stride, mask_n_heads,
+                            implicit_causal, n_past,
                             logit_softcap, wg_size, kq_done);
                         MKL_ACCUM(softmax_time_us, t0);
                     }
@@ -634,7 +823,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                             DV, q_rows, this_chunk,
                             alpha,
                             V_chunk_f16_ptr, DV,
-                            S_f16_ptr, this_chunk,
+                            S_f16_ptr, chunk_ld,
                             beta,
                             VKQ_chunk_ptr, DV,
                             std::vector<sycl::event>{*stream->ext_oneapi_get_last_event()});

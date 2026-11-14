@@ -39,6 +39,7 @@ struct llama_cparams {
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;
+    bool implicit_causal; // SYCL: encode causal masking implicitly in FA kernels (no materialized mask); on by default, GGML_SYCL_FA_IMPLICIT_CAUSAL=0 disables
     bool auto_fa;
     bool fused_dsv4_hc_pre;
     bool fused_dsv4_hc_comb;

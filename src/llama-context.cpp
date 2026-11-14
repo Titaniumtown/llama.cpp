@@ -398,6 +398,28 @@ llama_context::llama_context(
         }
     }
 
+    // SYCL implicit causal masking: FA kernels compute the causal boundary from
+    // token positions instead of reading a materialized [n_kv, n_tokens] mask.
+    // Only safe for causal, non-ALiBi, non-SWA, non-softcap models with the
+    // KQV ops offloaded (e.g. DSV4 with -ngl). On by default on SYCL;
+    // GGML_SYCL_FA_IMPLICIT_CAUSAL=0 disables it. A non-SYCL backend cannot
+    // read the sentinel, so the device name must contain SYCL.
+    {
+        const char * env = getenv("GGML_SYCL_FA_IMPLICIT_CAUSAL");
+        bool is_sycl = false;
+        if (!model.devices.empty()) {
+            const char * dev_name = ggml_backend_dev_name(model.devices[0].dev);
+            is_sycl = dev_name && strstr(dev_name, "SYCL") != nullptr;
+        }
+        cparams.implicit_causal = is_sycl && (!env || atoi(env) != 0)
+            && cparams.flash_attn
+            && cparams.offload_kqv
+            && cparams.causal_attn
+            && !hparams.use_alibi
+            && !hparams.attn_soft_cap
+            && hparams.swa_type == LLAMA_SWA_TYPE_NONE;
+    }
+
     // initialized later
     cparams.pipeline_parallel = false;
     cparams.training = false;

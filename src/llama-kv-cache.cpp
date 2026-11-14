@@ -1922,6 +1922,10 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const 
     // the mask is left unallocated when the graph only stores K/V without attending
     if (attn_mask.raw && attn_mask.raw->buffer) {
         ggml_tensor * dst = attn_mask.raw;
+        // sentinel (single-element) mask: implicit causal, nothing to fill.
+        if (dst->ne[0] == 1) {
+            return;
+        }
         const int32_t * rows = attn_mask.rows && attn_mask.rows->buffer ? (const int32_t *) attn_mask.rows->data : nullptr;
 
         const uint32_t n_tokens = ubatch->n_tokens;

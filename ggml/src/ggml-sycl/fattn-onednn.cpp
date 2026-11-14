@@ -149,7 +149,7 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
     // 2. types other than f16 need different logical_tensor declaration
     // 3. the mask must be shape [1, 1, q, seq]
     // 4. sinks: excludes attention sink (Xiao et al., 2024) that can't be modeled by oneDNN graph
-    if (mask && (mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1)) {
+    if (mask && (mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1 || mask->ne[0] == 1)) {
         return false;
     }
     if (sinks) {

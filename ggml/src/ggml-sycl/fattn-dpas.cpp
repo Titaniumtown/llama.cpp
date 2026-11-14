@@ -633,6 +633,10 @@ static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst) 
         fattn_dpas_kernel<D, NR16, KG, TC, ST, false, Q8>(p, nkvh, ne03, stream);
     }
 
+    // copied into a non-static local: a runtime-initialized static const is not
+    // constant-initialized, and oneAPI 2026 rejects it inside a kernel.
+    static const int combine_unroll_env = ggml_sycl_get_env("GGML_SYCL_FA_COMBINE_UNROLL", 4);
+    const int        combine_unroll     = combine_unroll_env;
     if (nsplit > 1) {
         float *        parts_p = parts.get();
         sycl::float2 * meta_p  = meta.get();
@@ -643,6 +647,7 @@ static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst) 
                 sycl::nd_range<3>(sycl::range<3>(Q->ne[3], Q->ne[2], (size_t) ne01 * D), sycl::range<3>(1, 1, D)),
                 [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
                     flash_attn_combine_results<D>(parts_p, meta_p, dst_p, nsplit,
+                                                 combine_unroll,
                                                   lm.get_multi_ptr<sycl::access::decorated::no>().get());
                 });
         });

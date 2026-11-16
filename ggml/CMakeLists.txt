@@ -260,6 +260,8 @@ set   (GGML_SYCL_TARGET "INTEL" CACHE STRING
                                             "ggml: sycl target device")
 set   (GGML_SYCL_DEVICE_ARCH "" CACHE STRING
                                             "ggml: sycl device architecture")
+set   (GGML_SYCL_FA_QUANTS "all" CACHE STRING
+                                            "ggml: SYCL FlashAttention vector kernel K-V type combinations to compile, \"all\" or a list such as \"q8_0-q8_0;q5_1-q4_0\"")
 
 option(GGML_OPENVINO                        "ggml: use OPENVINO"                              OFF)
 option(GGML_ET                              "ggml: use ET backend"                            OFF)

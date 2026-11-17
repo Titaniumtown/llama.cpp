@@ -6530,6 +6530,64 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     }
 };
 
+// two MUL_MATs in one graph whose src1 has the same address and shape: a backend that reuses a src1 conversion between them must see when the src1 data is not the same
+struct test_mul_mat_src1_reuse : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int mode; // 0: same src1, 1: src1 scaled in place between the MUL_MATs, 2: src1 are two non-contiguous views of different tensors
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_a, m, n, k, mode);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_mul_mat_src1_reuse(ggml_type type_a = GGML_TYPE_F16, int64_t m = 64, int64_t n = 16, int64_t k = 256, int mode = 0)
+        : type_a(type_a), m(m), n(n), k(k), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a0 = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * a1 = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(a0, "a0");
+        ggml_set_name(a1, "a1");
+
+        ggml_tensor * b0;
+        ggml_tensor * b1;
+        if (mode == 2) {
+            ggml_tensor * p0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*k, n);
+            ggml_tensor * p1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*k, n);
+            b0 = ggml_view_2d(ctx, p0, k, n, p0->nb[1], 0);
+            b1 = ggml_view_2d(ctx, p1, k, n, p1->nb[1], 0);
+        } else {
+            b0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            // out0 is the first src of the ADD below, so it reads b0 before the scale writes it
+            b1 = mode == 1 ? ggml_scale_inplace(ctx, b0, 2.0f) : b0;
+        }
+        ggml_set_name(b0, "b0");
+        if (b1 != b0) {
+            ggml_set_name(b1, "b1");
+        }
+
+        ggml_tensor * out0 = ggml_mul_mat(ctx, a0, b0);
+        ggml_tensor * out1 = ggml_mul_mat(ctx, a1, b1);
+
+        ggml_tensor * out = ggml_add(ctx, out0, out1);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SRC1_REUSE";
+    }
+};
+
 // FP4 W4A8 path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
 struct test_mul_mat_w4a8 : public test_mul_mat {
     test_mul_mat_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
@@ -6761,6 +6819,61 @@ struct test_mul_mat_id : public test_case {
 
     void reinit_perf_iter(ggml_context * ctx) override {
         init_mul_mat_id_ids(ctx, n_mats, skip);
+    }
+};
+
+// two MUL_MAT_IDs in one graph with the same ids and src1 shape: a backend that reuses a src1 conversion between them must see when the src1 data is not the same
+struct test_mul_mat_id_src1_reuse : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, n_mats, n_used, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_mul_mat_id_src1_reuse(ggml_type type_a = GGML_TYPE_F16, int n_mats = 4, int n_used = 2, int64_t m = 64, int64_t n = 32, int64_t k = 256)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as0 = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_tensor * as1 = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as0, "as0");
+        ggml_set_name(as1, "as1");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * b0 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, n);
+        ggml_tensor * b1 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, n);
+        ggml_set_name(b0, "b0");
+        ggml_set_name(b1, "b1");
+
+        ggml_tensor * out = ggml_add(ctx, ggml_mul_mat_id(ctx, as0, b0, ids), ggml_mul_mat_id(ctx, as1, b1, ids));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_SRC1_REUSE";
     }
 };
 
@@ -13393,6 +13506,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t k : {16, 32, 48}) {
             for (int64_t n : {9, 33, 128}) {
                 test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 100, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
+        for (int64_t n : {1, 4, 16, 96}) {
+            for (int mode : {0, 1, 2}) {
+                test_cases.emplace_back(new test_mul_mat_src1_reuse(type_a, 64, n, 256, mode));
+            }
+        }
+    }
+    // n_mats = 1: every token picks the same expert, so both MUL_MAT_IDs gather the same rows to the same place
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_Q4_0}) {
+        for (int n_mats : {1, 4}) {
+            for (int64_t n : {4, 32, 128}) {
+                test_cases.emplace_back(new test_mul_mat_id_src1_reuse(type_a, n_mats, std::min(n_mats, 2), 64, n, 256));
             }
         }
     }

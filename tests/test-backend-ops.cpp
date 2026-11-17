@@ -6437,6 +6437,46 @@ struct test_mul_mat_gemm_max : public test_mul_mat {
     }
 };
 
+// GGML_OP_MUL_MAT with a contiguous src0 and a src1 whose rows are strided in memory
+// test_mul_mat's k_v views src0 too, which keeps a backend off its paths that need a contiguous src0
+struct test_mul_mat_strided_b : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int64_t k_v; // row length of src1 in memory, k_v > k
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_a, m, n, k, k_v);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_strided_b(ggml_type type_a = GGML_TYPE_Q4_0, int64_t m = 64, int64_t n = 4, int64_t k = 256, int64_t k_v = 512)
+        : type_a(type_a), m(m), n(n), k(k), k_v(k_v) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_ASSERT(k_v > k);
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k_v, n);
+        b = ggml_view_2d(ctx, b, k, n, b->nb[1], 0);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -13341,6 +13381,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
+
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (int64_t n : {1, 2, 4, 8, 9, 16}) {
+            test_cases.emplace_back(new test_mul_mat_strided_b(type_a, 64, n, 256, 512));
+        }
+    }
 
     // small K at batch > 8, e.g. LoRA B matrices with K = rank
     for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {

@@ -266,6 +266,17 @@ static void permute_sdpa_out_sycl(const sycl::half * out, float * dst,
     });
 }
 
+#if DNNL_VERSION_MAJOR == 3 && DNNL_VERSION_MINOR < 14
+// oneDNN < 3.14 keys its SDPA kernel cache on uninitialised stack bytes, so an equal problem can recompile (~1 s).
+// Fixed by https://github.com/uxlfoundation/oneDNN/pull/5656; remove once the minimum oneDNN is 3.14.
+__attribute__((noinline)) static void ggml_sycl_dnnl_clear_stack() {
+    volatile unsigned char buf[64 * 1024];   // 2x the smallest size measured to work
+    for (size_t i = sizeof(buf); i > 0; --i) {
+        buf[i - 1] = 0;
+    }
+}
+#endif
+
 // Build + compile the contiguous-input GQA SDPA graph (MatMul->Divide->[Add]->SoftMax->MatMul), f32 out.
 // The Add node is only present with an explicit mask; the implicit-causal form replaces it with a Select chain.
 // Mirrors the hardware-verified scratch/onednn_sdpa_probe.cpp build_gqa (partitions=1, sdp_primitive_kernel_t).
@@ -434,6 +445,9 @@ static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int 
     }
     E.ins      = parts[0].get_input_ports();
     E.out      = parts[0].get_output_ports()[0];
+#if DNNL_VERSION_MAJOR == 3 && DNNL_VERSION_MINOR < 14
+    ggml_sycl_dnnl_clear_stack();
+#endif
     E.cp       = parts[0].compile(E.ins, {E.out}, eng);
 #if DNNL_VERSION_MAJOR > 3 || (DNNL_VERSION_MAJOR == 3 && DNNL_VERSION_MINOR >= 13)
     // the fused kernel needs no scratchpad; without it (e.g. the OpenCL driver cannot build oneDNN's microkernels)

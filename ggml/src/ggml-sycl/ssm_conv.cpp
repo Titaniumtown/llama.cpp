@@ -266,6 +266,87 @@ static void kernel_ssm_conv_collapsed_t1(
     });
 }
 
+// The rs_replay conv chain in one dispatch (see find_conv_replay_fold). Same per-channel
+// mapping and two phases as the collapsed kernel above, for the same reason: the window is
+// read from the cache row rows[s] and the tail is written to the cell of seq s, usually the
+// same row, and every cache address of channel c is owned by work-item c.
+template <int DC, int MAX_T, int MAX_NS>
+static void kernel_ssm_conv_replay(queue & q, const ggml_sycl_conv_replay_args a) {
+    constexpr int NC    = DC - 1;
+    constexpr int MAX_W = NC + MAX_T;
+    const size_t  wg    = 256;
+    const size_t  n_wg  = ((size_t) a.channels + wg - 1) / wg;
+
+    q.parallel_for(nd_range<1>(range<1>(n_wg * wg), range<1>(wg)), [=](nd_item<1> item) {
+        const int c = (int) item.get_global_id(0);
+        if (c >= a.channels) {
+            return;
+        }
+        float wv[DC];
+#pragma unroll
+        for (int i = 0; i < DC; ++i) {
+            wv[i] = a.w[(size_t) c * DC + i];
+        }
+
+        // phase 1: every load, before any store
+        float win[MAX_NS][MAX_W];
+#pragma unroll
+        for (int s = 0; s < MAX_NS; ++s) {
+            if (s < a.n_s) {
+                const float *   row  = a.cache + (int64_t) a.rows[s] * a.row_stride + a.hist_off + c;
+                const int32_t * cols = a.win + (int64_t) s * a.win_stride;
+#pragma unroll
+                for (int k = 0; k < NC; ++k) {
+                    win[s][k] = row[(int64_t) cols[k] * a.col_stride];
+                }
+#pragma unroll
+                for (int t = 0; t < MAX_T; ++t) {
+                    if (t < a.n_t) {
+                        win[s][NC + t] = a.x[c + t * a.x_t + s * a.x_s];
+                    }
+                }
+            }
+        }
+
+        // phase 2: every store
+#pragma unroll
+        for (int s = 0; s < MAX_NS; ++s) {
+            if (s < a.n_s) {
+#pragma unroll
+                for (int t = 0; t < MAX_T; ++t) {
+                    if (t < a.n_t) {
+                        float sumf = 0.0f;
+#pragma unroll
+                        for (int i = 0; i < DC; ++i) {
+                            sumf += win[s][t + i] * wv[i];
+                        }
+                        a.out[c + t * a.out_t + s * a.out_s] = a.silu ? sumf / (1.0f + sycl::exp(-sumf)) : sumf;
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < MAX_W; ++j) {
+                    if (j >= a.j0 && j < a.j0 + a.n_dst) {
+                        a.hd[c + (j - a.j0) * a.hd_col + s * a.hd_s] = win[s][j];
+                    }
+                }
+            }
+        }
+    });
+}
+
+// GGML_SYCL_CONV_REPLAY_FOLD=0 disables the replay conv fold (same-binary control).
+bool ggml_sycl_conv_replay_fold_enabled() {
+    static const bool on = ggml_sycl_get_env("GGML_SYCL_CONV_REPLAY_FOLD", 1) != 0;
+    return on;
+}
+
+void ggml_sycl_ssm_conv_replay(ggml_backend_sycl_context & ctx, const ggml_sycl_conv_replay_args & a) {
+    GGML_ASSERT(a.n_t >= 1 && a.n_t <= GGML_SYCL_CONV_REPLAY_MAX_T);
+    GGML_ASSERT(a.n_s >= 1 && a.n_s <= GGML_SYCL_CONV_REPLAY_MAX_NS);
+    GGML_ASSERT(a.j0 >= 0 && a.n_dst >= 1 && a.j0 + a.n_dst <= 3 + a.n_t);
+    kernel_ssm_conv_replay<4, GGML_SYCL_CONV_REPLAY_MAX_T, GGML_SYCL_CONV_REPLAY_MAX_NS>(*ctx.stream(), a);
+}
+
 // Prefill fold: one dispatch for CONCAT + K state CPYs + SSM_CONV + SiLU.
 //
 // The concat this replaces spends its whole 545 us/call materialising

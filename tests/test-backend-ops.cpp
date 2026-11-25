@@ -5515,6 +5515,125 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// The rs_replay conv chain as build_rs and build_conv_state_replay build it: the history gather,
+// the window gather, the concat with the new tokens, the transposed cont into ssm_conv + silu, and
+// the CPY of the history tail back to the cache. Compares the conv output, the written tail and
+// the whole cache.
+struct test_conv_replay_chain : public test_case {
+    static constexpr int64_t n_conv = 3;
+    static constexpr int64_t head   = 1;
+
+    const int64_t channels;
+    const int64_t n_pend; // n_rs_seq + 1
+    const int64_t n_t;
+    const int64_t n_seqs;
+    const int64_t rep;    // kept pending tokens of seq 0, seq s keeps (rep + s) % (n_pend + 1)
+    const bool    swap;   // seq s reads the cell seq n_seqs - 1 - s writes
+    const int64_t x_pad;  // x is a view of a wider projection
+
+    ggml_tensor * out_node   = nullptr;
+    ggml_tensor * cpy_node   = nullptr;
+    ggml_tensor * cache_node = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONV_REPLAY_CHAIN";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR7(channels, n_pend, n_t, n_seqs, rep, swap, x_pad);
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out_node, cpy_node, cache_node }; }
+
+    test_conv_replay_chain(int64_t channels, int64_t n_pend, int64_t n_t, int64_t n_seqs, int64_t rep, bool swap = false,
+            int64_t x_pad = 0)
+        : channels(channels), n_pend(n_pend), n_t(n_t), n_seqs(n_seqs), rep(rep), swap(swap), x_pad(x_pad) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_hist  = n_conv + n_pend;
+        const int64_t S       = channels * n_hist;
+        const int64_t n_cells = n_seqs + 2;
+
+        ggml_tensor * cache    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S, n_cells);
+        ggml_tensor * proj     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, channels + x_pad, n_t * n_seqs);
+        ggml_tensor * kernel   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_conv + 1, channels);
+        ggml_tensor * s_copy   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_tensor * rep_cols = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_conv, n_seqs);
+        ggml_set_name(cache, "conv_states_all");
+        ggml_set_name(s_copy, "s_copy");
+        ggml_set_name(rep_cols, "rep_cols");
+
+        ggml_tensor * x = ggml_view_3d(ctx, proj, channels, n_t, n_seqs, proj->nb[1], proj->nb[1] * n_t, 0);
+
+        // build_rs, with n_rs == n_seqs and no zeroed state
+        ggml_tensor * states     = ggml_reshape_2d(ctx, cache, S, n_cells);
+        ggml_tensor * fill       = ggml_fill_inplace(ctx, ggml_view_1d(ctx, states, 0, 0), 0.0f);
+        ggml_tensor * states_all = ggml_get_rows(ctx, states, s_copy);
+        ggml_tensor * rows       = ggml_view_2d(ctx, states_all, S, n_seqs, states_all->nb[1], 0);
+        ggml_tensor * extra      = ggml_cpy(ctx,
+                ggml_view_2d(ctx, states_all, S, 0, states_all->nb[1], n_seqs * states_all->nb[1]),
+                ggml_view_2d(ctx, cache, S, 0, cache->nb[1], (head + n_seqs) * cache->nb[1]));
+
+        // build_conv_state_replay
+        ggml_tensor * hist       = ggml_reshape_3d(ctx, rows, channels, n_hist, n_seqs);
+        ggml_tensor * cols       = ggml_concat(ctx, ggml_get_rows(ctx, hist, rep_cols), x, 1);
+        ggml_tensor * conv_input = ggml_cont(ctx, ggml_transpose(ctx, cols));
+
+        const int64_t n_dst = n_t >= 2 && n_t <= n_pend ? n_conv + n_t : n_conv;
+
+        ggml_tensor * tail     = ggml_view_3d(ctx, cols, channels, n_dst, n_seqs, cols->nb[1], cols->nb[2],
+                (n_conv + n_t - n_dst) * cols->nb[1]);
+        ggml_tensor * hist_all = ggml_reshape_3d(ctx, cache, channels, n_hist, n_cells);
+        ggml_tensor * hist_dst = ggml_view_3d(ctx, hist_all, channels, n_dst, n_seqs, hist_all->nb[1], hist_all->nb[2],
+                head * hist_all->nb[2]);
+        cpy_node = ggml_cpy(ctx, tail, hist_dst);
+
+        out_node = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, kernel));
+        ggml_set_name(out_node, "out");
+
+        cache_node = ggml_view_1d(ctx, cache, ggml_nelements(cache), 0);
+
+        if (mode == MODE_TEST) {
+            // the node order of the model graph: the CPY ahead of the conv, the cache read back last
+            ggml_build_forward_expand(gf, fill);
+            ggml_build_forward_expand(gf, rows);
+            ggml_build_forward_expand(gf, extra);
+            ggml_build_forward_expand(gf, cpy_node);
+            ggml_build_forward_expand(gf, out_node);
+            ggml_build_forward_expand(gf, cache_node);
+        }
+        return out_node;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src != nullptr) {
+                continue;
+            }
+            if (strcmp(t->name, "s_copy") == 0) {
+                std::vector<int32_t> data(n_seqs);
+                for (int64_t s = 0; s < n_seqs; s++) {
+                    data[s] = (int32_t) (head + (swap ? n_seqs - 1 - s : s));
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "rep_cols") == 0) {
+                // llm_graph_input_rs::set_input_rep: the window after the kept pending tokens
+                std::vector<int32_t> data(n_conv * n_seqs);
+                for (int64_t s = 0; s < n_seqs; s++) {
+                    for (int64_t c = 0; c < n_conv; c++) {
+                        data[s * n_conv + c] = (int32_t) ((rep + s) % (n_pend + 1) + c);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (t->type == GGML_TYPE_F32) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -13346,6 +13465,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}, fuse_bias));
                 test_cases.emplace_back(new test_ssm_conv_bias_silu(
                     GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}, fuse_bias));
+            }
+        }
+    }
+
+    // rs_replay conv chain: the Qwen3.5/3.6 shape at MTP n_max 4 (decode, verify, both seqs), and a
+    // small one with a partial work-group, swapped cells, a strided x and a prefill width
+    for (int64_t n_t : {1, 2, 5}) {
+        for (int64_t n_seqs : {1, 2}) {
+            for (int64_t rep = 0; rep <= 5; rep++) {
+                test_cases.emplace_back(new test_conv_replay_chain(10240, 5, n_t, n_seqs, rep));
+            }
+        }
+    }
+    for (int64_t n_t : {1, 2, 3, 4, 9}) {
+        for (int64_t n_seqs : {1, 2}) {
+            for (int64_t rep = 0; rep <= 3; rep++) {
+                test_cases.emplace_back(new test_conv_replay_chain(96, 3, n_t, n_seqs, rep, n_seqs == 2, (rep % 2) * 32));
             }
         }
     }

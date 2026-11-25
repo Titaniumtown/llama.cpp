@@ -7968,8 +7968,10 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
 // Deferring a cache read from a GET_ROWS to its consumer is sound only if nothing WRITES
 // the cache in between. Reads in between are irrelevant: the cache is not being modified,
 // only read later than it used to be.
+// Nodes in `skip` are folded away and never launch.
 static bool region_touched_between(const ggml_cgraph * cgraph, int from, int to, const ggml_tensor * cache,
-                                   bool include_reads) {
+                                   bool include_reads, const ggml_tensor * const * skip = nullptr,
+                                   int n_skip = 0) {
     const char * cache_beg = (const char *) cache->data;
     const size_t cache_len = ggml_nbytes(cache);
     auto hits_cache = [&](const ggml_tensor * t) {
@@ -7985,6 +7987,9 @@ static bool region_touched_between(const ggml_cgraph * cgraph, int from, int to,
             n->op == GGML_OP_VIEW || n->op == GGML_OP_PERMUTE || n->op == GGML_OP_NONE ||
             (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;  // not a launch, writes nothing
+        }
+        if (std::find(skip, skip + n_skip, n) != skip + n_skip) {
+            continue;
         }
         // a node writes its own tensor; CPY and SET_ROWS write through src[1] instead.
         // In-place ops alias src[0] into the node itself, so checking the node covers them.
@@ -8623,6 +8628,301 @@ static bool find_conv_collapse(const ggml_cgraph * cgraph, int concat_idx, const
     *out_conv = conv;
     *out_cpy  = cpy;
     *out_silu = silu;
+    return true;
+}
+
+// The rs_replay conv chain of build_conv_state_replay, at decode and MTP-verify widths:
+//   G = GET_ROWS(cache, s_copy), the histories; W = GET_ROWS(view(G), win_cols), the windows;
+//   CAT = CONCAT(W, x, 1); CPY(view(CAT) tail, cache); SSM_CONV(CONT(TRANSPOSE(CAT))) (+ SILU).
+// One dispatch at CAT reads the cache rows and x directly and writes the conv output and the
+// tail; G, W, CPY, CONT, SSM_CONV and SILU never launch. The cache read moves down from G to
+// CAT and both writes move up to CAT; the three hazard scans below clear exactly those moves.
+struct conv_replay_fold {
+    ggml_sycl_conv_replay_args args    = {};
+    const ggml_tensor *        anchor  = nullptr;  // CAT
+    const ggml_tensor *        skip[5] = {};       // W, CPY, CONT, SSM_CONV, SILU
+    int                        n_skip  = 0;
+    int                        pending = 0;        // anchor + skips not reached yet
+    uint64_t                   bytes   = 0;
+};
+
+static bool tensors_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * pa = (const char *) a->data;
+    const char * pb = (const char *) b->data;
+    return pa < pb + ggml_nbytes(b) && pb < pa + ggml_nbytes(a);
+}
+
+static bool find_conv_replay_fold(const ggml_cgraph * cgraph, int gi, conv_replay_fold * out) {
+    if (!ggml_sycl_conv_replay_fold_enabled()) {
+        return false;
+    }
+    constexpr int64_t NC = 3;  // d_conv 4
+    const ggml_tensor * g = cgraph->nodes[gi];
+    if (g->op != GGML_OP_GET_ROWS || g->type != GGML_TYPE_F32 || !ggml_is_contiguous(g) || g->ne[2] != 1) {
+        return false;
+    }
+    const ggml_tensor * states = g->src[0];
+    const ggml_tensor * rows   = g->src[1];
+    if (states == nullptr || rows == nullptr || states->type != GGML_TYPE_F32 || rows->type != GGML_TYPE_I32 ||
+        states->nb[0] != sizeof(float) || states->nb[1] % sizeof(float) != 0 || states->ne[2] != 1 ||
+        states->ne[3] != 1 || rows->nb[0] != sizeof(int32_t) || rows->ne[1] != 1) {
+        return false;
+    }
+
+    // Every reader of G, W, CAT and CONT, directly or through views, must be a chain node: their
+    // buffers are never written. The window finds the chain; the use counts prove nothing outside
+    // it reads them.
+    enum { T_G, T_W, T_CAT, T_TAIL, T_TR, T_CONT };
+    constexpr int       MAX_TRK = 16;
+    const ggml_tensor * trk[MAX_TRK];
+    int                 trk_idx[MAX_TRK];
+    int                 trk_role[MAX_TRK];
+    int                 trk_refs[MAX_TRK] = {};
+    int                 n_trk             = 0;
+    auto track = [&](const ggml_tensor * t, int idx, int role) {
+        if (n_trk == MAX_TRK) {
+            return false;
+        }
+        trk[n_trk]      = t;
+        trk_idx[n_trk]  = idx;
+        trk_role[n_trk] = role;
+        n_trk++;
+        return true;
+    };
+    auto find = [&](const ggml_tensor * t) {
+        for (int k = 0; k < n_trk; k++) {
+            if (trk[k] == t) {
+                return k;
+            }
+        }
+        return -1;
+    };
+    track(g, gi, T_G);
+
+    const ggml_tensor * w    = nullptr;
+    const ggml_tensor * cat  = nullptr;
+    const ggml_tensor * tail = nullptr;
+    const ggml_tensor * tr   = nullptr;
+    const ggml_tensor * cpy  = nullptr;
+    const ggml_tensor * cont = nullptr;
+    const ggml_tensor * conv = nullptr;
+    int cat_idx = -1, cpy_idx = -1, conv_idx = -1;
+
+    const int end = std::min(cgraph->n_nodes, gi + 64);
+    for (int j = gi + 1; j < end && conv == nullptr; j++) {
+        // build_rs leaves W a few nodes after G; most GET_ROWS are not this chain and stop here
+        if (w == nullptr && j > gi + 16) {
+            return false;
+        }
+        const ggml_tensor * n = cgraph->nodes[j];
+        bool reads = false;
+        for (int k = 0; k < GGML_MAX_SRC; k++) {
+            const int t = n->src[k] != nullptr ? find(n->src[k]) : -1;
+            if (t >= 0) {
+                trk_refs[t]++;
+                reads = true;
+                if (k != 0) {
+                    return false;  // every chain node reads the chain through src[0]
+                }
+            }
+        }
+        if (!reads) {
+            continue;
+        }
+        const int  p    = find(n->src[0]);
+        const int  pr   = trk_role[p];
+        const bool view = n->op == GGML_OP_VIEW || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_PERMUTE ||
+                          n->op == GGML_OP_TRANSPOSE;
+        bool ok = false;
+        if (pr == T_G) {
+            if (view) {
+                ok = track(n, j, T_G);
+            } else if (ggml_is_empty(n)) {
+                ok = true;  // build_rs's copy of the extra states, empty when n_rs == n_seqs
+            } else if (n->op == GGML_OP_GET_ROWS && w == nullptr) {
+                w  = n;
+                ok = track(n, j, T_W);
+            }
+        } else if (pr == T_W) {
+            if (n->op == GGML_OP_CONCAT && cat == nullptr) {
+                cat     = n;
+                cat_idx = j;
+                ok      = track(n, j, T_CAT);
+            }
+        } else if (pr == T_CAT) {
+            if (n->op == GGML_OP_VIEW && tail == nullptr) {
+                tail = n;
+                ok   = track(n, j, T_TAIL);
+            } else if (n->op == GGML_OP_TRANSPOSE && tr == nullptr) {
+                tr = n;
+                ok = track(n, j, T_TR);
+            }
+        } else if (pr == T_TAIL) {
+            if (n->op == GGML_OP_CPY && cpy == nullptr) {
+                cpy     = n;
+                cpy_idx = j;
+                ok      = true;
+            }
+        } else if (pr == T_TR) {
+            if (n->op == GGML_OP_CONT && cont == nullptr) {
+                cont = n;
+                ok   = track(n, j, T_CONT);
+            }
+        } else if (pr == T_CONT) {
+            if (n->op == GGML_OP_SSM_CONV) {
+                conv     = n;
+                conv_idx = j;
+                ok       = true;
+            }
+        }
+        if (!ok) {
+            return false;
+        }
+    }
+    if (w == nullptr || cat == nullptr || tail == nullptr || tr == nullptr || cpy == nullptr || cont == nullptr ||
+        conv == nullptr) {
+        return false;
+    }
+    for (int t = 0; t < n_trk; t++) {
+        if (ggml_node_get_use_count(cgraph, trk_idx[t]) != trk_refs[t]) {
+            return false;
+        }
+    }
+
+    // shapes: hist [C, n_hist, n_s] is a view of G with one G row per seq
+    const ggml_tensor * hist = w->src[0];
+    const ggml_tensor * win  = w->src[1];
+    const ggml_tensor * x    = cat->src[1];
+    const int64_t       C    = hist->ne[0];
+    const int64_t       n_s  = hist->ne[2];
+    const int64_t       n_t  = cat->ne[1] - NC;
+    if (n_t < 1 || n_t > GGML_SYCL_CONV_REPLAY_MAX_T || n_s < 1 || n_s > GGML_SYCL_CONV_REPLAY_MAX_NS) {
+        return false;
+    }
+    if (hist->ne[3] != 1 || hist->nb[0] != sizeof(float) || hist->nb[1] % sizeof(float) != 0 ||
+        hist->nb[2] != g->nb[1]) {
+        return false;
+    }
+    if (win == nullptr || win->type != GGML_TYPE_I32 || win->ne[0] != NC || win->ne[1] != n_s || win->ne[2] != 1 ||
+        win->ne[3] != 1 || win->nb[0] != sizeof(int32_t) || win->nb[1] % sizeof(int32_t) != 0) {
+        return false;
+    }
+    if (w->type != GGML_TYPE_F32 || w->ne[0] != C || w->ne[1] != NC || w->ne[2] != n_s || w->ne[3] != 1) {
+        return false;
+    }
+    if (cat->type != GGML_TYPE_F32 || ((const int32_t *) cat->op_params)[0] != 1 || cat->ne[0] != C ||
+        cat->ne[2] != n_s || cat->ne[3] != 1) {
+        return false;
+    }
+    if (x == nullptr || x->type != GGML_TYPE_F32 || x->ne[0] != C || x->ne[1] != n_t || x->ne[2] != n_s ||
+        x->ne[3] != 1 || x->nb[0] != sizeof(float) || x->nb[1] % sizeof(float) != 0 ||
+        x->nb[2] % sizeof(float) != 0) {
+        return false;
+    }
+    const ptrdiff_t hoff = (const char *) hist->data - (const char *) g->data;
+    if (hoff < 0 || hoff % sizeof(float) != 0) {
+        return false;
+    }
+    const int64_t row0  = hoff / g->nb[1];
+    const size_t  inner = hoff % g->nb[1];
+    if (row0 + n_s > g->ne[1] ||
+        (int64_t) (inner + (hist->ne[1] - 1) * hist->nb[1]) / (int64_t) sizeof(float) + C > g->ne[0]) {
+        return false;
+    }
+    if (tr->ne[0] != NC + n_t || tr->ne[1] != C || tr->ne[2] != n_s || cont->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const ggml_tensor * wt = conv->src[1];
+    if (conv->type != GGML_TYPE_F32 || conv->ne[0] != C || conv->ne[1] != n_t || conv->ne[2] != n_s ||
+        wt == nullptr || wt->type != GGML_TYPE_F32 || wt->ne[0] != NC + 1 || wt->ne[1] != C ||
+        wt->nb[0] != sizeof(float) || wt->nb[1] != (NC + 1) * sizeof(float)) {
+        return false;
+    }
+    const ggml_tensor * silu =
+        ggml_sycl_can_fuse(cgraph, conv_idx, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU }) ?
+            cgraph->nodes[conv_idx + 1] :
+            nullptr;
+    const ggml_tensor * res = silu != nullptr ? silu : conv;
+    if (res->type != GGML_TYPE_F32 || res->nb[0] != sizeof(float) || res->nb[1] % sizeof(float) != 0 ||
+        res->nb[2] % sizeof(float) != 0) {
+        return false;
+    }
+    const ptrdiff_t toff = (const char *) tail->data - (const char *) cat->data;
+    if (tail->ne[0] != C || tail->ne[2] != n_s || tail->ne[3] != 1 || tail->nb[0] != cat->nb[0] ||
+        tail->nb[1] != cat->nb[1] || tail->nb[2] != cat->nb[2] || toff < 0 || toff % cat->nb[1] != 0) {
+        return false;
+    }
+    const int64_t       j0    = toff / cat->nb[1];
+    const int64_t       n_dst = tail->ne[1];
+    const ggml_tensor * dst   = cpy->src[1];
+    if (n_dst < 1 || j0 + n_dst > NC + n_t || dst == nullptr || dst->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(dst, tail) || dst->nb[0] != sizeof(float) || dst->nb[1] % sizeof(float) != 0 ||
+        dst->nb[2] % sizeof(float) != 0) {
+        return false;
+    }
+
+    // The kernel reads and writes the cache in one launch. Per-channel ownership makes that safe
+    // only if every read and write offset is a multiple of the channel count from one base.
+    const ggml_tensor * cache = states->view_src != nullptr ? states->view_src : states;
+    if (tensors_overlap(dst, cache)) {
+        const ptrdiff_t m = C * sizeof(float);
+        const ptrdiff_t d = (const char *) dst->data - (const char *) states->data;
+        if (d % m != 0 || (ptrdiff_t) states->nb[1] % m != 0 || (ptrdiff_t) inner % m != 0 ||
+            (ptrdiff_t) hist->nb[1] % m != 0 || (ptrdiff_t) dst->nb[1] % m != 0 || (ptrdiff_t) dst->nb[2] % m != 0) {
+            return false;
+        }
+    }
+    if (tensors_overlap(res, cache) || tensors_overlap(res, x) || tensors_overlap(res, rows) ||
+        tensors_overlap(res, win) || tensors_overlap(res, dst) || tensors_overlap(dst, x) ||
+        tensors_overlap(dst, rows) || tensors_overlap(dst, win)) {
+        return false;
+    }
+
+    // the cache read moves from G to CAT: nothing in between may write the cache; the two writes
+    // move up to CAT: nothing in between may read or write their destinations
+    const ggml_tensor * chain[]  = { g, w, cat, cpy, cont, conv, silu };
+    const int           n_chain  = silu != nullptr ? 7 : 6;
+    const int           res_idx  = silu != nullptr ? conv_idx + 1 : conv_idx;
+    if (region_touched_between(cgraph, gi + 1, cat_idx, cache, /*include_reads=*/false, chain, n_chain) ||
+        region_touched_between(cgraph, cat_idx + 1, cpy_idx, dst, /*include_reads=*/true, chain, n_chain) ||
+        region_touched_between(cgraph, cat_idx + 1, res_idx, res, /*include_reads=*/true, chain, n_chain)) {
+        return false;
+    }
+
+    ggml_sycl_conv_replay_args & a = out->args;
+    a.cache      = (const float *) states->data;
+    a.row_stride = states->nb[1] / sizeof(float);
+    a.rows       = (const int32_t *) rows->data + row0;
+    a.hist_off   = inner / sizeof(float);
+    a.col_stride = hist->nb[1] / sizeof(float);
+    a.win        = (const int32_t *) win->data;
+    a.win_stride = win->nb[1] / sizeof(int32_t);
+    a.x          = (const float *) x->data;
+    a.x_t        = x->nb[1] / sizeof(float);
+    a.x_s        = x->nb[2] / sizeof(float);
+    a.w          = (const float *) wt->data;
+    a.out        = (float *) res->data;
+    a.out_t      = res->nb[1] / sizeof(float);
+    a.out_s      = res->nb[2] / sizeof(float);
+    a.hd         = (float *) dst->data;
+    a.hd_col     = dst->nb[1] / sizeof(float);
+    a.hd_s       = dst->nb[2] / sizeof(float);
+    a.channels   = (int) C;
+    a.n_t        = (int) n_t;
+    a.n_s        = (int) n_s;
+    a.j0         = (int) j0;
+    a.n_dst      = (int) n_dst;
+    a.silu       = silu != nullptr;
+
+    out->anchor = cat;
+    out->n_skip = 0;
+    for (const ggml_tensor * t : { w, cpy, cont, conv, silu }) {
+        if (t != nullptr) {
+            out->skip[out->n_skip++] = t;
+        }
+    }
+    out->pending = out->n_skip + 1;
+    out->bytes   = (uint64_t) n_s * C * sizeof(float) * (NC + 2 * n_t + n_dst) + (uint64_t) C * (NC + 1) * sizeof(float);
     return true;
 }
 
@@ -9472,6 +9772,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     ggml_tensor * collapse_conv = nullptr;
     ggml_tensor * collapse_cpy  = nullptr;
     ggml_tensor * collapse_silu = nullptr;
+    // the rs_replay conv chain registered at its gather: dispatched at the CONCAT, the rest skipped
+    conv_replay_fold replay;
+    bool             replay_live = false;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         sycl_ctx->cur_node = i;
@@ -9482,6 +9785,22 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                        "outstanding at node %d (its last consumer is node %d); "
                        "set GGML_SYCL_ELIDE_F32=0", sycl_ctx->elide_f32.node,
                        sycl_ctx->elide_f32.remaining, i, sycl_ctx->elide_f32.last);
+        }
+        if (replay_live) {
+            if (node == replay.anchor) {
+                prof.mark_cheap("HOST/pre-node", 0);
+                ggml_sycl_ssm_conv_replay(*sycl_ctx, replay.args);
+                prof.mark_cheap("SSM_CONV/replay-fold", replay.bytes);
+                replay.anchor = nullptr;
+                replay_live   = --replay.pending > 0;
+                continue;
+            }
+            const ggml_tensor ** sk = std::find(replay.skip, replay.skip + replay.n_skip, node);
+            if (sk != replay.skip + replay.n_skip) {
+                *sk         = nullptr;
+                replay_live = --replay.pending > 0;
+                continue;
+            }
         }
         // the collapsed conv at the CONCAT above already did all three of these
         if (node == collapse_cpy) {
@@ -9585,6 +9904,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
 #endif
         if (node->op == GGML_OP_GET_ROWS && g_ggml_sycl_enable_fusion) {
+            if (!replay_live && find_conv_replay_fold(cgraph, i, &replay)) {
+                replay_live = true;
+                continue;  // no dispatch: the CONCAT reads the cache rows itself
+            }
             ggml_tensor * cat_st = find_conv_state_gather(prof, cgraph, i);
             if (ggml_tensor * cat = cat_st) {
                 concat_fold_gather = cat;
@@ -9993,6 +10316,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     GGML_ASSERT(ssm_wb_conv == nullptr && "conv-state writeback skipped but never performed");
     GGML_ASSERT(collapse_conv == nullptr && collapse_cpy == nullptr && collapse_silu == nullptr &&
                 "conv chain collapsed but a node it absorbed was never reached");
+    GGML_ASSERT(!replay_live && "replay conv chain folded but a node it absorbed was never reached");
     GGML_ASSERT(pair_skip_lo == -1 && "mat-vec pair folded but a node it absorbed was never reached");
     for (const auto & sk : pair_skip_node) {
         GGML_ASSERT(sk == nullptr && "mat-vec pair folded but a node it absorbed was never reached");

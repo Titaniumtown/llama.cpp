@@ -176,12 +176,11 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
     };
     const bool plain_pair   = plain_type(wu->type) && plain_type(wg->type);
 #ifdef GGML_SYCL_MMVQ_HAS_XMX
-    // same-type pairs of the types of the XMX kernels, which also take a few more columns
-    // (the XMX kernels walk whole QK_K super-blocks, so they need rows of a multiple of QK_K)
+    // same-type pairs the XMX kernels cover; they take more columns than the reorder GEMV
     const bool xmx_pair = wu->type == wg->type && ggml_sycl_xmx_supports_type(wu->type) && wu->ne[0] % QK_K == 0;
 #else
     const bool xmx_pair = false;
-#endif // GGML_SYCL_MMVQ_HAS_XMX
+#endif
     // the ESIMD kernel covers same-type q2_K..q6_K and q8_0, plus mixed q2_K..q6_K gate/up
     // pairs, single activation column only (as unfused DMMV)
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD

@@ -9699,7 +9699,15 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 node->src[0]->extra != nullptr &&
                 ((ggml_tensor_extra_gpu *) node->src[0]->extra)->optimized_feature.reorder &&
                 ggml_sycl_info().device_count == 1;
-            if (pattern_ok) {
+            // Where the XMX mat-vec takes this width, the anchor runs it unfused and the standalone SWIGLU
+            // (which emits ffn_down's q8_1 copy) follows. FFN_CHAIN q4_K/q5_K/q5_K, us per layer, epilogue
+            // -> unfused: n2 315.1 -> 312.9, n5 348.5 -> 333.4, n8 392.3 -> 343.1.
+            const int64_t ncols      = node->src[1]->ne[1];
+            const bool    xmx_anchor = ncols >= 2 && ggml_sycl_xmx_enabled(sycl_ctx->device) &&
+                                    ggml_sycl_xmx_supports_type(node->src[0]->type) &&
+                                    ncols >= ggml_sycl_xmx_min_cols(node->src[0]->type) &&
+                                    ncols <= g_ggml_sycl_xmx_max_cols;
+            if (pattern_ok && !xmx_anchor) {
                 sycl_ctx->mmvq_glu_epi_out          = glu;
                 sycl_ctx->mmvq_glu_epi_other        = first;
                 sycl_ctx->mmvq_glu_epi_anchor_is_up = glu->src[1] == node;

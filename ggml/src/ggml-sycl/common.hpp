@@ -252,8 +252,9 @@ typedef sycl::float2 dfloat2;
 #    define GGML_SYCL_MMVQ_HAS_XMX
 #endif // GGML_SYCL_SUPPORT_XMX && __INTEL_LLVM_COMPILER
 
-// default of the most columns the XMX mul_mat_vec_q handles (GGML_SYCL_XMX_MAX_COLS), wider batches use other kernels
-#define GGML_SYCL_XMX_MAX_COLS_DEFAULT 80
+// default of the most columns the XMX mul_mat_vec_q handles (GGML_SYCL_XMX_MAX_COLS), wider batches use other kernels;
+// the widths up to here are the ones measured faster and tested with the defective-EU repair
+#define GGML_SYCL_XMX_MAX_COLS_DEFAULT 16
 
 // most columns the fused gate and up XMX kernel is built for, GGML_SYCL_XMX_GLU_MAX_COLS can only lower this limit
 #define GGML_SYCL_XMX_GLU_MAX_COLS 16
@@ -379,9 +380,12 @@ void ggml_sycl_dpas_check(int device);
 // the self-test found wrong DPAS results on the device and GGML_SYCL_DPAS_CHECK=1 keeps the integer DPAS kernels off it
 bool ggml_sycl_dpas_faulty(int device);
 
+// the device's DPAS self-test leaves the XMX mat-vec a defect it repairs, or none (mmvq.cpp); false before it ran
+bool ggml_sycl_xmx_usable(int device);
+
 static inline bool ggml_sycl_xmx_enabled(int device) {
     return g_ggml_sycl_enable_xmx_esimd && ggml_sycl_xmx_supports_arch(ggml_sycl_info().devices[device].hw_info.arch) &&
-           !ggml_sycl_dpas_faulty(device);
+           ggml_sycl_xmx_usable(device);
 }
 
 static constexpr size_t SYCL_BUFFER_ALIGNMENT = 128;

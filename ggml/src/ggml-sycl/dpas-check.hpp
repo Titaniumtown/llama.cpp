@@ -140,4 +140,30 @@ static inline std::string ggml_sycl_dpas_describe(const ggml_sycl_dpas_health & 
     return s + buf;
 }
 
+// The XMX mat-vec issues independent DPAS: it runs when every EU was tested and one EU at most gets one lane of a
+// single DPAS wrong, a lane it recomputes on that EU without DPAS (lane -1 when no lane is wrong).
+static inline bool ggml_sycl_dpas_lane_repair(const ggml_sycl_dpas_health & h, uint32_t & eu, int & lane) {
+    eu   = ~0u;
+    lane = -1;
+    if (!h.complete()) {
+        return false;
+    }
+    for (const ggml_sycl_dpas_fault & f : h.faults) {
+        if (f.lanes == 0) {
+            continue;
+        }
+        if (lane >= 0 || (f.lanes & (f.lanes - 1)) != 0) {
+            eu   = ~0u;
+            lane = -1;
+            return false;
+        }
+        eu   = f.eu;
+        lane = __builtin_ctz(f.lanes);
+    }
+    return true;
+}
+
+// the outcome of the device's self-test, set before ggml_sycl_dpas_check returns
+const ggml_sycl_dpas_health & ggml_sycl_dpas_get_health(int device);
+
 #endif // GGML_SYCL_DPAS_CHECK_HPP

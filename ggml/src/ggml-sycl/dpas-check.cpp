@@ -18,6 +18,12 @@ bool ggml_sycl_dpas_faulty(int device) {
     return g_ggml_sycl_dpas_faulty[device];
 }
 
+static ggml_sycl_dpas_health g_ggml_sycl_dpas_health[GGML_SYCL_MAX_DEVICES];
+
+const ggml_sycl_dpas_health & ggml_sycl_dpas_get_health(int device) {
+    return g_ggml_sycl_dpas_health[device];
+}
+
 #if GGML_SYCL_DPAS_CHECK_BUILD
 
 typedef short dpas_check_short8 __attribute__((ext_vector_type(8)));
@@ -260,6 +266,7 @@ static void ggml_sycl_dpas_self_test(int device) try {
     }
     sycl::free(d_cases, q);
     sycl::free(d_out, q);
+    g_ggml_sycl_dpas_health[device] = h;
 
     GGML_SYCL_DEBUG("[SYCL] %s: device %d: %d sub-groups, %.1f ms\n", __func__, device, (int) records.size(),
                     (ggml_time_us() - t0) / 1000.0);
@@ -273,11 +280,21 @@ static void ggml_sycl_dpas_self_test(int device) try {
 
     // the kernels with an int32 accumulator, where a wrong lane is off by orders of magnitude
     g_ggml_sycl_dpas_faulty[device] = g_ggml_sycl_dpas_check == 1;
-    if (g_ggml_sycl_dpas_faulty[device]) {
-        GGML_LOG_WARN("%s: device %d: the XMX mat-vec and DPAS flash attention stay off, other XMX kernels can still "
-                      "give wrong results (GGML_SYCL_DPAS_CHECK=2 keeps them on)\n",
-                      __func__, device);
+
+    std::string resp;
+    uint32_t    eu;
+    int         lane;
+    if (g_ggml_sycl_enable_xmx_esimd && ggml_sycl_xmx_supports_arch(ggml_sycl_info().devices[device].hw_info.arch)) {
+        if (!ggml_sycl_dpas_lane_repair(h, eu, lane)) {
+            resp += "the XMX mat-vec stays off, ";
+        } else if (lane >= 0) {
+            resp += "the XMX mat-vec recomputes lane " + std::to_string(lane) + " on that EU without DPAS, ";
+        }
     }
+    if (g_ggml_sycl_dpas_faulty[device]) {
+        resp += "DPAS flash attention stays off (GGML_SYCL_DPAS_CHECK=2 keeps it on), ";
+    }
+    GGML_LOG_WARN("%s: device %d: %sother XMX kernels can still give wrong results\n", __func__, device, resp.c_str());
 } catch (const std::exception & e) {
     GGML_LOG_WARN("%s: device %d: the DPAS self-test did not run: %s\n", __func__, device, e.what());
 }

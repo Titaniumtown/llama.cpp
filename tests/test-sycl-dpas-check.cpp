@@ -182,6 +182,38 @@ int main() {
         check(!h.complete() && h.n_eu_seen == 0 && h.faults.empty(), "not run: nothing proven");
     }
 
+    // the XMX mat-vec's repair: one lane of a single DPAS on one EU, with every EU tested
+    {
+        uint32_t eu;
+        int      lane;
+        auto     records = make_device(xe2, 8, 4, 8, 8);
+        check(ggml_sycl_dpas_lane_repair(ggml_sycl_dpas_evaluate(xe2, 256, records), eu, lane) && lane == -1,
+              "lane repair: healthy device, nothing to recompute");
+
+        auto chain = records;
+        make_fault(chain, 0x0a30, mask, 0, 0x8000);
+        check(ggml_sycl_dpas_lane_repair(ggml_sycl_dpas_evaluate(xe2, 256, chain), eu, lane) && lane == -1,
+              "lane repair: a fault only in dependent DPAS leaves single DPAS alone");
+
+        make_fault(records, 0x0a30, mask, 0x0080, 0x8080);
+        check(ggml_sycl_dpas_lane_repair(ggml_sycl_dpas_evaluate(xe2, 256, records), eu, lane) && eu == 0x0a30 &&
+                  lane == 7,
+              "lane repair: the B70's lane 7");
+
+        auto two_eu = records;
+        make_fault(two_eu, 0x0040, mask, 0x0001, 0x0001);
+        check(!ggml_sycl_dpas_lane_repair(ggml_sycl_dpas_evaluate(xe2, 256, two_eu), eu, lane) && lane == -1,
+              "lane repair: not two EUs");
+
+        auto two_lanes = records;
+        make_fault(two_lanes, 0x0a30, mask, 0x0081, 0x0081);
+        check(!ggml_sycl_dpas_lane_repair(ggml_sycl_dpas_evaluate(xe2, 256, two_lanes), eu, lane),
+              "lane repair: not two lanes");
+
+        check(!ggml_sycl_dpas_lane_repair(ggml_sycl_dpas_evaluate(xe2, 257, records), eu, lane),
+              "lane repair: not without every EU tested");
+    }
+
     if (n_fail) {
         fprintf(stderr, "%d checks failed\n", n_fail);
         return 1;

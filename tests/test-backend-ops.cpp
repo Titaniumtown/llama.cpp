@@ -2779,7 +2779,8 @@ struct test_mul_mat_reorder_then_big_batch : public test_case {
 // install the weight reorder first, so the triple itself is eligible for the backend's fused
 // dispatches: the SYCL SWIGLU epilogue writes the GLU output from the second mat-vec's store,
 // the same-type gate+up kernels (reorder or XMX) write it from one launch, and in both the
-// GLU node never runs. The XMX mat-vec must not take a dispatch that carries such a fusion.
+// GLU node never runs. The XMX mat-vec must not take a dispatch that carries such a fusion; where it
+// serves the width, the backend leaves the triple unfused.
 struct test_mul_mat_glu_mixed : public test_case {
     const ggml_type type_gate;
     const ggml_type type_up;
@@ -2820,6 +2821,272 @@ struct test_mul_mat_glu_mixed : public test_case {
 
         // warm is the first source, so the reorder-installing mat-vecs run before the triple
         ggml_tensor * out = ggml_add(ctx, ggml_repeat(ctx, warm, glu), glu);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// The (gate, up, SWIGLU) triple anchored at the GATE: the up mat-vec dispatches first, so the
+// SWIGLU epilogue (at widths the XMX mat-vec does not take) runs with the activated half as the
+// anchor (anchor_is_up false). The gate reads the up output as its activation, which makes the up
+// node the gate's direct parent and puts the three nodes in the order the epilogue needs; k == m.
+struct test_mul_mat_glu_gate_anchor : public test_case {
+    const ggml_type type_gate;
+    const ggml_type type_up;
+    const int64_t   m;
+    const int64_t   n;
+
+    std::string vars() override { return VARS_TO_STR4(type_gate, type_up, m, n); }
+
+    test_mul_mat_glu_gate_anchor(ggml_type type_gate, ggml_type type_up, int64_t m, int64_t n) :
+        type_gate(type_gate),
+        type_up(type_up),
+        m(m),
+        n(n) {}
+
+    double max_nmse_err() override { return 5e-4; }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * wg = ggml_new_tensor_2d(ctx, type_gate, m, m);
+        ggml_set_name(wg, "wg");
+        ggml_tensor * wu = ggml_new_tensor_2d(ctx, type_up, m, m);
+        ggml_set_name(wu, "wu");
+        ggml_tensor * x0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, 1);
+        ggml_set_name(x0, "x0");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * warm = ggml_add(ctx, ggml_mul_mat(ctx, wg, x0), ggml_mul_mat(ctx, wu, x0));
+        ggml_set_name(warm, "warm");
+
+        ggml_tensor * up = ggml_mul_mat(ctx, wu, x);
+        ggml_set_name(up, "up");
+        ggml_tensor * glu = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, wg, up), up);
+        ggml_set_name(glu, "glu");
+
+        ggml_tensor * out = ggml_add(ctx, ggml_repeat(ctx, warm, glu), glu);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// perf only: reps decode FFN blocks (rms_norm, gate, up, SWIGLU, down) in one graph, the shape the
+// SWIGLU epilogue serves in a server. op_size is inflated so the perf loop never duplicates the
+// output node: the time per run is one whole graph.
+struct test_ffn_chain_perf : public test_case {
+    const ggml_type type_gate;
+    const ggml_type type_up;
+    const ggml_type type_down;
+    const int64_t   m;
+    const int64_t   n;
+    const int64_t   k;
+    const int       reps;
+
+    std::string vars() override { return VARS_TO_STR7(type_gate, type_up, type_down, m, n, k, reps); }
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FFN_CHAIN";
+    }
+
+    test_ffn_chain_perf(ggml_type type_gate, ggml_type type_up, ggml_type type_down, int64_t m, int64_t n,
+                        int64_t k, int reps) :
+        type_gate(type_gate),
+        type_up(type_up),
+        type_down(type_down),
+        m(m),
+        n(n),
+        k(k),
+        reps(reps) {}
+
+    bool run_whole_graph() override { return true; }
+
+    size_t op_size(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return size_t(1) << 40;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * wg = ggml_new_tensor_2d(ctx, type_gate, k, m);
+        ggml_tensor * wu = ggml_new_tensor_2d(ctx, type_up, k, m);
+        ggml_tensor * wd = ggml_new_tensor_2d(ctx, type_down, m, k);
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        for (int r = 0; r < reps; ++r) {
+            ggml_tensor * h = ggml_rms_norm(ctx, cur, 1e-6f);
+            cur = ggml_mul_mat(ctx, wd, ggml_swiglu_split(ctx, ggml_mul_mat(ctx, wg, h), ggml_mul_mat(ctx, wu, h)));
+        }
+        return cur;
+    }
+};
+
+// mat-vec over a weight whose output is read only up to row `limit` (the MTP draft head's vocab
+// shortlist, ggml_mul_mat_set_row_limit); the backend fills the rest with -INF. The CPU reference
+// ignores the limit, so only the output, the first `limit` rows, is compared (a whole-graph test).
+struct test_mul_mat_row_limit : public test_case {
+    const ggml_type type;
+    const int64_t   m;
+    const int64_t   n;
+    const int64_t   k;
+    const int64_t   limit;
+
+    std::string vars() override { return VARS_TO_STR5(type, m, n, k, limit); }
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ROW_LIMIT";
+    }
+
+    test_mul_mat_row_limit(ggml_type type, int64_t m, int64_t n, int64_t k, int64_t limit) :
+        type(type),
+        m(m),
+        n(n),
+        k(k),
+        limit(limit) {}
+
+    double max_nmse_err() override { return 5e-4; }
+
+    bool run_whole_graph() override { return true; }
+
+    // the limited rows of the weight, the activations and the output
+    size_t op_size(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return limit * ggml_row_size(type, k) + n * k * sizeof(float) + n * m * sizeof(float);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_set_name(w, "w");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+        ggml_tensor * mm = ggml_mul_mat(ctx, w, x);
+        ggml_mul_mat_set_row_limit(mm, (int32_t) limit);
+        ggml_set_name(mm, "mm");
+        if (mode == MODE_PERF) {
+            return mm;
+        }
+        ggml_tensor * out = ggml_cont(ctx, ggml_view_2d(ctx, mm, limit, n, mm->nb[1], 0));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// k x m weight whose reorder is installed by a one-column mul_mat first, then an n-column
+// mul_mat on it: the second one is the decode / verify mat-vec of a warm server, which a
+// lone test_mul_mat does not reach at one column (the cold dispatch picks DMMV there).
+struct test_mul_mat_warm : public test_case {
+    const ggml_type type;
+    const int64_t   m;
+    const int64_t   n;
+    const int64_t   k;
+
+    std::string vars() override { return VARS_TO_STR4(type, m, n, k); }
+
+    test_mul_mat_warm(ggml_type type = GGML_TYPE_Q4_K, int64_t m = 64, int64_t n = 2, int64_t k = 1024) :
+        type(type),
+        m(m),
+        n(n),
+        k(k) {}
+
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_set_name(w, "w");
+        ggml_tensor * x1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(x1, "x1");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * mm1 = ggml_mul_mat(ctx, w, x1);
+        ggml_set_name(mm1, "mm1");
+        ggml_tensor * mm2 = ggml_mul_mat(ctx, w, x);
+        ggml_set_name(mm2, "mm2");
+
+        // mm1 is the first source, so the reorder-installing mul_mat runs before mm2
+        ggml_tensor * out = ggml_add(ctx, ggml_repeat(ctx, mm1, mm2), mm2);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// two one-column mat-vecs of one type over one activation, whose weights already carry the reorder (installed by a
+// two-column mat-vec, as a server's prefill does): the backend runs the pair as one dispatch that writes both
+// outputs, so no kernel that writes only its own node may take it
+struct test_mul_mat_pair_fused : public test_case {
+    const ggml_type type;
+    const int64_t   m;
+    const int64_t   k;
+
+    std::string vars() override { return VARS_TO_STR3(type, m, k); }
+
+    test_mul_mat_pair_fused(ggml_type type = GGML_TYPE_Q4_K, int64_t m = 6144, int64_t k = 5120) :
+        type(type),
+        m(m),
+        k(k) {}
+
+    double max_nmse_err() override { return 5e-4; }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w1 = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_set_name(w1, "w1");
+        ggml_tensor * w2 = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_set_name(w2, "w2");
+        ggml_tensor * x0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 2);
+        ggml_set_name(x0, "x0");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * warm = ggml_add(ctx, ggml_mul_mat(ctx, w1, x0), ggml_mul_mat(ctx, w2, x0));
+        ggml_set_name(warm, "warm");
+        ggml_tensor * pair = ggml_add(ctx, ggml_mul_mat(ctx, w1, x), ggml_mul_mat(ctx, w2, x));
+        ggml_set_name(pair, "pair");
+
+        // warm is the first source, so the reorder-installing mat-vecs run before the pair
+        ggml_tensor * out = ggml_add(ctx, ggml_view_2d(ctx, warm, m, 1, warm->nb[1], 0), pair);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// the GDN decay chain (q4_K one-column mat-vec, reshape, + bias, softplus, * scale) on a weight that already carries
+// the reorder: the backend folds the three ops into the mat-vec's store and never runs them, so only the kernel
+// that implements that store may take the mat-vec
+struct test_mul_mat_dsa_fused : public test_case {
+    const int64_t m;
+    const int64_t k;
+
+    std::string vars() override { return VARS_TO_STR2(m, k); }
+
+    test_mul_mat_dsa_fused(int64_t m = 6144, int64_t k = 5120) : m(m), k(k) {}
+
+    double max_nmse_err() override { return 5e-4; }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, k, m);
+        ggml_set_name(w, "w");
+        ggml_tensor * x0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 2);
+        ggml_set_name(x0, "x0");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(x, "x");
+        ggml_tensor * bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, 1);
+        ggml_set_name(bias, "bias");
+        ggml_tensor * scale = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, 1);
+        ggml_set_name(scale, "scale");
+
+        ggml_tensor * warm = ggml_mul_mat(ctx, w, x0);
+        ggml_set_name(warm, "warm");
+        ggml_tensor * mm = ggml_mul_mat(ctx, w, x);
+        ggml_set_name(mm, "mm");
+        ggml_tensor * chain =
+            ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, ggml_reshape_2d(ctx, mm, m, 1), bias)), scale);
+        ggml_set_name(chain, "chain");
+
+        // warm is the first source, so the reorder-installing mat-vec runs before the chain
+        ggml_tensor * out = ggml_add(ctx, ggml_view_2d(ctx, warm, m, 1, warm->nb[1], 0), chain);
         ggml_set_name(out, "out");
         return out;
     }
@@ -6144,6 +6411,29 @@ struct test_mul_mat : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
+// test_mul_mat whose error is the largest single deviation, max |a - b| / rms(b), not the NMSE: the NMSE averages
+// a wrong output channel of one EU (about one output in 2048, a few rms off each) down to a pass
+struct test_mul_mat_gemm_max : public test_mul_mat {
+    test_mul_mat_gemm_max(ggml_type type_a, int64_t m, int64_t n, int64_t k) :
+        test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_GEMM_MAX";
+    }
+
+    double max_nmse_err() override { return 0.1; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double max_d = 0.0, ss = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            max_d = std::max(max_d, std::fabs((double) a[i] - (double) b[i]));
+            ss += (double) b[i] * b[i];
+        }
+        return max_d / std::sqrt(ss / n);
     }
 };
 
@@ -13204,18 +13494,35 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n : { 1, 5 }) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 5120, n, 5120, {2, 1}, {1, 1}));
     }
-    // the production FFN triple (gate 17408x5120): mixed q4_K/q5_K at one column, solo verify (5),
-    // the widest mat-vec epilogue width (8) and the paired verify (10); same-type pairs at the
-    // paired verify and a full XMX GLU tile (16). GGML_SYCL_FUSE_GLU=16 lets the same-type
-    // triples reach the fused gate+up dispatch above one column.
-    for (int n : { 1, 5, 8, 10 }) {
+    // the production FFN triple (gate 17408x5120): mixed q4_K/q5_K and same-type pairs at every
+    // width of the SWIGLU epilogue (2..8, the mixed pair also at one column), the paired verify (10)
+    // and a full XMX GLU tile (16). GGML_SYCL_FUSE_GLU=16 lets the same-type triples reach the
+    // fused gate+up dispatch above one column.
+    for (int n : { 1, 2, 3, 4, 5, 6, 7, 8, 10 }) {
         test_cases.emplace_back(new test_mul_mat_glu_mixed(GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, 17408, n, 5120));
     }
     for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
-        for (int n : { 10, 16 }) {
+        for (int n : { 2, 3, 4, 5, 6, 7, 8, 10, 16 }) {
             test_cases.emplace_back(new test_mul_mat_glu_mixed(t, t, 17408, n, 5120));
         }
     }
+    // the SWIGLU epilogue anchored at the gate (the up mat-vec dispatched first)
+    for (auto [tg, tu] : std::vector<std::pair<ggml_type, ggml_type>>{ { GGML_TYPE_Q5_K, GGML_TYPE_Q4_K },
+                                                                      { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K } }) {
+        for (int n : { 1, 2, 5, 8 }) {
+            test_cases.emplace_back(new test_mul_mat_glu_gate_anchor(tg, tu, 5120, n));
+        }
+    }
+    // the MTP draft head: q6_K over the vocab, read up to the 3/8 shortlist
+    for (int n : { 1, 2 }) {
+        test_cases.emplace_back(new test_mul_mat_row_limit(GGML_TYPE_Q6_K, 248320, n, 5120, 93120));
+    }
+    test_cases.emplace_back(new test_mul_mat_row_limit(GGML_TYPE_Q6_K, 4096 + 48, 1, 5120, 1000));
+    // the one-column fused dispatches of decode: the grouped pair and the GDN decay-chain fold
+    for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
+        test_cases.emplace_back(new test_mul_mat_pair_fused(t, 6144, 5120));
+    }
+    test_cases.emplace_back(new test_mul_mat_dsa_fused(6144, 5120));
     // The paired MTP verify: two slots x (n_max 4 + 1) = 10 columns, plus the other
     // widths above MMVQ_MAX_BATCH_SIZE that the chunked / wide / XMX mat-vec paths serve.
     // {m, k} are the production gate/up (17408x5120) and down (5120x17408) weights.
@@ -13224,6 +13531,35 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             for (int n : { 9, 10, 12, 16 }) {
                 test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
             }
+        }
+    }
+    // warm-reorder mat-vecs at every width the XMX mat-vec takes in decode and verify, on the
+    // production row lengths, plus row lengths on both sides of its 2D block load threshold
+    for (ggml_type type :
+         { GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0 }) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 } }) {
+            for (int n = 1; n <= 16; ++n) {
+                test_cases.emplace_back(new test_mul_mat_warm(type, m, n, k));
+            }
+        }
+        for (int64_t k : { 256, 512, 768, 1024, 1280, 2048, 5120 }) {
+            for (int n : { 1, 2, 3, 8 }) {
+                test_cases.emplace_back(new test_mul_mat_warm(type, 64, n, k));
+            }
+        }
+    }
+    for (ggml_type type : { GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{ { 6144, 5120 }, { 5120, 6144 } }) {
+            for (int n = 1; n <= 16; ++n) {
+                test_cases.emplace_back(new test_mul_mat_warm(type, m, n, k));
+            }
+        }
+    }
+    // prefill-shape GEMMs (the f16 GEMM library path) on the production weights: every DPAS on the
+    // device takes part, so a wrong output channel of one EU fails these (test_mul_mat_gemm_max)
+    for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_Q4_K }) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 } }) {
+            test_cases.emplace_back(new test_mul_mat_gemm_max(type, m, 256, k));
         }
     }
 
@@ -15124,6 +15460,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int n : { 1, 2, 5, 8, 10, 16 }) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, n, 5120, { 1, 1 }, { 1, 1 }));
     }
+    // the MTP draft head, read up to its 3/8 vocab shortlist, and the shortlist as a plain weight
+    // (the one-row limit only forces the mat-vec path a cold one-column mul_mat would not take)
+    test_cases.emplace_back(new test_mul_mat_row_limit(GGML_TYPE_Q6_K, 248320, 1, 5120, 93120));
+    test_cases.emplace_back(new test_mul_mat_row_limit(GGML_TYPE_Q6_K, 93121, 1, 5120, 93120));
+    for (int n : { 1, 2 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 93120, n, 5120, { 1, 1 }, { 1, 1 }));
+    }
+    // decode FFN blocks: the mixed gate/up triple anchors its SWIGLU at the up mat-vec
+    for (int n : { 1, 2, 5, 8, 10 }) {
+        test_cases.emplace_back(
+            new test_ffn_chain_perf(GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_K, 17408, n, 5120, 16));
+    }
+    test_cases.emplace_back(new test_ffn_chain_perf(GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, 17408, 5, 5120, 16));
     for (float n : {128.0f, 4096.0f, 32768.0f, 1048576.0f}) {
         test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, n, 1.0f));
     }

@@ -851,6 +851,23 @@ inline bool xmx_supported(const void * vx, const int ncols) {
     return ncols % QK_K == 0 && (uintptr_t) vx % 64 == 0;
 }
 
+// A defective XVE can compute one output channel of every DPAS wrong while its other channels are right
+// (seen on a B70: one EU, channel 7). The DPAS self-test (dpas-check.cpp) finds it, and the threads that run on that
+// EU recompute that channel without DPAS (xmx_term). eu matches no sr0 when the device has no such EU.
+struct xmx_repair {
+    uint32_t eu      = ~0u;  // sr0 & eu_mask of the defective EU
+    uint32_t eu_mask = 0;
+    int      bad     = 0;    // its wrong output channel
+};
+
+ESIMD_INLINE uint32_t xmx_sr0() {
+    sycl::ext::intel::esimd::simd<uint32_t, 1> sr = 0;
+#ifdef __SYCL_DEVICE_ONLY__
+    __asm__ volatile("mov (M1_NM, 1) %0 %%sr0(0,0)<0;1,0>" : "=r"(sr.data_ref()));
+#endif
+    return sr[0];
+}
+
 // transposed 2D block load of 16 rows, dword (kd, n) lands at [kd * 16 + n]
 // 2D block loads need rows of at least 64 bytes, shorter rows (SR) are read row by row
 template <int W, bool SR>
@@ -1270,20 +1287,30 @@ template <typename T, int NC, bool FUSED> constexpr int xmx_grf() {
 
 #ifdef GGML_SYCL_MMVQ_HAS_XMX
 // One DPAS of a block of RC columns: the int32 products of the weights B and the activations A, as float and scaled
-// per weight row. Every quant type sums one or two of these per group of 32.
-template <int RC, int NT>
-ESIMD_INLINE simd<float, RC * NT> xmx_term(const simd<int8_t, 512> &    B,
+// per weight row. Every quant type sums one or two of these per group of 32. FIX: this thread runs on the EU of rp.
+template <int RC, int NT, bool FIX>
+ESIMD_INLINE simd<float, RC * NT> xmx_term(const simd<int8_t, 512> &     B,
                                            const simd<int8_t, RC * 32> & A,
-                                           const simd<float, NT> &       s) {
+                                           const simd<float, NT> &       s,
+                                           const xmx_repair &            rp) {
     using namespace sycl::ext::intel::esimd;
     namespace xmx = sycl::ext::intel::esimd::xmx;
 
     simd<int, RC * NT> C = xmx::dpas<8, RC, int>(B, A);
+    if constexpr (FIX) {
+        // the bad channel's dot products in integer SIMD: its weights are byte 4 * channel of each 64 byte K row
+        const simd<int, 32> c = convert<int>(B.template replicate_vs_w_hs<8, 64, 4, 1>(4 * rp.bad));
+#pragma unroll
+        for (int r = 0; r < RC; ++r) {
+            C[r * NT + rp.bad] =
+                reduce<int>(c * convert<int>(A.template replicate_vs_w_hs<1, 0, 32, 1>(32 * r)), std::plus<>());
+        }
+    }
     return convert<float>(C) * s.template replicate<RC>();
 }
 
 // one group of 32 of one weight set, accumulated into Cf for all the columns of the tile
-template <typename T, int NC, typename A2T, typename D8T>
+template <typename T, int NC, bool FIX, typename A2T, typename D8T>
 ESIMD_INLINE void xmx_group(simd<float, NC * XMX_ROWS> & Cf,
                             const typename T::part_t &   pd,
                             typename T::scales_t &       sc,
@@ -1293,7 +1320,8 @@ ESIMD_INLINE void xmx_group(simd<float, NC * XMX_ROWS> & Cf,
                             simd<int8_t, 512> &          Bh,
                             const simd<int8_t, 512> &    Ol,
                             const int                    g,
-                            const int                    part) {
+                            const int                    part,
+                            const xmx_repair &           rp) {
     using namespace sycl::ext::intel::esimd;
 
     constexpr int  NT    = XMX_ROWS;
@@ -1359,14 +1387,14 @@ ESIMD_INLINE void xmx_group(simd<float, NC * XMX_ROWS> & Cf,
 
         simd<float, RC * NT> z;
         if constexpr (T::plain) {
-            z = xmx_term<RC, NT>(B, A, rd);
+            z = xmx_term<RC, NT, FIX>(B, A, rd, rp);
         } else if constexpr (T::has_min) {
             // the second DPAS (all ones against the activations) is the exact integer sum of the activations
-            z = xmx_term<RC, NT>(B, A, rd) - xmx_term<RC, NT>(Ol, A, rm);
+            z = xmx_term<RC, NT, FIX>(B, A, rd, rp) - xmx_term<RC, NT, FIX>(Ol, A, rm, rp);
         } else if constexpr (T::min16) {
-            z = xmx_term<RC, NT>(Bs, A, sc.d) - xmx_term<RC, NT>(Bm, A, sc.dmin);
+            z = xmx_term<RC, NT, FIX>(Bs, A, sc.d, rp) - xmx_term<RC, NT, FIX>(Bm, A, sc.dmin, rp);
         } else {
-            z = xmx_term<RC, NT>(Bl, A, rs0) + xmx_term<RC, NT>(Bh, A, rs1);
+            z = xmx_term<RC, NT, FIX>(Bl, A, rs0, rp) + xmx_term<RC, NT, FIX>(Bh, A, rs1, rp);
         }
         Cb += z * d8r;
     }
@@ -1389,31 +1417,28 @@ template <int N> ESIMD_INLINE simd<float, N> xmx_glu_act(const simd<float, N> & 
 // weights instead, zeros in B drop the other half of K.
 // KS is the most threads that split K for one tile, the launch may use fewer.
 // FUSED computes up * act(gate) from the weights vx (up) and vg (gate), reading the activations once.
-template <typename T, int NC, int KS, bool FUSED>
-ESIMD_INLINE void xmx_mul_mat(const void * vx,
-                              const void * vg,
-                              const char * vy,
-                              float *      dst,
-                              const int    ncols,
-                              const int    nrows,
-                              const int    ncv,
-                              const int    stride_y_bytes,
-                              const int    ldd,
-                              const int    glu_op,
-                              const int    tile,
-                              const int    lid,
-                              const int    ks) {
+// FIX: the thread runs on the defective EU of rp. The launch calls slm_init.
+template <typename T, int NC, int KS, bool FUSED, bool FIX>
+ESIMD_INLINE void xmx_mul_mat(const void *     vx,
+                              const void *     vg,
+                              const char *     vy,
+                              float *          dst,
+                              const int        ncols,
+                              const int        nrows,
+                              const int        ncv,
+                              const int        stride_y_bytes,
+                              const int        ldd,
+                              const int        glu_op,
+                              const int        tile,
+                              const int        lid,
+                              const int        ks,
+                              const xmx_repair rp) {
     using namespace sycl::ext::intel::esimd;
 
     constexpr int  NT    = XMX_ROWS;
     constexpr int  RC    = NC < 8 ? NC : 8;
     constexpr int  NB    = NC / RC;
-    constexpr int  N_ACC = FUSED ? 2 : 1;
     constexpr bool pair  = (RC * 32) % 64 == 0;  // a block of RC rows fills whole registers
-
-    if constexpr (KS > 1) {
-        slm_init<N_ACC * KS * NC * NT * sizeof(float)>();
-    }
 
     const int  bpr  = ncols / QK_K;
     const int  row0 = tile * NT;
@@ -1487,9 +1512,9 @@ ESIMD_INLINE void xmx_mul_mat(const void * vx,
                     }
                 }
 
-                xmx_group<T, NC>(Cf, pd, sc, A2, d8f, Bl, Bh, Ol, g, part);
+                xmx_group<T, NC, FIX>(Cf, pd, sc, A2, d8f, Bl, Bh, Ol, g, part, rp);
                 if constexpr (FUSED) {
-                    xmx_group<T, NC>(Cfg, pdg, scg, A2, d8f, Bl, Bh, Ol, g, part);
+                    xmx_group<T, NC, FIX>(Cfg, pdg, scg, A2, d8f, Bl, Bh, Ol, g, part, rp);
                 }
             }
         }
@@ -1543,65 +1568,79 @@ ESIMD_INLINE void xmx_mul_mat(const void * vx,
 // KS_MAX bounds the threads that split K for one tile, the launch uses as few as keep every thread to the same
 // number of super-blocks as the busiest one
 template <typename T, int NC, int KS_MAX, bool FUSED>
-static void xmx_mul_mat_launch_ks(const void *    vx,
-                                  const void *    vg,
-                                  const char *    vy,
-                                  float *         dst,
-                                  const int       ncols,
-                                  const int       nrows,
-                                  const int       ncv,
-                                  const int       stride_y_bytes,
-                                  const int       ldd,
-                                  const int       glu_op,
-                                  dpct::queue_ptr stream) {
+static void xmx_mul_mat_launch_ks(const void *       vx,
+                                  const void *       vg,
+                                  const char *       vy,
+                                  float *            dst,
+                                  const int          ncols,
+                                  const int          nrows,
+                                  const int          ncv,
+                                  const int          stride_y_bytes,
+                                  const int          ldd,
+                                  const int          glu_op,
+                                  const xmx_repair & rp,
+                                  dpct::queue_ptr    stream) {
     GGML_ASSERT(ncols % QK_K == 0);
     const size_t n_tiles = (nrows + XMX_ROWS - 1) / XMX_ROWS;
     const int    bpr     = ncols / QK_K;
     const int    rounds  = (bpr + KS_MAX - 1) / KS_MAX;
     const int    ks      = (bpr + rounds - 1) / rounds;
     stream->submit([&](sycl::handler & cgh) {
-        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(n_tiles * ks), sycl::range<1>(ks)),
-                         sycl::ext::oneapi::experimental::properties{
-                             sycl::ext::intel::experimental::grf_size<xmx_grf<T, NC, FUSED>()> },
-                         [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                             xmx_mul_mat<T, NC, KS_MAX, FUSED>(vx, vg, vy, dst, ncols, nrows, ncv, stride_y_bytes, ldd,
-                                                               glu_op, (int) it.get_group(0), (int) it.get_local_id(0),
-                                                               ks);
-                         });
+        cgh.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(n_tiles * ks), sycl::range<1>(ks)),
+            sycl::ext::oneapi::experimental::properties{
+                sycl::ext::intel::experimental::grf_size<xmx_grf<T, NC, FUSED>()> },
+            [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+                if constexpr (KS_MAX > 1) {
+                    sycl::ext::intel::esimd::slm_init<(FUSED ? 2 : 1) * KS_MAX * NC * XMX_ROWS * sizeof(float)>();
+                }
+                const int tile = it.get_group(0);
+                const int lid  = it.get_local_id(0);
+                // a separate instantiation, so the repair costs the other threads nothing
+                if ((xmx_sr0() & rp.eu_mask) == rp.eu) {
+                    xmx_mul_mat<T, NC, KS_MAX, FUSED, true>(vx, vg, vy, dst, ncols, nrows, ncv, stride_y_bytes, ldd,
+                                                            glu_op, tile, lid, ks, rp);
+                } else {
+                    xmx_mul_mat<T, NC, KS_MAX, FUSED, false>(vx, vg, vy, dst, ncols, nrows, ncv, stride_y_bytes, ldd,
+                                                             glu_op, tile, lid, ks, rp);
+                }
+            });
     });
 }
 
 template <typename T, int NC, bool FUSED>
-static void xmx_mul_mat_launch(const void *    vx,
-                               const void *    vg,
-                               const char *    vy,
-                               float *         dst,
-                               const int       ncols,
-                               const int       nrows,
-                               const int       ncv,
-                               const int       stride_y_bytes,
-                               const int       ldd,
-                               const int       glu_op,
-                               dpct::queue_ptr stream) {
+static void xmx_mul_mat_launch(const void *       vx,
+                               const void *       vg,
+                               const char *       vy,
+                               float *            dst,
+                               const int          ncols,
+                               const int          nrows,
+                               const int          ncv,
+                               const int          stride_y_bytes,
+                               const int          ldd,
+                               const int          glu_op,
+                               const xmx_repair & rp,
+                               dpct::queue_ptr    stream) {
     // the fused kernel keeps two sets of accumulators in shared memory, half the threads for the same size
     constexpr int ks_max = xmx_n_split<NC>() / (FUSED ? 2 : 1);
-    xmx_mul_mat_launch_ks<T, NC, ks_max, FUSED>(vx, vg, vy, dst, ncols, nrows, ncv, stride_y_bytes, ldd, glu_op,
+    xmx_mul_mat_launch_ks<T, NC, ks_max, FUSED>(vx, vg, vy, dst, ncols, nrows, ncv, stride_y_bytes, ldd, glu_op, rp,
                                                 stream);
 }
 
 // FUSED: vx and vg are the up and gate weights, dst gets up * act(gate) with glu_op a ggml_glu_op
 template <typename T, bool FUSED = false>
-static void xmx_mul_mat_ncols(const void *    vx,
-                              const void *    vg,
-                              const char *    vy,
-                              float *         dst,
-                              const int       ncols,
-                              const int       nrows,
-                              const int       ncols_dst,
-                              const int       stride_y_bytes,
-                              const int       ldd,
-                              const int       glu_op,
-                              dpct::queue_ptr stream) {
+static void xmx_mul_mat_ncols(const void *       vx,
+                              const void *       vg,
+                              const char *       vy,
+                              float *            dst,
+                              const int          ncols,
+                              const int          nrows,
+                              const int          ncols_dst,
+                              const int          stride_y_bytes,
+                              const int          ldd,
+                              const int          glu_op,
+                              const xmx_repair & rp,
+                              dpct::queue_ptr    stream) {
     constexpr int chunk_max = FUSED ? XMX_FUSED_CHUNK : XMX_CHUNK;
     for (int c0 = 0; c0 < ncols_dst; c0 += chunk_max) {
         const int    n  = std::min(chunk_max, ncols_dst - c0);
@@ -1609,9 +1648,9 @@ static void xmx_mul_mat_ncols(const void *    vx,
         float *      d  = dst + (size_t) c0 * ldd;
         const int    nc = n > 32 ? 64 : (n > 16 ? 32 : (n > 8 ? 16 : n));
         switch (nc) {
-#define XMX_CASE(N)                                                                                          \
-    case N:                                                                                                  \
-        xmx_mul_mat_launch<T, N, FUSED>(vx, vg, y, d, ncols, nrows, n, stride_y_bytes, ldd, glu_op, stream); \
+#define XMX_CASE(N)                                                                                              \
+    case N:                                                                                                      \
+        xmx_mul_mat_launch<T, N, FUSED>(vx, vg, y, d, ncols, nrows, n, stride_y_bytes, ldd, glu_op, rp, stream); \
         break
             XMX_CASE(1);
             XMX_CASE(2);
@@ -1623,11 +1662,11 @@ static void xmx_mul_mat_ncols(const void *    vx,
             XMX_CASE(8);
 #undef XMX_CASE
             // short row variants are for tests, not built for the wide tiles
-#define XMX_CASE_WIDE(N)                                                                                         \
-    case N:                                                                                                      \
-        if constexpr (!T::short_rows && (!FUSED || N <= XMX_FUSED_CHUNK)) {                                      \
-            xmx_mul_mat_launch<T, N, FUSED>(vx, vg, y, d, ncols, nrows, n, stride_y_bytes, ldd, glu_op, stream); \
-        }                                                                                                        \
+#define XMX_CASE_WIDE(N)                                                                                             \
+    case N:                                                                                                          \
+        if constexpr (!T::short_rows && (!FUSED || N <= XMX_FUSED_CHUNK)) {                                          \
+            xmx_mul_mat_launch<T, N, FUSED>(vx, vg, y, d, ncols, nrows, n, stride_y_bytes, ldd, glu_op, rp, stream); \
+        }                                                                                                            \
         break
             XMX_CASE_WIDE(16);
             XMX_CASE_WIDE(32);

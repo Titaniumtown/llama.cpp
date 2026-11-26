@@ -7,4 +7,8 @@
 bool ggml_sycl_flash_attn_ext_dpas_supported(int device, const ggml_tensor * dst);
 void ggml_sycl_flash_attn_ext_dpas(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
+// decode FA over the row-split ("reordered") q5_1 / q4_0 / q8_0 KV caches, D 256, f16 DPAS; mask or
+// implicit-causal sentinel
+bool ggml_sycl_flash_attn_ext_dpas_r_supported(int device, const ggml_tensor * dst);
+void ggml_sycl_flash_attn_ext_dpas_r(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 #endif // GGML_SYCL_FATTN_DPAS_HPP

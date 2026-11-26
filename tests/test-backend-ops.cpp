@@ -15850,6 +15850,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // Same non-causal vision-encoder shape for the other head size padded in-kernel by the CUDA MMA kernels
     test_cases.emplace_back(new test_flash_attn_ext(40, 40, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
+    // production decode FA over a SET_ROWS-written cache (the reordered path): MTP verify (5)
+    // against the q5_1/q4_0 main cache, and the draft (1) and MTP-layer verify (5) against its q8_0 cache
+    for (int64_t n_kv : {16384, 32768, 65536, 98304}) {
+        for (int64_t ns : {1, 2}) {
+            test_cases.emplace_back(new test_fa_kv_cache(256, 4, 6, n_kv, 5, ns, GGML_TYPE_Q5_1, GGML_TYPE_Q4_0));
+            test_cases.emplace_back(new test_fa_kv_cache(256, 4, 6, n_kv, 1, ns, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+            test_cases.emplace_back(new test_fa_kv_cache(256, 4, 6, n_kv, 5, ns, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        }
+    }
+
     // Sparse flash attention (n_kv_max hint) decode across KV depths.
     // Shapes: 576/512 DeepSeek MLA, 512/512 DeepSeek-V4/GLM-5.2, 256/256 gqa12 Qwen QSA.
     for (int64_t kv : {4096, 16384, 32768}) {

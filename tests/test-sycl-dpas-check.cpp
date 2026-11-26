@@ -214,6 +214,33 @@ int main() {
               "lane repair: not without every EU tested");
     }
 
+    // DPAS-R's repair: the dependent-DPAS lanes of one EU, each next to a right lane of its pair
+    {
+        uint32_t eu;
+        uint32_t lanes;
+        auto     records = make_device(xe2, 8, 4, 8, 8);
+        check(ggml_sycl_dpas_pair_repair(ggml_sycl_dpas_evaluate(xe2, 256, records), eu, lanes) && lanes == 0,
+              "pair repair: healthy device, nothing to recompute");
+
+        make_fault(records, 0x0a30, mask, 0x0080, 0x8080);
+        check(ggml_sycl_dpas_pair_repair(ggml_sycl_dpas_evaluate(xe2, 256, records), eu, lanes) && eu == 0x0a30 &&
+                  lanes == 0x8080,
+              "pair repair: the B70's lanes 7 and 15");
+
+        auto pair = records;
+        make_fault(pair, 0x0a30, mask, 0x0080, 0x00c0);
+        check(!ggml_sycl_dpas_pair_repair(ggml_sycl_dpas_evaluate(xe2, 256, pair), eu, lanes) && lanes == 0,
+              "pair repair: not both lanes of a pair");
+
+        auto two_eu = records;
+        make_fault(two_eu, 0x0040, mask, 0, 0x0001);
+        check(!ggml_sycl_dpas_pair_repair(ggml_sycl_dpas_evaluate(xe2, 256, two_eu), eu, lanes),
+              "pair repair: not two EUs");
+
+        check(!ggml_sycl_dpas_pair_repair(ggml_sycl_dpas_evaluate(xe2, 257, records), eu, lanes),
+              "pair repair: not without every EU tested");
+    }
+
     if (n_fail) {
         fprintf(stderr, "%d checks failed\n", n_fail);
         return 1;

@@ -291,6 +291,14 @@ static void ggml_sycl_dpas_self_test(int device) try {
             resp += "the XMX mat-vec recomputes lane " + std::to_string(lane) + " on that EU without DPAS, ";
         }
     }
+    uint32_t lanes;
+    if (!ggml_sycl_dpas_pair_repair(h, eu, lanes)) {
+        resp += "DPAS-R flash attention stays off, ";
+    } else if (lanes != 0) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "DPAS-R flash attention recomputes lanes 0x%04x on that EU, ", lanes);
+        resp += buf;
+    }
     if (g_ggml_sycl_dpas_faulty[device]) {
         resp += "DPAS flash attention stays off (GGML_SYCL_DPAS_CHECK=2 keeps it on), ";
     }

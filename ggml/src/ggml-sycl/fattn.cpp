@@ -111,6 +111,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
     BEST_FATTN_KERNEL_VEC      = 100,
     BEST_FATTN_KERNEL_DPAS     = 120, // q4_0 / q8_0 K/V decode on Xe2 XMX
+    BEST_FATTN_KERNEL_DPAS_R   = 130, // row-split q5_1 / q4_0 / q8_0 K/V decode on Xe2 XMX
     BEST_FATTN_KERNEL_ONEDNN   = 150, // oneDNN SDPA: native F16 (PR #25222)
     BEST_FATTN_KERNEL_TILE     = 200,
     BEST_FATTN_KERNEL_MKL      = 300,
@@ -213,6 +214,12 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         if (kv_strides_ok) {
             return BEST_FATTN_KERNEL_MKL;
         }
+    }
+
+    // Decode over a row-split cache: both products on XMX. Ahead of the implicit-causal TILE
+    // pin below, because it reads the sentinel too.
+    if (ggml_sycl_flash_attn_ext_dpas_r_supported(device, dst)) {
+        return BEST_FATTN_KERNEL_DPAS_R;
     }
 
     // An implicit-causal sentinel (mask->ne[0] == 1) is understood by the MKL,
@@ -442,6 +449,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
             case BEST_FATTN_KERNEL_TILE:   kname = "TILE";   break;
             case BEST_FATTN_KERNEL_MKL:    kname = "MKL";    break;
             case BEST_FATTN_KERNEL_DPAS:   kname = "DPAS";   break;
+            case BEST_FATTN_KERNEL_DPAS_R: kname = "DPAS-R"; break;
         }
         int64_t delta = 0;
         if (Dk == 256) {
@@ -481,6 +489,9 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_DPAS:
             ggml_sycl_flash_attn_ext_dpas(ctx, dst);
             break;
+        case BEST_FATTN_KERNEL_DPAS_R:
+            ggml_sycl_flash_attn_ext_dpas_r(ctx, dst);
+            break;
         case BEST_FATTN_KERNEL_MKL:
             ggml_sycl_flash_attn_ext_mkl(ctx, dst);
             break;
@@ -509,6 +520,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
             if (kb == BEST_FATTN_KERNEL_TILE) kname = "TILE";
             if (kb == BEST_FATTN_KERNEL_VEC) kname = "VEC";
             if (kb == BEST_FATTN_KERNEL_DPAS) kname = "DPAS";
+            if (kb == BEST_FATTN_KERNEL_DPAS_R) kname = "DPAS-R";
             GGML_LOG_INFO("[FA-DIAG] #%d %s D=%d n_kv=%lld n_q=%lld "
                     "n_qh=%lld n_kvh=%lld K=%s V=%s "
                     "nb1=%zu nb2=%zu first 64 floats:\n",

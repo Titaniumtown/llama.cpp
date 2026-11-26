@@ -163,6 +163,26 @@ static inline bool ggml_sycl_dpas_lane_repair(const ggml_sycl_dpas_health & h, u
     return true;
 }
 
+// DPAS-R chains its DPAS through the accumulator: it runs when every EU was tested and one EU at most gets lanes of
+// dependent DPAS wrong, each with a right neighbour in its pair, from which it recomputes them (lanes 0 when none)
+static inline bool ggml_sycl_dpas_pair_repair(const ggml_sycl_dpas_health & h, uint32_t & eu, uint32_t & lanes) {
+    eu    = ~0u;
+    lanes = 0;
+    if (!h.complete()) {
+        return false;
+    }
+    for (const ggml_sycl_dpas_fault & f : h.faults) {
+        if (lanes != 0 || (f.lanes_chain & (f.lanes_chain >> 1) & 0x5555u) != 0) {
+            eu    = ~0u;
+            lanes = 0;
+            return false;
+        }
+        eu    = f.eu;
+        lanes = f.lanes_chain;
+    }
+    return true;
+}
+
 // the outcome of the device's self-test, set before ggml_sycl_dpas_check returns
 const ggml_sycl_dpas_health & ggml_sycl_dpas_get_health(int device);
 

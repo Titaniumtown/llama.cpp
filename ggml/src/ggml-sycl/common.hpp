@@ -148,6 +148,7 @@ extern int g_ggml_sycl_fa_onednn;
 extern int g_ggml_sycl_fa_onednn_max_kv;
 extern int g_ggml_sycl_enable_mkl_fa;
 extern int g_ggml_sycl_fa_dpas;
+extern int g_ggml_sycl_dpas_check;
 extern int g_ggml_sycl_memtrace;
 extern int g_ggml_sycl_memtrace_step;
 extern int g_ggml_sycl_graph_eviction_timeout;
@@ -367,8 +368,14 @@ struct ggml_sycl_device_info {
 
 ggml_sycl_device_info & ggml_sycl_info();
 
+// DPAS self-test of the device (dpas-check.cpp), once, at backend init
+void ggml_sycl_dpas_check(int device);
+// the self-test found wrong DPAS results on the device and GGML_SYCL_DPAS_CHECK=1 keeps the integer DPAS kernels off it
+bool ggml_sycl_dpas_faulty(int device);
+
 static inline bool ggml_sycl_xmx_enabled(int device) {
-    return g_ggml_sycl_enable_xmx_esimd && ggml_sycl_xmx_supports_arch(ggml_sycl_info().devices[device].hw_info.arch);
+    return g_ggml_sycl_enable_xmx_esimd && ggml_sycl_xmx_supports_arch(ggml_sycl_info().devices[device].hw_info.arch) &&
+           !ggml_sycl_dpas_faulty(device);
 }
 
 static constexpr size_t SYCL_BUFFER_ALIGNMENT = 128;

@@ -38,7 +38,8 @@ bool ggml_sycl_flash_attn_ext_dpas_supported(int device, const ggml_tensor * dst
     GGML_UNUSED(dst);
     return false;
 #else
-    if (!g_ggml_sycl_fa_dpas || !fattn_dpas_support_arch(ggml_sycl_info().devices[device].hw_info.arch)) {
+    if (!g_ggml_sycl_fa_dpas || !fattn_dpas_support_arch(ggml_sycl_info().devices[device].hw_info.arch) ||
+        ggml_sycl_dpas_faulty(device)) {
         return false;
     }
 
